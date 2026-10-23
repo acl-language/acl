@@ -74,6 +74,11 @@ pub enum ProtocolAction {
     /// §38.8: `broadcast <perf> [payload] to <list_state>;` — fan-out to
     /// every role named in a list state (contract-net announce)
     Broadcast { performative: Performative, fields: Option<BTreeMap<String, String>>, to: String },
+    /// §44: `await N <perf> into <list> within <dur> as <flag>;` —
+    /// declarative collection: matching events push their payload into the
+    /// list state; when N arrive the flag goes true; on deadline it goes
+    /// false. No handler needs to be written for the collected events.
+    Await { count: i64, performative: Performative, into: String, within_ms: i64, flag: String },
 }
 
 /// §35.5: retry policy on sends — declarative, driven by the runtime's
@@ -1704,6 +1709,30 @@ fn parse_action(stmt: &str) -> Result<ProtocolAction, String> {
             .ok_or_else(|| format!("unknown performative '{perf_w}'"))?;
         return Ok(ProtocolAction::Broadcast { performative, fields, to: target });
     }
+    if let Some(rest) = s.strip_prefix("await ") {
+        // §44: `await 3 propose into bids within 5s as bids_ready;`
+        let parts: Vec<&str> = rest.split_whitespace().collect();
+        if parts.len() != 8
+            || parts[2] != "into"
+            || parts[4] != "within"
+            || parts[6] != "as"
+        {
+            return Err(format!(
+                "bad await: '{s}' (want 'await N <perf> into <list> within <dur> as <flag>')"
+            ));
+        }
+        let count: i64 = parts[0].parse().map_err(|_| "bad await count")?;
+        let performative =
+            perf_from_word(parts[1]).ok_or_else(|| format!("unknown performative '{}'", parts[1]))?;
+        let within_ms = parse_duration(parts[5]).ok_or("bad await duration")?;
+        return Ok(ProtocolAction::Await {
+            count,
+            performative,
+            into: parts[3].to_string(),
+            within_ms,
+            flag: parts[7].to_string(),
+        })
+    }
     if let Some(rest) = s.strip_prefix("send ") {
         // peel retry clause first: `retry 3 backoff 2s exp`
         let (rest, retry) = match rest.find(" retry ") {
@@ -2277,6 +2306,39 @@ pub fn check(prog: &ProtocolProgram) -> Result<Vec<String>, Vec<IdlError>> {
                         });
                     }
                 }
+                ProtocolAction::Await { count, into, flag, within_ms, .. } => {
+                    let ty_of = |n: &str| {
+                        prog.states
+                            .iter()
+                            .find(|st| st.name == n)
+                            .and_then(|st| st.ty.clone())
+                            .unwrap_or_default()
+                    };
+                    if !ty_of(into).starts_with("list") {
+                        errors.push(IdlError {
+                            line: h.line,
+                            message: format!("await into '{into}': not a list state"),
+                        });
+                    }
+                    if ty_of(flag) != "bool" {
+                        errors.push(IdlError {
+                            line: h.line,
+                            message: format!("await flag '{flag}': not a declared bool state"),
+                        });
+                    }
+                    if *count < 1 {
+                        errors.push(IdlError {
+                            line: h.line,
+                            message: format!("await count {count} must be >= 1"),
+                        });
+                    }
+                    if *within_ms <= 0 {
+                        errors.push(IdlError {
+                            line: h.line,
+                            message: "await within must be positive".to_string(),
+                        });
+                    }
+                }
                 ProtocolAction::For { var, over, .. } => {
                     if !prog.states.iter().any(|st| &st.name == over) {
                         errors.push(IdlError {
@@ -2490,6 +2552,14 @@ fn action_word(a: &ProtocolAction) -> String {
             perf_word(performative),
             fields.as_ref().map(|f| format!(" {}", serde_json::to_string(f).unwrap_or_default())).unwrap_or_default(),
             to
+        ),
+        ProtocolAction::Await { count, performative, into, within_ms, flag } => format!(
+            "await {} {} into {} within {}ms as {}",
+            count,
+            perf_word(performative),
+            into,
+            within_ms,
+            flag
         ),
         ProtocolAction::For { var, over, actions } => {
             let inner: Vec<String> = actions.iter().map(|a| action_word(a)).collect();

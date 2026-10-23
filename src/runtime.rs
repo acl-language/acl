@@ -223,6 +223,17 @@ pub struct OutEvent {
     pub fields: Option<BTreeMap<String, String>>,
 }
 
+/// §44: a declarative `await` collector — armed by an action, fed by
+/// deliver(), completed or timed out by tick()
+#[derive(Debug, Clone)]
+struct AwaitSpec {
+    count_left: i64,
+    performative: Performative,
+    into: String,
+    deadline_ms: i64,
+    flag: String,
+}
+
 /// §35.5: a send awaiting retry — driven by tick(), not by a clock.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PendingSend {
@@ -275,6 +286,8 @@ pub struct Runtime {
     pending: Vec<PendingSend>,
     /// §38.7: recursion guard for internal-error routing
     handling_error: bool,
+    /// §44: active await collectors
+    awaits: Vec<AwaitSpec>,
     /// §35.4: host-injected clock (set by tick)
     now_ms: i64,
     /// §35.3: message templates for fmt()
@@ -338,6 +351,7 @@ impl Runtime {
             last_seen: None,
             pending: Vec::new(),
             handling_error: false,
+            awaits: Vec::new(),
             now_ms: 0,
             aborted: false,
             enforce_dialogue: false,
@@ -669,6 +683,44 @@ impl Runtime {
                 }
             }
         }
+        // §44: an active await collector CONSUMES matching events (the
+        // collected payloads do not need handlers)
+        if let Event::In { performative, fields, .. } = &ev {
+            if let Some(i) = self.awaits.iter().position(|a| a.performative == *performative) {
+                let spec = self.awaits[i].clone();
+                let payload = StateValue::Map(
+                    fields
+                        .clone()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|(k, v)| (k, StateValue::Str(v)))
+                        .collect(),
+                );
+                // append to the list state
+                match self.states.get_mut(&spec.into) {
+                    Some(StateValue::List(l)) => l.push(payload),
+                    Some(slot) if matches!(slot, StateValue::Unset) => {
+                        *slot = StateValue::List(vec![payload]);
+                    }
+                    _ => {}
+                    None => {
+                        self.states.insert(spec.into.clone(), StateValue::List(vec![payload]));
+                    }
+                }
+                self.log(
+                    Dir::In,
+                    format!("await collected {} ({}/{} into {})", perf_name(spec.performative), spec.count_left, spec.count_left, spec.into),
+                );
+                if spec.count_left <= 1 {
+                    self.awaits.remove(i);
+                    let _ = self.set_state(&spec.flag, StateValue::Bool(true));
+                    self.log(Dir::State, format!("await satisfied: {} = true", spec.flag));
+                } else {
+                    self.awaits[i].count_left = spec.count_left - 1;
+                }
+                return Vec::new();
+            }
+        }
         let (hidx, captures) = match self.matching_handler(&ev) {
             Some((hidx, caps)) => (hidx, caps),
             None => return Vec::new(),
@@ -833,6 +885,24 @@ impl Runtime {
                             out.extend(self.deliver_internal_error(reason));
                         }
                     }
+                }
+                ProtocolAction::Await { count, performative, into, within_ms, flag } => {
+                    // §44: arm the collector; flag starts false
+                    self.awaits.push(AwaitSpec {
+                        count_left: *count,
+                        performative: *performative,
+                        into: into.clone(),
+                        deadline_ms: self.now_ms + within_ms,
+                        flag: flag.clone(),
+                    });
+                    let _ = self.set_state(flag, StateValue::Bool(false));
+                    self.log(
+                        Dir::State,
+                        format!(
+                            "await {} {}: waiting for {} {} into {} within {}ms",
+                            count, flag, count, perf_name(*performative), into, within_ms
+                        ),
+                    );
                 }
                 ProtocolAction::Set { name, field, expr } => match self.eval(expr, ev, &captures) {
                     Ok(v) => {
@@ -1079,6 +1149,20 @@ impl Runtime {
                 self.timer_due[i] += every_ms;
                 self.log(Dir::In, format!("timer({}ms)", every_ms));
                 out.extend(self.run_handler(i, &Event::Expired, BTreeMap::new()));
+            }
+        }
+        // §44: await deadlines — overdue collectors set the flag false
+        let mut i = 0;
+        while i < self.awaits.len() {
+            if self.awaits[i].deadline_ms <= elapsed_ms {
+                let spec = self.awaits.remove(i);
+                let _ = self.set_state(&spec.flag, StateValue::Bool(false));
+                self.log(
+                    Dir::State,
+                    format!("await timed out: {} = false", spec.flag),
+                );
+            } else {
+                i += 1;
             }
         }
         // §35.5: retry pending sends when due; exhaustion = retry dropped
@@ -2264,5 +2348,54 @@ mod generic_state_tests {
         let mut r = Runtime::new(&prog, "b").unwrap();
         r.deliver(Event::In { from: "a".into(), performative: Performative::Inform, pattern: None, fields: None });
         assert_eq!(r.states_snapshot().get("caught"), Some(&StateValue::Bool(true)));
+    }
+}
+
+#[cfg(test)]
+mod await_tests {
+    use super::*;
+    use crate::protocol::parse;
+
+    // §44: await collects N matching events, then the flag goes true
+    #[test]
+    fn await_collects_and_flags() {
+        let prog = parse(
+            "protocol p v1;\nroles a, b;\nstate bids: list;\nstate ready: bool;\non request from a { await 3 propose into bids within 10s as ready; send progress to a; }\non propose from b -> send bye;\non inform from b -> send bye;\non inform from a { set done = ready; }\non bye from b -> send inform to b;\non bye from a -> send inform to a;\n",
+        )
+        .unwrap();
+        let mut r = Runtime::new(&prog, "b").unwrap();
+        r.deliver(Event::In { from: "a".into(), performative: Performative::Request, pattern: None, fields: None });
+        for i in 1..=3 {
+            r.deliver(Event::In {
+                from: "a".into(),
+                performative: Performative::Propose,
+                pattern: None,
+                fields: Some(BTreeMap::from([("who".into(), format!("b{i}")), ("price".into(), format!("{i}0"))])),
+            });
+        }
+        let snap = r.states_snapshot();
+        assert_eq!(snap.get("ready"), Some(&StateValue::Bool(true)));
+        match snap.get("bids") {
+            Some(StateValue::List(l)) => assert_eq!(l.len(), 3),
+            other => panic!("expected bids list, got {other:?}"),
+        }
+        // collected events do NOT reach handlers (consumed by the collector)
+        let collected: Vec<_> = r.transcript().iter().filter(|e| e.text.contains("await collected")).collect();
+        assert_eq!(collected.len(), 3, "{:?}", collected.iter().map(|e| &e.text).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn await_timeout_sets_flag_false() {
+        let prog = parse(
+            "protocol p v1;\nroles a, b;\nstate bids: list;\nstate ready: bool;\non request from a { await 2 propose into bids within 100ms as ready; }\non propose from b -> send bye;\non inform from b -> send bye;\non bye from b -> send inform to b;\non bye from a -> send inform to a;\n",
+        )
+        .unwrap();
+        let mut r = Runtime::new(&prog, "b").unwrap();
+        r.deliver(Event::In { from: "a".into(), performative: Performative::Request, pattern: None, fields: None });
+        r.deliver(Event::In { from: "a".into(), performative: Performative::Propose, pattern: None, fields: None });
+        assert_eq!(r.states_snapshot().get("ready"), Some(&StateValue::Bool(false)));
+        r.tick(500);
+        assert_eq!(r.states_snapshot().get("ready"), Some(&StateValue::Bool(false)));
+        assert!(r.transcript().iter().any(|e| e.text.contains("await timed out")));
     }
 }

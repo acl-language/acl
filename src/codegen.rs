@@ -46,6 +46,10 @@ fn py_action(a: &ProtocolAction) -> String {
                 None => "None".into(),
             }
         ),
+        ProtocolAction::Await { count, performative, into, within_ms, flag } => format!(
+            "{{\"kind\": \"await\", \"count\": {count}, \"performative\": \"{}\", \"into\": \"{into}\", \"within_ms\": {within_ms}, \"flag\": \"{flag}\"}}",
+            py_perf(performative)
+        ),
         ProtocolAction::Broadcast { performative, fields, to } => format!(
             "{{\"kind\": \"broadcast\", \"performative\": \"{}\", \"to\": \"{}\", \"fields\": {}}}",
             py_perf(performative),
@@ -308,9 +312,11 @@ pub fn gen_agent_py(prog: &ProtocolProgram, role: &str) -> Result<String, Vec<cr
         r#"    def __init__(self):
         self._arg = {}
         self._caps = {}
+        self._awaits = []
         self.states = {k: None for k in self.STATES}
         self.commitment = "proposed"   # proposed -> active -> fulfilled/breached
         self.timer_due = [0] * len([h for h in self.HANDLERS if h["kind"] == "timer"])
+        self._now = 0
         self.transcript = []
 
     # -- state helpers ------------------------------------------------
@@ -503,6 +509,16 @@ pub fn gen_agent_py(prog: &ProtocolProgram, role: &str) -> Result<String, Vec<cr
             elif a["kind"] == "set":
                 self.states[a["name"]] = self._eval(a["expr"])
                 self.transcript.append(("state", "set:" + a["name"]))
+            elif a["kind"] == "await":
+                # §44: arm the collector; flag starts False
+                self._awaits.append({
+                    "count_left": a["count"],
+                    "performative": a["performative"],
+                    "into": a["into"],
+                    "deadline_ms": self._now + a["within_ms"],
+                    "flag": a["flag"],
+                })
+                self.states[a["flag"]] = False
             elif a["kind"] == "broadcast":
                 # §38.8: fan-out — one send per role in the list state
                 for r in (self.states.get(a["to"]) or []):
@@ -546,6 +562,20 @@ pub fn gen_agent_py(prog: &ProtocolProgram, role: &str) -> Result<String, Vec<cr
     def deliver(self, from_role, performative, pattern=None, fields=None):
         """Feed one incoming speech act; returns the outgoing ones."""
         self._arg = fields or {}
+        # §44: an active await collector CONSUMES matching events
+        for aw in list(self._awaits):
+            if aw["performative"] == performative:
+                payload = dict(fields or {})
+                cur = self.states.get(aw["into"])
+                if isinstance(cur, list):
+                    cur.append(payload)
+                else:
+                    self.states[aw["into"]] = [payload]
+                aw["count_left"] -= 1
+                if aw["count_left"] <= 0:
+                    self._awaits.remove(aw)
+                    self.states[aw["flag"]] = True
+                return []
         self.transcript.append(("in", performative, from_role))
         for h in self.HANDLERS:
             if h["kind"] == "breach" or h["kind"] == "expired":
@@ -566,6 +596,12 @@ pub fn gen_agent_py(prog: &ProtocolProgram, role: &str) -> Result<String, Vec<cr
 
     def tick(self, elapsed_ms):
         """Host-injected time (§34): timers fire here, deterministically."""
+        self._now = elapsed_ms
+        # §44: await deadlines
+        for aw in list(self._awaits):
+            if aw["deadline_ms"] <= elapsed_ms:
+                self._awaits.remove(aw)
+                self.states[aw["flag"]] = False
         timers = [h for h in self.HANDLERS if h["kind"] == "timer"]
         out = []
         for i, h in enumerate(timers):

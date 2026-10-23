@@ -78,6 +78,8 @@ fn main() {
                                             acl_core::protocol::ProtocolAction::Abort => "abort".into(),
                                             acl_core::protocol::ProtocolAction::Broadcast { performative, to, .. } =>
                                                 format!("broadcast {:?} to {to}", performative),
+                                            acl_core::protocol::ProtocolAction::Await { count, performative, into, .. } =>
+                                                format!("await {count} {:?} into {into}", performative),
                                         }).collect();
                                         println!("    on {} -> {}", t, a.join("; "));
                                     }
