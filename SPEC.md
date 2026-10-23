@@ -1,6 +1,6 @@
 # ACL — Agent Communication Language
 
-**Version:** 0.2.0-draft
+**Version:** 0.3.0-draft
 **Status:** Draft specification
 **License:** Apache-2.0 (spec + reference implementation)
 
@@ -528,10 +528,16 @@ peers. Reference: `acl_core::registry` + `registry_cli`.
 | local registry (`src/registry.rs`) | register/lookup/by-capability/persist tests + CLI |
 | robustness (`tests/robustness.rs`) | 70k+ fuzz-lite inputs, decoder never panics; cargo-fuzz target in `fuzz/` |
 | benchmarks (`tests/bench.rs`) | encode 0.57 µs, decode 0.94 µs, verify 80 µs; msgpack −43% vs JSON (BENCH.md) |
+| IDL + compiler (§18, `src/idl.rs`, `aclc`) | 5/5 tests (parse/typecheck/errors/pretty-roundtrip/codegen); stdlib compiled + linted + gen smoke in CI |
+| CL composition (§6.3) | nested and/or/not/ref roundtrip + grammar matrix recursive to leaves |
+| epistemic facts (§6.4) | modality/provenance/confidence/validity roundtrip + backward-compat defaults |
+| dialogue rules (§16, `src/dialogue.rs`) | full reply-matrix tests incl. bye-closes-session |
+| formal semantics (§17, `src/semantics.rs`) | FP/RE present for all 14 performatives |
 
 Not yet implemented: sealed-envelope key rotation/HD derivation,
-batch signature verification, WS client demo in CI (server-side validated),
-public governance body.
+batch signature verification, WS client demo in CI, public governance body,
+CL type-checker over message payloads (IDL types are validated at build
+time; runtime payload validation against compiled schemas is future work).
 
 ## 16. Dialogue rules (normative)
 

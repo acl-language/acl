@@ -6,6 +6,31 @@ Format based on Keep a Changelog; versions follow semver for the
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-10-23
+
+The release that makes ACL a **language** rather than a transport protocol
+with conventions. All changes additive; SPEC-VERSION on the wire remains `1`.
+
+### Added
+- **IDL and compiler** (spec §18): `.acl` vocabulary files with namespaces
+  (`acl.std.fs.file_exists`), type aliases and doc comments; `aclc`
+  subcommands `check` / `lint` / `fmt` (canonical pretty-print, idempotent)
+  / `gen rust|py|ts` (typed CL builders) / `names`.
+- **Standard library** (`stdlib/`): `fs.acl`, `task.acl`, `time.acl`,
+  `net.acl` — 29 documented declarations under `acl.std.*`, compiled and
+  linted in CI.
+- **CL composition** (spec §6.3): `and` / `or` / `not` / `ref` operators;
+  the §6.2 grammar matrix applies recursively down to leaves.
+- **Epistemic facts** (spec §6.4): `modality` (asserted/believed/known),
+  `provenance` chains, `confidence`, `valid_until_ms` — all optional,
+  backward compatible.
+- **Dialogue rules** (spec §16): normative reply matrix per performative
+  (`query` → answered by facts; `propose` → accept/reject only; `bye`
+  closes the session).
+- **Formal semantics** (spec §17): machine-readable feasibility
+  preconditions (FP) and rational effects (RE) for all 14 performatives,
+  FIPA-ACL style.
+
 ## [0.2.0] — 2026-10-23
 
 All changes additive; SPEC-VERSION on the wire remains `1`.
@@ -60,6 +85,7 @@ First public release.
 - Independent spec-only Python codec; interop validated both directions
 - Robustness fuzz-lite corpus test; codec benchmarks
 
-[Unreleased]: https://github.com/acl-language/acl/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/acl-language/acl/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/acl-language/acl/releases/tag/v0.3.0
 [0.2.0]: https://github.com/acl-language/acl/releases/tag/v0.2.0
 [0.1.0]: https://github.com/acl-language/acl/releases/tag/v0.1.0

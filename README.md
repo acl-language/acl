@@ -85,6 +85,23 @@ signatures), WebSocket, Python + TypeScript bindings, sealed envelopes
 HTTP), 3-agent delegate-chain demo, content language (facts/actions/
 queries/commitments) spoken by the reference agent.
 
+### It is a language, not just a protocol
+
+Vocabularies are **declared, typed and compiled**. Write an `.acl` IDL file:
+
+```acl
+namespace acl.std.fs v1;
+predicate file_exists(path: Path) -> bool;
+action file_read(path: Path) -> string;
+```
+
+…then `aclc check|lint|fmt|gen rust|py|ts` produces typed builders for
+facts, actions, queries and commitments (with provenance, confidence,
+epistemic modality and expiry), enforces the per-performative grammar
+matrix, the dialogue reply policy (§16) and carries formal semantics
+(FP/RE, §17). A **standard library** (`stdlib/`: fs, task, time, net)
+ships compiled in CI. Expressions compose (`and/or/not/ref`).
+
 Also here: [BENCH.md](BENCH.md) (codec benchmarks),
 [docs/TUTORIAL.md](docs/TUTORIAL.md) (10-minute guide),
 [governance/](governance/) (RFC process).
