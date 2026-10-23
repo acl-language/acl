@@ -439,6 +439,9 @@ pub struct ProtocolProgram {
     pub functions: Vec<Function>,
     /// §38.2: user-defined record types `type Quote = { price: int };`
     pub types: BTreeMap<String, Vec<(String, String)>>,
+    /// §38.5: reusable handler fragments `handler_set name { ... }` —
+    /// spliced into a protocol by `include handler_set name;`
+    pub handler_sets: BTreeMap<String, Vec<Handler>>,
 }
 
 /// §38.1: a user-defined function — pure computation over parameters and
@@ -631,6 +634,8 @@ pub fn parse(src: &str) -> Result<ProtocolProgram, Vec<IdlError>> {
     let mut handler: Option<Handler> = None;
     let mut scenario: Option<Scenario> = None;
     let mut func: Option<Function> = None;  // §38.1 WIP
+    // §38.5: in-progress handler_set body (name, lines, opener line, depth)
+    let mut open_set: Option<(String, Vec<String>, usize, usize)> = None;
 
     for (idx, raw) in src.lines().enumerate() {
         let line_no = idx + 1;
@@ -643,6 +648,103 @@ pub fn parse(src: &str) -> Result<ProtocolProgram, Vec<IdlError>> {
         }
         .trim();
         if line.is_empty() {
+            continue;
+        }
+
+        // §38.5: inside a handler_set body — collect lines until the
+        // closing brace (brace-depth aware for nested handler blocks)
+        if let Some((name, body, ln, depth)) = open_set.as_mut() {
+            let opens = line.matches('{').count();
+            let closes = line.matches('}').count();
+            *depth += opens;
+            *depth = depth.saturating_sub(closes);
+            if line.trim() == "}" && *depth <= 0 {
+                let (name, body, ln, _) = open_set.take().unwrap();
+                let mini = parse(&format!(
+                    "protocol __frag_{name} v1;\nroles __dummy;\n{}",
+                    body.join("\n")
+                ));
+                match mini {
+                    Ok(m) => {
+                        prog.handler_sets.insert(name, m.handlers);
+                    }
+                    Err(es) => {
+                        for e in es {
+                            errors.push(IdlError {
+                                line: ln,
+                                message: format!("handler_set '{name}': {}", e.message),
+                            });
+                        }
+                    }
+                }
+            } else {
+                body.push(line.to_string());
+                if *depth <= 0 {
+                    // same-line close — finalize without the brace
+                    let (name, body, ln, _) = open_set.take().unwrap();
+                    let mini = parse(&format!(
+                        "protocol __frag_{name} v1;\nroles __dummy;\n{}",
+                        body.join("\n")
+                    ));
+                    match mini {
+                        Ok(m) => {
+                            prog.handler_sets.insert(name, m.handlers);
+                        }
+                        Err(es) => {
+                            for e in es {
+                                errors.push(IdlError {
+                                    line: ln,
+                                    message: format!("handler_set '{name}': {}", e.message),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        // §38.5: handler_set opener — `handler_set name {` or inline
+        if let Some(rest) = line.strip_prefix("handler_set ") {
+            let name = rest.split('{').next().unwrap_or("").trim().to_string();
+            if name.is_empty() {
+                errors.push(IdlError { line: line_no, message: "handler_set needs a name".into() });
+            } else if line.contains('{') && line.ends_with('}') {
+                let inner = &line[line.find('{').unwrap() + 1..line.len() - 1];
+                let mini = parse(&format!(
+                    "protocol __frag_{name} v1;\nroles __dummy;\n{inner}"
+                ));
+                match mini {
+                    Ok(m) => {
+                        prog.handler_sets.insert(name, m.handlers);
+                    }
+                    Err(es) => {
+                        for e in es {
+                            errors.push(IdlError {
+                                line: line_no,
+                                message: format!("handler_set '{name}': {}", e.message),
+                            });
+                        }
+                    }
+                }
+            } else if line.ends_with('{') {
+                open_set = Some((name, Vec::new(), line_no, 1));
+            } else {
+                errors.push(IdlError { line: line_no, message: "malformed handler_set (want 'handler_set name {')".into() });
+            }
+            continue;
+        }
+        // §38.5: splice a declared handler set into the current protocol
+        if let Some(rest) = line.strip_prefix("include handler_set ") {
+            let name = rest.trim_end_matches(';').trim().to_string();
+            match prog.handler_sets.get(&name) {
+                Some(hs) => prog.handlers.extend(hs.iter().cloned()),
+                None => errors.push(IdlError {
+                    line: line_no,
+                    message: format!(
+                        "unknown handler set '{name}' (declare it with handler_set before include)"
+                    ),
+                }),
+            }
             continue;
         }
 
@@ -2208,5 +2310,54 @@ mod alternation_tests {
         )
         .unwrap_err();
         assert!(errs.iter().any(|e| e.message.contains("alternation")));
+    }
+}
+
+#[cfg(test)]
+mod handler_set_tests {
+    use super::*;
+
+    // §38.5: handler_set fragments splice into a protocol via include
+    #[test]
+    fn handler_set_splices_handlers() {
+        let prog = parse(
+            "handler_set common_failure {\non breach -> send failure to buyer;\non expired -> send error to buyer;\n}\nprotocol p v1;\nroles buyer, seller;\non request(\"quote\") from buyer -> send propose to buyer;\non propose from seller -> send accept to seller;\non accept from buyer -> begin;\non accept from seller -> send bye;\ninclude handler_set common_failure;\non failure from seller -> send bye;\non error from seller -> send bye;\n",
+        )
+        .unwrap();
+        assert!(prog.handler_sets.contains_key("common_failure"));
+        assert_eq!(prog.handler_sets["common_failure"].len(), 2);
+        // 6 own handlers + 2 spliced
+        assert_eq!(prog.handlers.len(), 8);
+        assert!(check(&prog).is_ok());
+    }
+
+    #[test]
+    fn handler_set_unknown_include_errors() {
+        let errs = parse(
+            "protocol p v1;\nroles a, b;\non inform from a -> send inform to b;\non inform from b -> send bye;\ninclude handler_set nosuch;\n",
+        )
+        .unwrap_err();
+        assert!(errs.iter().any(|e| e.message.contains("unknown handler set")));
+    }
+
+    #[test]
+    fn handler_set_roles_checked_at_include() {
+        // the fragment references role 'ghost' which the including
+        // protocol does not declare — check() must catch it
+        let prog = parse(
+            "handler_set bad {\non breach -> send failure to ghost;\n}\nprotocol p v1;\nroles a, b;\non inform from a -> send inform to b;\non inform from b -> send bye;\ninclude handler_set bad;\non breach -> send bye;\n",
+        )
+        .unwrap();
+        assert!(check(&prog).is_err());
+    }
+
+    #[test]
+    fn handler_set_inline_form() {
+        let prog = parse(
+            "handler_set tiny { on breach -> send failure to a; }\nprotocol p v1;\nroles a, b;\non inform from a -> send inform to b;\non inform from b -> send bye;\non breach -> send bye;\ninclude handler_set tiny;\n",
+        )
+        .unwrap();
+        assert_eq!(prog.handler_sets["tiny"].len(), 1);
+        assert_eq!(prog.handlers.len(), 4);
     }
 }
