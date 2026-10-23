@@ -46,6 +46,9 @@ fn py_action(a: &ProtocolAction) -> String {
                 None => "None".into(),
             }
         ),
+        ProtocolAction::Enter { phase } => format!(
+            "{{\"kind\": \"enter\", \"phase\": \"{phase}\"}}",
+        ),
         ProtocolAction::Try { body, catch } => format!(
             "{{\"kind\": \"try\", \"body\": [{}], \"catch\": [{}]}}",
             body.iter().map(py_action).collect::<Vec<_>>().join(", "),
@@ -208,8 +211,8 @@ fn py_expr(e: &Expr) -> String {
 
 fn py_trigger(t: &OnTrigger) -> String {
     match t {
-        OnTrigger::Event { performative, pattern, from, .. } => format!(
-            "{{\"kind\": \"event\", \"performative\": \"{}\", \"pattern\": {}, \"from\": {}}}",
+        OnTrigger::Event { performative, pattern, from, phase, .. } => format!(
+            "{{\"kind\": \"event\", \"performative\": \"{}\", \"pattern\": {}, \"from\": {}, {{\"phase\": {}}}",
             py_perf(performative),
             match pattern {
                 Some(p) => serde_json::to_string(p).unwrap_or_default(),
@@ -217,6 +220,10 @@ fn py_trigger(t: &OnTrigger) -> String {
             },
             match from {
                 Some(f) => format!("\"{f}\""),
+                None => "None".to_string(),
+            },
+            match phase {
+                Some(ph) => format!("\"{ph}\""),
                 None => "None".to_string(),
             }
         ),
@@ -276,14 +283,18 @@ pub fn gen_agent_py(prog: &ProtocolProgram, role: &str) -> Result<String, Vec<cr
         })
         .collect();
     out.push_str(&format!(
+        "    PHASES = {}\n",
+        serde_json::to_string(&prog.phases).unwrap_or_default()
+    ));
+    out.push_str(&format!(
         "    TEMPLATES = {}\n",
         serde_json::to_string(&templates).unwrap_or_default()
     ));
     out.push_str("    HANDLERS = [\n");
     for h in &ep.handlers {
         let (kind, base) = match &h.trigger {
-            OnTrigger::Event { performative, from, .. } => {
-                ("event", format!("\"performative\": \"{}\", \"from\": {}", py_perf(performative), match from { Some(f) => format!("\"{f}\""), None => "None".into() }))
+            OnTrigger::Event { performative, from, phase, .. } => {
+                ("event", format!("\"performative\": \"{}\", \"from\": {}, \"phase\": {}", py_perf(performative), match from { Some(f) => format!("\"{f}\""), None => "None".into() }, match phase { Some(ph) => format!("\"{ph}\""), None => "None".into() }))
             }
             OnTrigger::Breach => ("breach", String::new()),
             OnTrigger::Expired => ("expired", String::new()),
@@ -320,6 +331,7 @@ pub fn gen_agent_py(prog: &ProtocolProgram, role: &str) -> Result<String, Vec<cr
         self._awaits = []
         self._catch = None
         self._jump = False
+        self._phase = self.PHASES[0] if self.PHASES else ""
         self.states = {k: None for k in self.STATES}
         self.commitment = "proposed"   # proposed -> active -> fulfilled/breached
         self.timer_due = [0] * len([h for h in self.HANDLERS if h["kind"] == "timer"])
@@ -401,6 +413,9 @@ pub fn gen_agent_py(prog: &ProtocolProgram, role: &str) -> Result<String, Vec<cr
     def _match(self, h, performative, pattern, fields):
         if h["kind"] == "event":
             if h["performative"] != performative:
+                return False
+            # §50: conversation phase gate
+            if h.get("phase") is not None and self._phase != h["phase"]:
                 return False
             if not self._pattern_ok(h["pattern"], pattern, fields):
                 return False
@@ -527,6 +542,10 @@ pub fn gen_agent_py(prog: &ProtocolProgram, role: &str) -> Result<String, Vec<cr
                         break
                 self._catch = None
                 self._jump = False
+            elif a["kind"] == "enter":
+                # §50: conversation phase transition
+                self._phase = a["phase"]
+                self.transcript.append(("state", "phase:" + a["phase"]))
             elif a["kind"] == "await":
                 # §44: arm the collector; flag starts False
                 self._awaits.append({

@@ -383,6 +383,10 @@ pub struct Runtime {
     handling_error: bool,
     /// §44: active await collectors
     awaits: Vec<AwaitSpec>,
+    /// §50: current conversation phase (first declared phase, or "")
+    phase: String,
+    /// §50: declared phases (for enter validation)
+    phases: Vec<String>,
     /// §45: active try/catch — the catch actions of the innermost `try`
     catch_stack: Vec<Vec<ProtocolAction>>,
     /// §45: set when a caught failure cuts the remaining body short
@@ -454,6 +458,8 @@ impl Runtime {
             pending: Vec::new(),
             handling_error: false,
             awaits: Vec::new(),
+            phase: prog.phases.first().cloned().unwrap_or_default(),
+            phases: prog.phases.clone(),
             catch_stack: Vec::new(),
             catch_jump: false,
             in_catch: false,
@@ -854,7 +860,7 @@ impl Runtime {
 
     fn matching_handler(&self, ev: &Event) -> Option<(usize, BTreeMap<String, StateValue>)> {
         self.endpoint.handlers.iter().enumerate().find_map(|(i, h)| match (&h.trigger, ev) {
-            (OnTrigger::Event { performative, pattern, from, .. }, Event::In { from: f, performative: p, pattern: pat, fields }) => {
+            (OnTrigger::Event { performative, pattern, from, phase, .. }, Event::In { from: f, performative: p, pattern: pat, fields }) => {
                 let mut captures: BTreeMap<String, StateValue> = BTreeMap::new();
                 let content_ok = match (pattern.as_ref(), pat.as_ref(), fields) {
                     // no pattern declared: matches anything
@@ -906,8 +912,13 @@ impl Runtime {
                         _ => g.eval(&self.bool_view()),
                     }
                 });
+                let phase_ok = match phase {
+                    Some(want) => self.phase == *want,
+                    None => true,
+                };
                 if content_ok
                     && guard_ok
+                    && phase_ok
                     && from.as_ref().map_or(true, |want| want == f)
                     && (performative == p)
                 {
@@ -999,6 +1010,17 @@ impl Runtime {
                             let reason = format!("broadcast to '{to}': not a list ({:?})", other.map(value_text).unwrap_or_default());
                             self.action_failed(reason, &mut out);
                         }
+                    }
+                }
+                ProtocolAction::Enter { phase } => {
+                    // §50: conversation phase transition
+                    if self.phases.iter().any(|p| p == phase) {
+                        self.phase = phase.clone();
+                        self.log(Dir::State, format!("phase -> {phase}"));
+                    } else {
+                        out.extend(self.deliver_internal_error(format!(
+                            "enter '{phase}': not a declared phase"
+                        )));
                     }
                 }
                 ProtocolAction::Try { body, catch } => {
@@ -2688,5 +2710,60 @@ mod typed_fields_tests {
             fields: Some(BTreeMap::from([("code".into(), FieldValue::Int(42))])),
         });
         assert_eq!(out[0].performative, Performative::Bye);
+    }
+}
+
+#[cfg(test)]
+mod phase_tests {
+    use super::*;
+    use crate::protocol::parse;
+
+    // §50: a handler gated on a phase only fires IN that phase
+    #[test]
+    fn phase_gate_gates() {
+        let prog = parse(
+            "protocol p v1;\nroles a, b;\nphase quoted;\nphase accepted;\non inform {\"price\": $p} from a in quoted { enter accepted; }\non inform from a in accepted -> send bye;\non inform from b -> send bye;\n",
+        )
+        .unwrap();
+        assert!(crate::protocol::check(&prog).is_ok(), "{:?}", crate::protocol::check(&prog).unwrap_err());
+        let mut r = Runtime::new(&prog, "b").unwrap();
+        // initial phase = "quoted": the in-quoted handler fires and enters accepted
+        r.deliver(Event::In { from: "a".into(), performative: Performative::Inform, pattern: None, fields: Some(BTreeMap::from([("price".into(), FieldValue::Int(5))])) });
+        assert_eq!(r.states_snapshot().get("__x"), None);
+        // now in accepted: the second handler fires
+        let out = r.deliver(Event::In { from: "a".into(), performative: Performative::Inform, pattern: None, fields: None });
+        assert_eq!(out[0].performative, Performative::Bye);
+        // back in quoted the FIRST handler would fire again if re-entered —
+        // but we are in accepted: inform without price does nothing
+        // still in accepted: the gated handler fires again
+        let out2 = r.deliver(Event::In { from: "a".into(), performative: Performative::Inform, pattern: None, fields: None });
+        assert_eq!(out2[0].performative, Performative::Bye);
+    }
+
+    #[test]
+    fn undeclared_phase_is_compile_error() {
+        let prog = parse(
+            "protocol p v1;\nroles a, b;\non inform from a in nosuch -> send bye;\non inform from b -> send bye;\n",
+        )
+        .unwrap();
+        let es = crate::protocol::check(&prog).unwrap_err();
+        assert!(
+            es.iter().any(|e| e.message.contains("'nosuch'")),
+            "{es:?}"
+        );
+    }
+
+    #[test]
+    fn enter_undeclared_phase_is_runtime_error() {
+        let prog = parse(
+            "protocol p v1;\nroles a, b;\nphase quoted;\non inform from a { enter nosuch; }\non inform from b -> send bye;\n",
+        )
+        .unwrap();
+        // check catches it first — verify both layers
+        assert!(crate::protocol::check(&prog).is_err());
+        let mut r = Runtime::new(&prog, "b").unwrap();
+        let out = r.deliver(Event::In { from: "a".into(), performative: Performative::Inform, pattern: None, fields: None });
+        assert!(out.is_empty());
+        assert!(r.transcript().iter().any(|e| e.text.contains("not a declared phase")));
     }
 }

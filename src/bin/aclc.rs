@@ -81,6 +81,8 @@ fn main() {
                                             acl_core::protocol::ProtocolAction::Await { count, performative, into, .. } =>
                                                 format!("await {count} {:?} into {into}", performative),
                                             acl_core::protocol::ProtocolAction::Try { .. } => "try/catch".into(),
+                                            acl_core::protocol::ProtocolAction::Enter { phase } =>
+                                                format!("enter {phase}"),
                                         }).collect();
                                         println!("    on {} -> {}", t, a.join("; "));
                                     }

@@ -35,7 +35,14 @@ pub enum OnTrigger {
     /// `on request("quote") from buyer` — incoming speech act (optionally
     /// patterned, attributed to a sender role, and in n-role protocols
     /// optionally restricted to ONE executor via `as <role>`)
-    Event { performative: Performative, pattern: Option<String>, from: Option<String>, as_role: Option<String> },
+    Event {
+        performative: Performative,
+        pattern: Option<String>,
+        from: Option<String>,
+        as_role: Option<String>,
+        /// §50: conversation phase gate — handler fires only in this phase
+        phase: Option<String>,
+    },
     /// `on breach` — a commitment this role owes was broken
     Breach,
     /// `on expired` — the session/commitment deadline passed
@@ -74,6 +81,8 @@ pub enum ProtocolAction {
     /// §38.8: `broadcast <perf> [payload] to <list_state>;` — fan-out to
     /// every role named in a list state (contract-net announce)
     Broadcast { performative: Performative, fields: Option<BTreeMap<String, String>>, to: String },
+    /// §50: `enter <phase>;` — transition the session's conversation phase
+    Enter { phase: String },
     /// §45: `try { ... } catch { ... };` — a failing action inside the
     /// body (set/push/put eval error, container violation, fmt failure)
     /// cuts the body short and runs the catch actions instead of routing
@@ -496,6 +505,10 @@ pub struct ProtocolProgram {
     /// §38.10: sets made importable by `export handler_set name;` —
     /// everything else stays private to the module file
     pub exported_sets: Vec<String>,
+    /// §50: declared conversation phases — handlers may be gated on the
+    /// current phase (`on inform ... in <phase>`) and actions transition
+    /// with `enter <phase>;`. The FIRST declared phase is the initial one.
+    pub phases: Vec<String>,
     /// §42: `protocol v2 extends v1;` — the base protocol declared
     /// earlier in the same file (states/types/fns/handlers inherited,
     /// handlers overridable by matching trigger+guard signature)
@@ -854,7 +867,7 @@ fn merge_programs(mut progs: Vec<ProtocolProgram>) -> Result<ProtocolProgram, Ve
 /// §42: a handler's override signature — trigger word + pattern + from + guard
 pub fn handler_sig(h: &Handler) -> String {
     let trig = match &h.trigger {
-        OnTrigger::Event { performative, pattern, from, as_role } => format!(
+        OnTrigger::Event { performative, pattern, from, as_role, phase } => format!(
             "{}|{:?}|{:?}",
             perf_word(performative),
             pattern,
@@ -1185,6 +1198,16 @@ fn parse_single(src: &str) -> Result<ProtocolProgram, Vec<IdlError>> {
             prog.extends = extends;
             continue;
         }
+        // §50: conversation phase declaration
+        if let Some(rest) = line.strip_prefix("phase ") {
+            let name = rest.trim_end_matches(';').trim().to_string();
+            if name.is_empty() {
+                errors.push(IdlError { line: line_no, message: "phase needs a name".into() });
+            } else {
+                prog.phases.push(name);
+            }
+            continue;
+        }
         if let Some(rest) = line.strip_prefix("roles ") {
             let list = rest.trim_end_matches(';');
             for r in list.split(',') {
@@ -1296,6 +1319,9 @@ fn parse_single(src: &str) -> Result<ProtocolProgram, Vec<IdlError>> {
                 Some(i) => rest[..i].trim().to_string(),
                 None => head.to_string(),
             };
+            // §50: peel `in <phase>` (conversation state gate) — outside
+            // braces/strings, before the other peels
+            let (head, trig_phase) = peel_phase(&head);
             // §43: peel `as <role>` (executor restriction for n-role) —
             // BEFORE the guard peel, from the END of the head
             let (head, as_role) = match head.rfind(" as ") {
@@ -1348,13 +1374,16 @@ fn parse_single(src: &str) -> Result<ProtocolProgram, Vec<IdlError>> {
             }
             let mut hs: Vec<Handler> = Vec::new();
             for hhead in &expanded {
-                let trigger = match parse_trigger_as(hhead, as_role.clone()) {
+                let mut trigger = match parse_trigger_as(hhead, as_role.clone()) {
                     Ok(t) => t,
                     Err(e) => {
                         errors.push(IdlError { line: line_no, message: e });
                         continue;
                     }
                 };
+                if let OnTrigger::Event { phase, .. } = &mut trigger {
+                    *phase = trig_phase.clone();
+                }
                 hs.push(Handler { trigger, guard: guard.clone(), actions: Vec::new(), line: line_no });
             }
             if hs.is_empty() {
@@ -1539,6 +1568,44 @@ fn parse_single(src: &str) -> Result<ProtocolProgram, Vec<IdlError>> {
     if errors.is_empty() { Ok(prog) } else { Err(errors) }
 }
 
+/// §50: peel ` in <phase>` from a handler head — scans OUTSIDE braces and
+/// string literals so a pattern like `{"m": "hello in there"}` is untouched
+fn peel_phase(head: &str) -> (String, Option<String>) {
+    let cs: Vec<char> = head.chars().collect();
+    let mut depth = 0i64;
+    let mut in_str = false;
+    let mut i = 0;
+    while i < cs.len() {
+        let c = cs[i];
+        match c {
+            '"' => in_str = !in_str,
+            '{' if !in_str => depth += 1,
+            '}' if !in_str => depth -= 1,
+            ' ' if depth == 0 && !in_str => {
+                if i + 4 <= cs.len() && cs[i + 1] == 'i' && cs[i + 2] == 'n' && cs[i + 3] == ' ' {
+                    let mut j = i + 4;
+                    while j < cs.len() && (cs[j].is_alphanumeric() || cs[j] == '_') {
+                        j += 1;
+                    }
+                    if j > i + 4 {
+                        let rest: String = cs[j..].iter().collect();
+                        if rest.trim_start().starts_with("from") || rest.trim().is_empty() {
+                            let phase: String = cs[i + 4..j].iter().collect();
+                            return (
+                                cs[..i].iter().collect::<String>().trim().to_string(),
+                                Some(phase),
+                            );
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    (head.to_string(), None)
+}
+
 /// §45: split statements on ';' at brace-depth 0 — `try { a; b; } catch { c };`
 /// stays one statement.
 fn split_stmts(src: &str) -> Vec<String> {
@@ -1573,6 +1640,12 @@ fn parse_trigger(head: &str) -> Result<OnTrigger, String> {
 
 fn parse_trigger_as(head: &str, as_role: Option<String>) -> Result<OnTrigger, String> {
     let (word, pattern, from) = split_trigger(head);
+    // §50: `on inform in quoted from a` — the phase gate lives between
+    // the performative (and pattern) and the from-clause
+    let (word, phase) = match word.split_once(" in ") {
+        Some((w, ph)) => (w.trim().to_string(), Some(ph.trim().to_string())),
+        None => (word, None),
+    };
     match word.as_str() {
         "breach" | "expired" if from.is_some() => {
             Err(format!("'{word}' cannot have a 'from' role"))
@@ -1580,7 +1653,7 @@ fn parse_trigger_as(head: &str, as_role: Option<String>) -> Result<OnTrigger, St
         "breach" => Ok(OnTrigger::Breach),
         "expired" => Ok(OnTrigger::Expired),
         w => match perf_from_word(w) {
-            Some(p) => Ok(OnTrigger::Event { performative: p, pattern, from, as_role }),
+            Some(p) => Ok(OnTrigger::Event { performative: p, pattern, from, as_role, phase }),
             None => Err(format!("unknown trigger '{word}'")),
         },
     }
@@ -1761,6 +1834,11 @@ fn parse_action(stmt: &str) -> Result<ProtocolAction, String> {
         let performative = perf_from_word(perf_w)
             .ok_or_else(|| format!("unknown performative '{perf_w}'"))?;
         return Ok(ProtocolAction::Broadcast { performative, fields, to: target });
+    }
+    if let Some(rest) = s.strip_prefix("enter ") {
+        // §50: conversation phase transition
+        let phase = rest.trim_end_matches(';').trim().to_string();
+        return Ok(ProtocolAction::Enter { phase });
     }
     if let Some(rest) = s.strip_prefix("try ") {
         // §45: `try { a; b; } catch { c; };` — inline form
@@ -2089,9 +2167,9 @@ pub fn check(prog: &ProtocolProgram) -> Result<Vec<String>, Vec<IdlError>> {
     let mut sigs: BTreeMap<String, ()> = BTreeMap::new();
     for h in &prog.handlers {
         let sig = match &h.trigger {
-            OnTrigger::Event { performative, pattern, from, as_role } => {
+            OnTrigger::Event { performative, pattern, from, as_role, phase } => {
                 format!(
-                    "event:{performative:?}:{pattern:?}:{from:?}:{as_role:?}:guard={:?}",
+                    "event:{performative:?}:{pattern:?}:{from:?}:{as_role:?}:{phase:?}:guard={:?}",
                     h.guard.as_ref().map(|g| guard_word(g))
                 )
             }
@@ -2152,6 +2230,34 @@ pub fn check(prog: &ProtocolProgram) -> Result<Vec<String>, Vec<IdlError>> {
                     line: 0,
                     message: format!("end when references undeclared state '{s}'"),
                 });
+            }
+        }
+    }
+
+    // ---- §50: conversation phases — triggers and enter targets must
+    // reference declared phases
+    let bad_phase = |name: &str, what: &str, line: usize, errors: &mut Vec<IdlError>| {
+        if prog.phases.is_empty() {
+            errors.push(IdlError {
+                line,
+                message: format!("{what} '{name}': the protocol declares no phases"),
+            });
+            return;
+        }
+        if !prog.phases.iter().any(|p| p == name) {
+            errors.push(IdlError {
+                line,
+                message: format!("{what} references undeclared phase '{name}'"),
+            });
+        }
+    };
+    for h in &prog.handlers {
+        if let OnTrigger::Event { phase: Some(ph), .. } = &h.trigger {
+            bad_phase(ph, "trigger phase", h.line, &mut errors);
+        }
+        for a in all_actions(&h.actions) {
+            if let ProtocolAction::Enter { phase } = a {
+                bad_phase(phase, "enter", h.line, &mut errors);
             }
         }
     }
@@ -2634,11 +2740,14 @@ pub fn pretty(prog: &ProtocolProgram) -> String {
     }
     for h in &prog.handlers {
         let mut trig = match &h.trigger {
-            OnTrigger::Event { performative, pattern, from, as_role } => {
+            OnTrigger::Event { performative, pattern, from, as_role, phase } => {
                 let mut t = match pattern {
                     Some(p) => format!("{}{}", perf_word(performative), p),
                     None => perf_word(performative).to_string(),
                 };
+                if let Some(ph) = phase {
+                    t.push_str(&format!(" in {ph}"));
+                }
                 if let Some(f) = from {
                     t.push_str(&format!(" from {f}"));
                 }
@@ -2833,6 +2942,7 @@ fn action_word(a: &ProtocolAction) -> String {
             within_ms,
             flag
         ),
+        ProtocolAction::Enter { phase } => format!("enter {phase}"),
         ProtocolAction::Try { body, catch } => format!(
             "try {{ {} }} catch {{ {} }}",
             body.iter().map(action_word).collect::<Vec<_>>().join("; "),
@@ -3344,11 +3454,14 @@ fn import_module(
 /// captures/patterns round-trip through the same grammar).
 fn handler_to_text(h: &Handler) -> Vec<String> {
     let mut head = match &h.trigger {
-        OnTrigger::Event { performative, pattern, from, as_role } => {
+        OnTrigger::Event { performative, pattern, from, as_role, phase } => {
             let mut t = perf_word(performative).to_string();
             if let Some(p) = pattern {
                 t.push(' ');
                 t.push_str(p);
+            }
+            if let Some(ph) = phase {
+                t.push_str(&format!(" in {ph}"));
             }
             if let Some(f) = from {
                 t.push_str(&format!(" from {f}"));

@@ -38,6 +38,7 @@ pub fn double_confirmation() -> Handler {
             pattern: None,
             from: None,
             as_role: None,
+            phase: None,
         },
         guard: Some(Guard::Atom { name: "confirmed".into(), neg: false }),
         actions: vec![ProtocolAction::Begin],
