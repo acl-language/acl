@@ -2,7 +2,10 @@
 """acl-py binding test: build, sign, verify, encode/decode, framing, tamper check."""
 
 import sys, os, time, secrets
-sys.path.insert(0, "/home/guilherme/apps/acl/acl-py/target/debug")
+import os
+_here = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(_here, "..", "..", "acl-py", "target", "debug"))
+# CI override: the .so is built before this step; PYTHONPATH also works
 import acl_py
 
 print("ACL_VERSION =", acl_py.ACL_VERSION)

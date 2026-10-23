@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Unit tests (acl-core + bridges)
+        run: cargo test
+      - name: Build binaries
+        run: cargo build --bin peer --bin httpd --bin interop --bin mcp_bridge
+      - name: Build acl-py binding
+        working-directory: acl-py
+        run: PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 cargo build
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Python deps for interop demos
+        run: python3 -m pip install --user msgpack cryptography
+      - name: Spec-only codec ↔ acl-core interop
+        run: python3 tests/interop/py_codec.py /tmp/acl-interop $(pwd)/target/debug/interop
+      - name: Binding test
+        run: python3 tests/interop/binding_test.py
+        env:
+          # binding_test.py imports acl_py from the acl-py target dir
+          PYTHONPATH: acl-py/target/debug
+      - name: stdio transport demo
+        run: python3 tests/interop/stdio_demo.py /tmp/acl-stdio target/debug/peer
+      - name: HTTP/SSE transport demo
+        run: |
+          target/debug/httpd --port 9200 &
+          sleep 1
+          python3 tests/interop/http_demo.py 9200
+          kill %1
+      - name: MCP bridge demo (real MCP server via node)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: mkdir -p /tmp/acl-mcp
+      - run: python3 tests/mcp/bridge_demo.py /tmp/acl-mcp target/debug/mcp_bridge tests/mcp/server.js
