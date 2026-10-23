@@ -416,7 +416,7 @@ an ACL capability.
 | `acl-py` binding | 5/5 (incl. cross-verification by the spec-only codec) |
 | stdio transport (`acl-peer`) | live-pipe demo: §8 workflow + signed card |
 | HTTP/SSE transport (`acl-httpd`) | live demo: sync POST, signed SSE stream, card |
-| A2A bridge | unit-tested state/task mapping |
+| A2A bridge | unit-tested mapping + end-to-end vs real A2A server (HTTP) |
 | MCP bridge (`acl-mcp-bridge`) | end-to-end against a real MCP server (node) |
 
 Not yet implemented: WebSocket transport, sealed envelopes (v0.2),
