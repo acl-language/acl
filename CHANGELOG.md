@@ -5,11 +5,36 @@ Format based on Keep a Changelog; versions follow semver for the
 **implementation** and a separate `SPEC-VERSION` for the protocol.
 
 ## [Unreleased]
+
+## [0.2.0] — 2026-10-23
+
+All changes additive; SPEC-VERSION on the wire remains `1`.
+
 ### Added
 - **Content Language (CL)** (spec §6.2): shared grammar for facts, typed
   actions, queries and commitments with per-performative grammar matrix and
   commitment lifecycle; canonical arg ordering for stable signatures.
-  Supported in acl-core, acl-py and acl-ts.
+  Supported in acl-core, acl-py and acl-ts. Reference agent `acl-peer`
+  answers fact queries, executes CL actions and rejects ill-formed bodies.
+- **WebSocket transport** (`acl-wsd`, spec §9.3): RFC 6455 upgrade, binary
+  frames, signed replies — validated end-to-end.
+- **Sealed envelopes** (spec §10.1): X25519 + ChaCha20-Poly1305
+  end-to-end confidentiality through relays.
+- **TypeScript binding** (`acl-ts`, napi-rs): sign/verify/decode/framing.
+- **Idempotency & ordering** (spec §8.1): semantic dedup by `msg_id`,
+  retransmission rules, eviction.
+- **Local agent registry** (spec §13bis): file-backed discovery + CLI.
+- **A2A bridge validated live** against a real A2A server (HTTP):
+  Agent Card ↔ AgentCard, message/send ↔ request/Task.
+- **Multi-agent pilots demo**: 3 agents over live pipes with real
+  delegate chains.
+- **Governance**: CONTRIBUTING, RFC process + template, CODEOWNERS,
+  issue templates, spec versioning policy (§14).
+- **Robustness**: fuzz-lite corpus tests (70k+ inputs, decoder never
+  panics) + cargo-fuzz target.
+- **Benchmarks** (BENCH.md): encode 0.57 µs, decode 0.94 µs, verify
+  80 µs; msgpack −43% vs JSON.
+- **Docs CI**: rustdoc artifact on every push; tutorial + quickstart script.
 
 ## [0.1.0] — 2026-10-22
 

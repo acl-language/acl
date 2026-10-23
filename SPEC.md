@@ -1,6 +1,6 @@
 # ACL — Agent Communication Language
 
-**Version:** 0.1.0-draft
+**Version:** 0.2.0-draft
 **Status:** Draft specification
 **License:** Apache-2.0 (spec + reference implementation)
 
@@ -473,7 +473,7 @@ peers. Reference: `acl_core::registry` + `registry_cli`.
   path; dual-stack decoders are recommended during transitions.
 - The changelog is authoritative for what changed between spec versions.
 
-## 15. Implementation status (v0.1)
+## 15. Implementation status (v0.2)
 
 | component | tests / validation |
 |-----------|--------------------|
@@ -485,6 +485,15 @@ peers. Reference: `acl_core::registry` + `registry_cli`.
 | A2A bridge | unit-tested mapping + end-to-end vs real A2A server (HTTP) |
 | MCP bridge (`acl-mcp-bridge`) | end-to-end against a real MCP server (node) |
 | multi-agent demo (`tests/pilots/`) | 3 Python agents over live pipes: watch, input_required workflow, real delegate chain — all signed |
+| WebSocket transport (`acl-wsd`) | live demo: RFC 6455 upgrade, binary frames, signed replies |
+| sealed envelopes (`src/sealed.rs`) | roundtrip + wrong-key + tampered-ciphertext tests (§10.1) |
+| idempotency (`src/idempotency.rs`) | dedup/violation/eviction tests (§8.1) |
+| content language (`src/cl.rs`, §6.2) | roundtrip all ops, canonical ordering, grammar matrix, lifecycle; **live demo: acl-peer answers facts, executes actions, rejects ill-formed (422)** |
+| TypeScript binding (`acl-ts`) | node test: sign/verify/decode/framing/tamper |
+| local registry (`src/registry.rs`) | register/lookup/by-capability/persist tests + CLI |
+| robustness (`tests/robustness.rs`) | 70k+ fuzz-lite inputs, decoder never panics; cargo-fuzz target in `fuzz/` |
+| benchmarks (`tests/bench.rs`) | encode 0.57 µs, decode 0.94 µs, verify 80 µs; msgpack −43% vs JSON (BENCH.md) |
 
-Not yet implemented: WebSocket transport, sealed envelopes (v0.2),
-TypeScript binding, live-network A2A peer validation, public governance.
+Not yet implemented: sealed-envelope key rotation/HD derivation,
+batch signature verification, WS client demo in CI (server-side validated),
+public governance body.

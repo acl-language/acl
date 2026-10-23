@@ -76,9 +76,21 @@ env.sign(key)
 
 ## Status
 
-v0.1-draft, Apache-2.0. Validated: stdio, HTTP/SSE, Python binding,
-MCP bridge, A2A state mapping. Not yet: WebSocket, sealed envelopes,
-TypeScript binding, public governance.
+v0.2-draft, Apache-2.0 (SPEC-VERSION 1 on the wire — all changes additive).
+
+Validated end-to-end: stdio/pipes, HTTP sync, SSE streaming (per-event
+signatures), WebSocket, Python + TypeScript bindings, sealed envelopes
+(X25519 + ChaCha20-Poly1305), idempotency, local registry, MCP bridge
+(against a real MCP server), A2A bridge (against a real A2A server over
+HTTP), 3-agent delegate-chain demo, content language (facts/actions/
+queries/commitments) spoken by the reference agent.
+
+Also here: [BENCH.md](BENCH.md) (codec benchmarks),
+[docs/TUTORIAL.md](docs/TUTORIAL.md) (10-minute guide),
+[governance/](governance/) (RFC process).
+
+Not yet: sealed-envelope key rotation, batch signature verification,
+public governance body (RFCs exist; stewards pending).
 
 ## License
 
