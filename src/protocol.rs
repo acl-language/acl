@@ -1595,10 +1595,11 @@ fn peel_phase(head: &str) -> (String, Option<String>) {
                         let rest: String = cs[j..].iter().collect();
                         if rest.trim_start().starts_with("from") || rest.trim().is_empty() {
                             let phase: String = cs[i + 4..j].iter().collect();
-                            return (
-                                cs[..i].iter().collect::<String>().trim().to_string(),
-                                Some(phase),
-                            );
+                            // §54: keep the REST (` from b`, ...) — only the
+                            // `in <phase>` gate is removed
+                            let mut head: String = cs[..i].iter().collect();
+                            head.push_str(&rest);
+                            return (head.trim().to_string(), Some(phase));
                         }
                     }
                 }
@@ -2273,6 +2274,28 @@ pub fn check(prog: &ProtocolProgram) -> Result<Vec<String>, Vec<IdlError>> {
         }
     }
 
+    // ---- §54: phase reachability — a declared phase that is never
+    // `enter`-ed can never host its handlers (compile WARNING; proving
+    // cross-participant phase compatibility needs global analysis)
+    {
+        let entered: Vec<&str> = prog
+            .handlers
+            .iter()
+            .flat_map(|h| all_actions(&h.actions))
+            .filter_map(|a| match a {
+                ProtocolAction::Enter { phase } => Some(phase.as_str()),
+                _ => None,
+            })
+            .collect();
+        for (i, ph) in prog.phases.iter().enumerate() {
+            if i > 0 && !entered.contains(&ph.as_str()) {
+                warnings.push(format!(
+                    "phase '{ph}' is never entered — its handlers are unreachable"
+                ));
+            }
+        }
+    }
+
     // ---- §47: function recursion is a compile error (no call stacks in
     // the runtime — a cycle would hang delivery)
     {
@@ -2749,6 +2772,9 @@ pub fn pretty(prog: &ProtocolProgram) -> String {
             None => out.push_str(&format!("state {};\n", s.name)),
         }
     }
+    for ph in &prog.phases {
+        out.push_str(&format!("phase {ph};\n"));
+    }
     for h in &prog.handlers {
         let mut trig = match &h.trigger {
             OnTrigger::Event { performative, pattern, from, as_role, phase } => {
@@ -2761,6 +2787,9 @@ pub fn pretty(prog: &ProtocolProgram) -> String {
                 }
                 if let Some(f) = from {
                     t.push_str(&format!(" from {f}"));
+                }
+                if let Some(a) = as_role {
+                    t.push_str(&format!(" as {a}"));
                 }
                 t
             }
@@ -2919,14 +2948,16 @@ fn guard_word(g: &Guard) -> String {
 fn action_word(a: &ProtocolAction) -> String {
     match a {
         ProtocolAction::Send { performative, to, fields, .. } => {
-            let mut out = match to {
-                Some(r) => format!("send {} to {}", perf_word(performative), r),
-                None => format!("send {}", perf_word(performative)),
-            };
-            if let Some(f) = fields {
-                out.push_str(&format!(" {}", serde_json::to_string(f).unwrap_or_default()));
+            // §54: the payload goes BEFORE `to` — that is the order the
+            // send parser expects (`send X {payload} to R`)
+            let payload = fields
+                .as_ref()
+                .map(|f| format!(" {}", serde_json::to_string(f).unwrap_or_default()))
+                .unwrap_or_default();
+            match to {
+                Some(r) => format!("send {}{} to {}", perf_word(performative), payload, r),
+                None => format!("send {}{}", perf_word(performative), payload),
             }
-            out
         }
         ProtocolAction::Begin => "begin".into(),
         ProtocolAction::Fulfil => "fulfil".into(),
@@ -3923,6 +3954,40 @@ mod tooling_tests {
         .map(|e| e.message)
         .collect();
         assert!(es.iter().any(|m| m.contains("recursive")), "{es:?}");
+    }
+
+    // §54: parse -> pretty -> parse must be a FIXPOINT for every language
+    // feature — formatting may never invalidate a program
+    #[test]
+    fn pretty_roundtrip_preserves_all_features() {
+        let src = concat!(
+            "protocol p v1;\n",
+            "roles a, b, c;\n",
+            "phase start;\n",
+            "phase work;\n",
+            "state n: int;\n",
+            "type Bid = { price: int };\n",
+            "message m = \"hi\";\n",
+            "transport http;\n",
+            "capacity 4;\n",
+            "abort when n > 9;\n",
+            "fn f(x: int) -> int {\nset r = x + 1;\nreturn r;\n}\n",
+            "on request from a as b { set n = f(2); send propose to c; }\n",
+            "on inform {\"n\": $n} from b in work -> send inform {\"r\": \"${n}\"} to a;\n",
+            "on propose from b as c { try { set n = n / 0; } catch { set n = 0; } }\n",
+            "on breach -> send failure to a;\n",
+            "on inform from a -> send bye;\n",
+        );
+        let p1 = parse(src).unwrap();
+        let f1 = pretty(&p1);
+        let p2 = parse(&f1).expect("pretty output must reparse");
+        let f2 = pretty(&p2);
+        assert_eq!(p1, p2, "roundtrip semantic equality");
+        assert_eq!(f1, f2, "formatting must be IDEMPOTENT");
+        // the formatter preserves executor attribution and phases
+        assert!(f1.contains(" as b"), "{f1}");
+        assert!(f1.contains("phase work;"), "{f1}");
+        assert!(f1.contains(" in work"), "{f1}");
     }
 
     #[test]

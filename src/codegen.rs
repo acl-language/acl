@@ -189,7 +189,10 @@ fn py_expr(e: &Expr) -> String {
     match e {
         Expr::LitInt(i) => format!("{{\"lit\": {}}}", i),
         Expr::LitStr(s) => format!("{{\"lit\": {}}}", serde_json::to_string(s).unwrap_or_default()),
-        Expr::LitBool(b) => format!("{{\"lit\": {}}}", b),
+        Expr::LitBool(b) => format!(
+            "{{\"lit\": {}}}",
+            if *b { "True" } else { "False" }
+        ),
         Expr::State(n) => format!("{{\"state\": \"{}\"}}", n),
         // §38.3: capture references serialize as a capture node
         Expr::Capture(n) => format!("{{\"capture\": \"{}\"}}", n),
@@ -556,6 +559,40 @@ pub fn gen_agent_py(prog: &ProtocolProgram, role: &str) -> Result<String, Vec<cr
     def _run(self, h):
         out = []
         for a in h["actions"]:
+            self._run_one(a, out)
+        return out
+
+    def deliver(self, from_role, performative, pattern=None, fields=None):
+        """Feed one incoming speech act; returns the outgoing ones."""
+        self._arg = fields or {}
+        # §44: an active await collector CONSUMES matching events
+        for aw in list(self._awaits):
+            if aw["performative"] == performative:
+                payload = dict(fields or {})
+                cur = self.states.get(aw["into"])
+                if isinstance(cur, list):
+                    cur.append(payload)
+                else:
+                    self.states[aw["into"]] = [payload]
+                aw["count_left"] -= 1
+                if aw["count_left"] <= 0:
+                    self._awaits.remove(aw)
+                    self.states[aw["flag"]] = True
+                return []
+        self.transcript.append(("in", performative, from_role))
+        for h in self.HANDLERS:
+            if h["kind"] == "breach" or h["kind"] == "expired":
+                continue
+            if h["kind"] == "event" and h["from"] is not None and h["from"] != from_role:
+                continue
+            if self._match(h, performative, pattern, fields):
+                return self._run(h)
+        return []   # logged, unhandled (§33.4 auditability)
+
+    def _run_one(self, a, out):
+        # ONE dispatcher for top-level AND nested execution — a failing
+        # action routes like the Rust runtime; caught failures jump
+        try:
             if a["kind"] == "send":
                 self.transcript.append(("out", a["performative"]))
                 fields = a["fields"]
@@ -604,113 +641,6 @@ pub fn gen_agent_py(prog: &ProtocolProgram, role: &str) -> Result<String, Vec<cr
                 # §50: conversation phase transition
                 self._phase = a["phase"]
                 self.transcript.append(("state", "phase:" + a["phase"]))
-            elif a["kind"] == "await":
-                # §44: arm the collector; flag starts False
-                self._awaits.append({
-                    "count_left": a["count"],
-                    "performative": a["performative"],
-                    "into": a["into"],
-                    "deadline_ms": self._now + a["within_ms"],
-                    "flag": a["flag"],
-                })
-                self.states[a["flag"]] = False
-            elif a["kind"] == "broadcast":
-                # §38.8: fan-out — one send per role in the list state
-                for r in (self.states.get(a["to"]) or []):
-                    self.transcript.append(("out", a["performative"]))
-                    out.append({"to": r, "performative": a["performative"], "fields": a["fields"]})
-            elif a["kind"] == "push":
-                cur = self.states.get(a["state"])
-                if cur is None:
-                    self.states[a["state"]] = [self._eval(a["expr"])]
-                elif isinstance(cur, list):
-                    cur.append(self._eval(a["expr"]))
-                self.transcript.append(("state", "push:" + a["state"]))
-            elif a["kind"] == "put":
-                cur = self.states.get(a["state"])
-                if cur is None:
-                    self.states[a["state"]] = {}
-                if isinstance(self.states[a["state"]], dict):
-                    key = self._eval({"lit": 0, "str": a["key"]}) if False else a["key"]
-                    self.states[a["state"]][key] = self._eval(a["expr"])
-                self.transcript.append(("state", "put:" + a["state"]))
-            elif a["kind"] == "for":
-                lst = list(self.states.get(a["over"]) or [])
-                saved = self.states.get(a["var"])
-                for item in lst:
-                    self.states[a["var"]] = item
-                    for sub in a["actions"]:
-                        self._exec_one(sub)
-                if saved is None:
-                    self.states.pop(a["var"], None)
-                else:
-                    self.states[a["var"]] = saved
-            elif a["kind"] == "abort":
-                self.commitment = "breached"
-                self.transcript.append(("state", "abort"))
-        return out
-
-    def _exec_one(self, a):
-        self._run({"actions": [a]})
-
-    # -- public surface -----------------------------------------------
-    def deliver(self, from_role, performative, pattern=None, fields=None):
-        """Feed one incoming speech act; returns the outgoing ones."""
-        self._arg = fields or {}
-        # §44: an active await collector CONSUMES matching events
-        for aw in list(self._awaits):
-            if aw["performative"] == performative:
-                payload = dict(fields or {})
-                cur = self.states.get(aw["into"])
-                if isinstance(cur, list):
-                    cur.append(payload)
-                else:
-                    self.states[aw["into"]] = [payload]
-                aw["count_left"] -= 1
-                if aw["count_left"] <= 0:
-                    self._awaits.remove(aw)
-                    self.states[aw["flag"]] = True
-                return []
-        self.transcript.append(("in", performative, from_role))
-        for h in self.HANDLERS:
-            if h["kind"] == "breach" or h["kind"] == "expired":
-                continue
-            if h["kind"] == "event" and h["from"] is not None and h["from"] != from_role:
-                continue
-            if self._match(h, performative, pattern, fields):
-                return self._run(h)
-        return []   # logged, unhandled (§33.4 auditability)
-
-    def _run_one(self, a, out):
-        # §45: one action; failures route like the Rust runtime
-        try:
-            if a["kind"] == "send":
-                self.transcript.append(("out", a["performative"]))
-                out.append({"to": a["to"], "performative": a["performative"], "fields": a["fields"]})
-            elif a["kind"] == "begin":
-                if self.commitment == "proposed":
-                    self.commitment = "active"
-                self.transcript.append(("state", "begin"))
-            elif a["kind"] == "fulfil":
-                if self.commitment == "active":
-                    self.commitment = "fulfilled"
-                self.transcript.append(("state", "fulfil"))
-            elif a["kind"] == "retract":
-                self.states[a["target"]] = False
-                self.transcript.append(("state", "retract:" + a["target"]))
-            elif a["kind"] == "set":
-                self.states[a["name"]] = self._eval(a["expr"])
-                self.transcript.append(("state", "set:" + a["name"]))
-            elif a["kind"] == "try":
-                # §45: handler-local error flow — a failing action in
-                # the body cuts it short and runs the catch actions
-                self._catch = a["catch"]
-                for b in a["body"]:
-                    self._run_one(b, out)
-                    if self._jump:
-                        break
-                self._catch = None
-                self._jump = False
             elif a["kind"] == "await":
                 # §44: arm the collector; flag starts False
                 self._awaits.append({

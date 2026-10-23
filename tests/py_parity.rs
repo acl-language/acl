@@ -1,6 +1,8 @@
 //! §52: semantic parity — the Rust runtime and the generated Python agent
-//! MUST produce identical observable behavior for the same input sequence.
-//! Requires a python3 interpreter; ignored by default (`--ignored`).
+//! MUST produce identical observable behavior for the same input sequence,
+//! INCLUDING nested actions (enter/begin/fulfil/interp send inside try),
+//! exercised catch paths, and named-commitment lifecycles.
+//! Requires a python3 interpreter; run with `cargo test --test py_parity -- --ignored`.
 
 use acl_core::protocol::parse;
 use acl_core::runtime::{Event, FieldValue, Runtime, StateValue};
@@ -15,15 +17,29 @@ state x: int;
 state y: int;
 state flag: bool;
 on inform {"n": $n} from a in start {
-  try { set x = $n * 2; set y = x + 1; } catch { set y = -1; }
-  begin job;
-  send inform {"r": "${y}"} to a;
+  try { set x = $n * 2; set y = x + 1; enter done; begin job; send inform {"r": "${y}"} to a; } catch { set y = -1; }
 }
-on inform from a in done -> fulfil job;
+on inform {"n": $n} from a in done {
+  try { set x = x / 0; } catch { set flag = true; }
+  fulfil job;
+}
 every 1s as b while not flag -> set flag = true;
 "#;
 
-fn rust_run() -> (Vec<String>, BTreeMap<String, String>) {
+fn state_text(v: &StateValue) -> String {
+    match v {
+        StateValue::Bool(b) => b.to_string(),
+        StateValue::Int(i) => i.to_string(),
+        StateValue::Float(f) => f.to_string(),
+        StateValue::Str(s) => s.clone(),
+        StateValue::List(_) => "<list>".into(),
+        StateValue::Map(_) => "<map>".into(),
+        StateValue::Record(_) => "<record>".into(),
+        StateValue::Unset => "unset".into(),
+    }
+}
+
+fn rust_run() -> (Vec<String>, BTreeMap<String, String>, BTreeMap<String, String>) {
     let prog = parse(PROGRAM).unwrap();
     let mut r = Runtime::new(&prog, "b").unwrap();
     let mut outs = Vec::new();
@@ -51,7 +67,7 @@ fn rust_run() -> (Vec<String>, BTreeMap<String, String>) {
         from: "a".into(),
         performative: acl_core::Performative::Inform,
         pattern: None,
-        fields: None,
+        fields: Some(BTreeMap::from([("n".into(), FieldValue::Int(3))])),
     });
     for o in &o2 {
         outs.push(format!("{}", acl_core::runtime::perf_name_pub(o.performative)));
@@ -61,27 +77,19 @@ fn rust_run() -> (Vec<String>, BTreeMap<String, String>) {
         .into_iter()
         .map(|(k, v)| (k, state_text(&v)))
         .collect();
-    (outs, states)
-}
-
-fn state_text(v: &StateValue) -> String {
-    match v {
-        StateValue::Bool(b) => b.to_string(),
-        StateValue::Int(i) => i.to_string(),
-        StateValue::Float(f) => f.to_string(),
-        StateValue::Str(s) => s.clone(),
-        StateValue::List(_) => "<list>".into(),
-        StateValue::Map(_) => "<map>".into(),
-        StateValue::Record(_) => "<record>".into(),
-        StateValue::Unset => "unset".into(),
-    }
+    let job = r.commitment_status("job");
+    let job_text = match job {
+        Some(c) => format!("{c:?}").to_lowercase(),
+        None => "absent".to_string(),
+    };
+    let commitments = BTreeMap::from([("job".to_string(), job_text)]);
+    (outs, states, commitments)
 }
 
 #[test]
-#[ignore = "requires python3"]
+#[ignore = "requires python3; run with --ignored (CI runs it explicitly)"]
 fn py_parity() {
     let prog = parse(PROGRAM).unwrap();
-    // generate the agent for role b
     let code = acl_core::codegen::gen_agent_py(&prog, "b").expect("codegen");
     let dir = std::env::temp_dir().join("acl_py_parity");
     let _ = std::fs::remove_dir_all(&dir);
@@ -102,11 +110,16 @@ for o in o1:
     f = o["fields"] or {}
     outs.append(str(o["to"]) + ":" + json.dumps({k: str(v) for k, v in sorted(f.items())}, separators=(",", ":")))
 ag.tick(1500)
-o2 = ag.deliver("a", "inform", None, None)
+o2 = ag.deliver("a", "inform", None, {"n": 3})
 for o in o2:
     outs.append(o["performative"])
-states = {k: ("unset" if v is None else str(v).lower() if isinstance(v, bool) else str(v)) for k, v in ag.states.items()}
-print(json.dumps({"outs": outs, "states": states, "commitments": ag.commitments}))
+def st(v):
+    if v is None: return "unset"
+    if isinstance(v, bool): return "true" if v else "false"
+    return str(v)
+states = {k: st(v) for k, v in ag.states.items()}
+commitments = {k: str(v) for k, v in ag.commitments.items()}
+print(json.dumps({"outs": outs, "states": states, "commitments": commitments}))
 "#,
     )
     .unwrap();
@@ -118,7 +131,7 @@ print(json.dumps({"outs": outs, "states": states, "commitments": ag.commitments}
     assert!(out.status.success(), "py driver failed: {}", String::from_utf8_lossy(&out.stderr));
     let py: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
 
-    let (rust_outs, rust_states) = rust_run();
+    let (rust_outs, rust_states, rust_commitments) = rust_run();
     // parity: outgoing events
     let py_outs: Vec<String> = py["outs"]
         .as_array()
@@ -130,7 +143,6 @@ print(json.dumps({"outs": outs, "states": states, "commitments": ag.commitments}
     // parity: states
     for (k, rv) in &rust_states {
         let pv = py["states"].get(k).and_then(|v| v.as_str()).unwrap_or("missing");
-        // py booleans print as True/False via str(); normalize
         let pv_norm = match rv.as_str() {
             "true" => pv.replace("True", "true"),
             "false" => pv.replace("False", "false"),
@@ -138,4 +150,23 @@ print(json.dumps({"outs": outs, "states": states, "commitments": ag.commitments}
         };
         assert_eq!(&pv_norm, rv, "STATE parity broken for {k}");
     }
+    // parity: NAMED COMMITMENT lifecycles (§51)
+    for (k, rv) in &rust_commitments {
+        let pv = py["commitments"]
+            .get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or("absent");
+        assert_eq!(pv, rv, "COMMITMENT parity broken for {k}");
+    }
+    // the exercised paths MUST include: catch, phase transition, fulfil
+    assert_eq!(
+        rust_states.get("flag").map(String::as_str),
+        Some("true"),
+        "catch path must have run"
+    );
+    assert_eq!(
+        rust_commitments.get("job").map(String::as_str),
+        Some("fulfilled"),
+        "fulfil job must have run"
+    );
 }
