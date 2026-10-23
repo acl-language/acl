@@ -35,11 +35,16 @@ whitespace    = space | tab | newline ;
 
 ```ebnf
 program       = { protocol_decl | role_decl | state_decl | type_decl
-                | fn_decl | handler | timer_handler | scenario_block
-                | include_stmt | import_stmt | export_stmt
+                | fn_decl | phase_decl | handler | timer_handler
+                | scenario_block | include_stmt | import_stmt | export_stmt
                 | handler_set_decl | message_stmt | transport_stmt
                 | capacity_stmt | use_stmt | abort_when_decl
                 | end_when_decl | comment | whitespace } ;
+
+phase_decl    = "phase", identifier, ";" ;
+              (* conversation phase (§49): the FIRST declaration is the
+                 initial phase; handlers gate with `in <phase>`, actions
+                 transition with `enter <phase>;` *)
 
 protocol_decl = "protocol", identifier, "v", digit,
                 [ "extends", identifier ], ";" ;
@@ -75,7 +80,9 @@ handler       = "on", trigger, [ "when", guard ], "->", action_stmt,
               | "on", trigger, [ "when", guard ],
                 "handle", "error", "->", action_stmt, ";" ;
 
-trigger       = performative_alt, [ pattern ], [ "from", identifier ],
+trigger       = performative_alt, [ pattern ],
+                [ "in", identifier ],                       (* phase gate *)
+                [ "from", identifier ],
                 [ "as", identifier ], [ "timeout", duration ] ;
               (* `as <role>` (n-role protocols, §42): the executor is that
                  ONE role instead of every role other than the sender *)
@@ -102,7 +109,8 @@ pattern       = "(", str_literal, ")" ;                   (* literal pattern *)
 
 json_field_list = json_field, { ",", json_field } ;
 json_field    = str_literal, ":", json_value ;
-json_value    = str_literal | "$", identifier ;             (* capture var *)
+json_value    = str_literal | "$", identifier ;             (* capture var;
+                 wire payloads are TYPED (str|int|float|bool) *)
               (* wire payloads are TYPED (str|int|float|bool, §45); a
                  bare $var capture converts natively, strings infer *)
               (* a bare $var value is normalized to the string "$var" at
@@ -113,8 +121,12 @@ json_value    = str_literal | "$", identifier ;             (* capture var *)
 
 ```ebnf
 action_stmt   = send_stmt | broadcast_stmt | await_stmt | try_stmt
-              | begin_stmt | fulfil_stmt | retract_stmt | set_stmt
-              | push_stmt | put_stmt | for_stmt | abort_stmt ;
+              | enter_stmt | begin_stmt | begin_id_stmt | fulfil_stmt
+              | fulfil_id_stmt | retract_stmt | set_stmt | push_stmt
+              | put_stmt | for_stmt | abort_stmt ;
+
+begin_id_stmt = "begin", identifier, ";" ;                   (* named, §50 *)
+fulfil_id_stmt = "fulfil", identifier, ";" ;
 
 await_stmt    = "await", int_literal, performative,
                 "into", identifier, "within", duration, "as", identifier, ";" ;
@@ -123,6 +135,9 @@ await_stmt    = "await", int_literal, performative,
 
 try_stmt      = "try", "{", [ action_stmt, { action_stmt } ], "}",
                 "catch", "{", [ action_stmt, { action_stmt } ], "}", ";" ;
+
+enter_stmt    = "enter", identifier, ";" ;
+              (* conversation phase transition (§49) *)
               (* local error flow (§44): a failing body action cuts the
                  body and runs the catch actions *)
 
@@ -132,7 +147,8 @@ broadcast_stmt = "broadcast", performative, [ pattern ],
                  dialogue legality is checked like an ordinary send *)
 
 send_stmt     = "send", performative,
-                [ pattern ],                              (* fields *)
+                [ pattern ],                              (* fields; values
+                   may interpolate "${expr}" over session state *)
                 [ "to", identifier ],
                 [ "retry", int_literal, "backoff", duration, [ "exp" ] ] ;
 
@@ -256,6 +272,8 @@ handler_set_decl = "handler_set", identifier, "{", { handler }, "}" ;
                  checked against the INCLUDING protocol at include time *)
 
 abort_when_decl = "abort", "when", guard, ";" ;
+expect_log_stmt = "expect", "log", str_literal, ";" ;        (* scenario: the
+                substring must appear in some role's transcript *)
 end_when_decl   = "end", "when", ( "fulfilled" | "expired" | "breached"
                                   | identifier ), ";" ;
 
@@ -310,3 +328,10 @@ duration      = int_literal, ( "ms" | "s" | "m" ) ;
 13. **Await targets**: `await ... into <list>` requires a list state and
    `as <flag>` a declared bool state; the collector consumes matching
    events before handlers see them.
+14. **Phases**: trigger `in <phase>` and `enter <phase>` must reference
+   declared phases; phases are per-session (instance-scoped).
+15. **Replay completeness**: ticks, closes and capability grants are
+   journaled inputs — exact replay covers the WHOLE execution, not only
+   delivered events.
+16. **Parity**: generated agents must reproduce the Rust runtime's
+   observable behavior (out-events and final states) for equal inputs.

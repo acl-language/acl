@@ -6,6 +6,34 @@ Format based on Keep a Changelog; versions follow semver for the
 
 ## [Unreleased]
 
+## [0.17.0] — 2026-10-23
+
+### Added
+- **Compiler coverage (§47)**: checks recurse into nested actions
+  (`for`/`try`/`catch`); payload correlation warnings (receiver pattern
+  keys vs sent keys).
+- **Replay completeness (§48)**: host ticks, session closes and
+  capability grants are journaled; exact replay covers timers, awaits,
+  retries and lifecycle.
+- **Conversation phases (§49)**: `phase <name>;`, handlers gated with
+  `in <phase>`, transitions with `enter <phase>;` — phases are
+  instance-scoped.
+- **Named commitments (§50)**: `begin <id>;` / `fulfil <id>;` with
+  independent lifecycles per session.
+- **Send payload interpolation**: `send inform {"r": "${y}"};`
+  interpolates full expressions over session state (shared with the
+  fmt engine).
+- **Semantic parity harness (§51)**: `tests/py_parity.rs` drives the
+  same inputs through the Rust runtime and the generated Python agent
+  and asserts identical observable behavior.
+- **Concurrent conversations (§52)**: instance-scoped states, phases
+  and commitments — documented and tested.
+
+### Fixed
+- **Try executed with an empty scope**: nested `set x = $n * 2`
+  evaluated captures as unset (0) inside `try`/`catch`/`for` bodies —
+  `run_actions` now threads captures explicitly.
+
 ## [0.16.0] — 2026-10-23
 
 ### Added

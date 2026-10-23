@@ -123,6 +123,23 @@ assignments, record fields, and function recursion.
 **Toolchain** — `aclc fmt` canonical (idempotent) formatting of any
 program; scenario assertions `expect state/commitment/log`.
 
+### Conversation structure and lifecycle (§49-§53)
+- **Conversation phases** — `phase quoted;` … `enter accepted;` with
+  handlers gated by `on inform ... in quoted`: the same speech act is
+  only valid in the phase where the protocol says it is.
+- **Named commitments** — `begin delivery;` / `fulfil delivery;` track
+  several independent obligations per session.
+- **Declarative collection + local error flow** — `await N <perf> into
+  <list> within <dur> as <flag>;`, `try { ... } catch { ... };` and the
+  `handle error` sugar.
+- **Concurrent conversations** — every session is an independent
+  participant instance: states, phases and commitments never leak across
+  conversations of the same role.
+- **Exact replay** — ticks, closes and capability grants are journaled:
+  replay covers the whole execution, not only delivered events.
+- **Guaranteed parity** — generated Python agents reproduce the Rust
+  runtime's observable behavior for equal inputs (harness: `tests/`).
+
 ### Inheritance and modules (§41, §39.8)
 `protocol supply_v2 v1 extends supply_v1;` inherits everything and may
 override handlers by trigger+guard signature; `export type X;` /

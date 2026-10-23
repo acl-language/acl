@@ -1,6 +1,6 @@
 # ACL — Agent Communication Language
 
-**Version:** 0.16.0-draft
+**Version:** 0.17.0-draft
 **Status:** Draft specification
 **License:** Apache-2.0 (spec + reference implementation)
 
@@ -1445,3 +1445,58 @@ content language (§27) converts to wire field values.
   role's transcript contains the substring.
 - A user function that recurses (directly or mutually) is a compile
   error: the runtime has no call stacks.
+
+## 47. Compiler coverage — nested actions and payload correlation (normative)
+
+Compile-time checks apply to actions at ANY nesting level: sends inside
+`for` bodies, `try` bodies and `catch` arms are dialogue-checked,
+attribution-checked, linearity-checked and state-target-checked exactly
+like top-level actions. Additionally, when a receiving handler declares
+a content pattern, the keys it matches are statically compared with the
+keys of the send payloads that reach it; a send that omits a pattern key
+produces a compile warning (right performative, possibly wrong message).
+
+## 48. Replay completeness (normative)
+
+Every input that affects execution is journaled: delivered events, host
+time advances (`Event::Tick` per session, emitted by `tick()`), and
+session closes (`Event::SessionClosed`). Capability grants are part of
+the persistence header (`journal_with_roles` returns roles + grants +
+journal; `replay_from` reconstructs the capability gate). Sessions that
+were CLOSED remain in the header. Exact replay therefore covers timers,
+awaits, retry deadlines, capability gating and lifecycle — not only
+delivered speech acts.
+
+## 49. Conversation phases (normative)
+
+`phase <name>;` declares a conversation phase; the FIRST declaration is
+the initial phase. A handler may be gated on the current phase with
+`on <perf> ... in <phase> ...`; the gate is evaluated after content and
+guard matching. `enter <phase>;` transitions. Phases referenced by
+triggers or `enter` must be declared — a trigger using a phase when the
+protocol declares none is a compile error. Phases are instance-scoped:
+each session carries its own current phase.
+
+## 50. Named commitments (normative)
+
+`begin <id>;` and `fulfil <id>;` manage NAMED commitments: independent
+obligation lifecycles within one session (`id -> status`). The
+id-less `begin`/`fulfil` keep the session-level semantics of §6.2.
+Re-fulfilling an already-fulfilled commitment is logged and ignored.
+
+## 51. Local semantic parity (normative)
+
+The generated Python agent MUST behave identically to the Rust runtime
+for the same input sequence: outgoing events (targets, performatives,
+payloads) and final session states match exactly. The parity harness
+(`tests/py_parity.rs`) covers typed capture guards, try/catch, phases,
+named commitments and host time advances. Send/broadcast payload values
+may interpolate `${expr}` (§38.9 semantics) — pre-parsed into segments
+in generated code.
+
+## 52. Concurrent conversations (normative)
+
+Each session is an independent participant instance. States AND
+conversation phases are instance-scoped: two concurrent conversations of
+the same role never share state, phase transitions, or commitments.
+Capacity (§35.8) bounds the number of concurrent instances.
