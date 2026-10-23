@@ -1,6 +1,6 @@
 # ACL — Agent Communication Language
 
-**Version:** 0.15.0-draft
+**Version:** 0.16.0-draft
 **Status:** Draft specification
 **License:** Apache-2.0 (spec + reference implementation)
 
@@ -1363,3 +1363,85 @@ ns.name;` then splices the imported fragment into the protocol.
 
 The `aclc` tool resolves includes and imports relative to the edited
 file's own directory, for every subcommand that reads a `.aclp`.
+
+## 40. Hardened static validation (normative)
+
+### 40.1 Expression guards are compile-checked
+A guard that is a full expression (§39.1) is validated at compile time:
+states it references must be declared; comparisons whose operands have
+statically known incompatible types are compile errors. Captures and
+`arg.*` remain statically unknown and keep the runtime checks.
+
+### 40.2 State type lattice
+Declared state types are validated: `bool | int | str | float | list |
+map | list<T> | map<K,V> | <record>`, where T, K, V are scalars or
+declared record types (K also `int`). Runtime assignments into typed
+states, and `push`/`put` into generic containers, are checked per
+element; a violation routes to the session's `on error` handler (§39.5)
+as an internal failure.
+
+### 40.3 Source attribution
+Every handler carries its source line; compile diagnostics for handlers
+point at the `on` declaration instead of a synthetic position.
+
+## 41. Protocol inheritance and vocabulary export (normative)
+
+`protocol v2 extends v1;` (same file) inherits roles, states, types,
+functions, templates, scenarios, `end when`, transport, capacity and
+`abort_when` from the base. A handler in the derived protocol with the
+SAME trigger + guard signature OVERRIDES the base handler; other base
+handlers are inherited unchanged. Multiple `protocol` declarations in
+one file MUST form an `extends` chain.
+
+`export type X;` and `export fn name;` mark vocabulary as importable;
+`import "file.aclp" [as ns];` splices exported types and functions under
+their own names (they are referenced from expressions, where a namespace
+prefix would not parse) — a name collision is a compile error. Handler
+sets splice namespaced as `ns.<set>` (§39.8).
+
+## 42. n-role projection (normative)
+
+`project()` supports any role count. In protocols with more than two
+roles, `check` requires explicit `from` on triggers and `to` on sends
+(§34); the counterpart default exists ONLY in two-role protocols, and a
+send without `to` in an n-role protocol is a projection error. A trigger
+may restrict its executor to a single role with `on X from R as <role>`;
+the executor must be a declared role and differs from the sender.
+
+## 43. Declarative await (normative)
+
+`await N <perf> into <list> within <dur> as <flag>;` arms a collector:
+subsequent matching incoming events are CONSUMED by the collector (they
+do not reach handlers) and their payload maps are appended to the list
+state. When N payloads have arrived, `<flag>` (a declared bool state)
+becomes true; when the deadline passes first, tick() sets it false and
+logs `await timed out`. The flag starts false when the await is armed.
+
+## 44. Local error flow (normative)
+
+`try { <actions> } catch { <actions> };` — a failing action inside the
+body (evaluation errors, container violations, `fmt` failures) cuts the
+remaining body short and runs the catch actions. Failures INSIDE the
+catch are not caught by the same try — they route to the session's
+`on error` handler (§39.5). `on X ... -> <action> handle error ->
+<action>;` is sugar for a single-action try/catch.
+
+## 45. Typed fields on the wire (normative)
+
+`Event::In.fields` carries typed values (string, int, float, bool).
+String literals convert implicitly; native numeric/boolean payloads pass
+through WITHOUT the string-inference heuristic of §39.1 (a string
+payload may still be a number written as text — it is inferred). Literal
+and prefix-wildcard patterns compare by text rendering. The `ClValue`
+content language (§27) converts to wire field values.
+
+## 46. Toolchain obligations (normative)
+
+- `aclc fmt <file.aclp>` emits the canonical formatting of a program
+  (all declarations; import lines are resolved by the loader and are NOT
+  preserved — `fmt` refuses files that contain them). Formatting is
+  idempotent.
+- Scenario steps accept `expect log "<substring>";` — satisfied when any
+  role's transcript contains the substring.
+- A user function that recurses (directly or mutually) is a compile
+  error: the runtime has no call stacks.

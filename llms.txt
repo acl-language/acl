@@ -67,13 +67,19 @@ Expressions are pure (19 builtins, incl. `prefer(list, key)` for
 contract-net bid selection); time is host-injected (`tick()`), never a
 hidden clock.
 
-Language extras (spec §39): guards over typed pattern captures
+Language extras (spec §39-§47): guards over typed pattern captures
 (`when $p > 100`), trigger alternation (`on (accept | reject)`),
 static assignment typing, `on error { ... }` for internal failures
 (with `$reason`), rich templates (`fmt("x ${expr}")`, `$${` = literal),
 reusable fragments with visibility (`handler_set` / `include
-handler_set ns.name` / `export`) and module imports
-(`import "file.aclp" as m;` — only exported sets splice, namespaced).
+handler_set ns.name` / `export type` / `export fn`) and module imports
+(`import "file.aclp" as m;`), protocol inheritance (`protocol v2
+extends v1;` — override by trigger+guard), n-role projection (`on X
+from R as executor`), declarative collection (`await 3 propose into
+bids within 5s as ready;`), local error flow (`try { ... } catch
+{ ... };` and `handle error`), typed wire fields (native int/float/bool
+payloads), `aclc fmt` canonical formatting and `expect log` scenario
+assertions.
 
 ## Compile and run
 

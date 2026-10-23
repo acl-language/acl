@@ -98,10 +98,35 @@ role in a list state; `prefer(bids, "price")` picks the lowest bid.
 full expressions inline; registered templates late-bind `${expr}` at the
 call site and keep positional `{0}` placeholders.
 
+**N-role protocols (§42)** — protocols with any role count: `check`
+forces explicit attribution (`from` on triggers, `to` on sends) and
+`on X from R as <role>` pins the executor to one role.
+
+**Declarative collection (§43)** — `await 3 propose into bids within 5s
+as ready;` collects matching payloads into a list state and completes
+(or times out) a bool flag — contract-net without hand-written handlers.
+
+**Local error flow (§44)** — `try { ... } catch { ... };` and the
+`handle error` sugar: a failing action cuts the body and runs the catch
+locally instead of the session-level `on error`.
+
+**Typed wire fields (§45)** — payloads carry native int/float/bool
+values end-to-end; captures resolve without string heuristics.
+
 **Compile-time guarantees** — dialogue matrix (an illegal reply is a
 compile error), linearity (every send must have a receiver — orphan
 sends are compile errors), liveness (handlers that cannot reach a
-terminal action warn as possible deadlocks), guard/type checking.
+terminal action warn as possible deadlocks), full static validation of
+guards, state type lattice (`list<T>`, `map<K,V>`, records), typed
+assignments, record fields, and function recursion.
+
+**Toolchain** — `aclc fmt` canonical (idempotent) formatting of any
+program; scenario assertions `expect state/commitment/log`.
+
+### Inheritance and modules (§41, §39.8)
+`protocol supply_v2 v1 extends supply_v1;` inherits everything and may
+override handlers by trigger+guard signature; `export type X;` /
+`export fn f;` make vocabulary importable alongside handler sets.
 
 ## The toolchain
 

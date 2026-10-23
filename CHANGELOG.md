@@ -6,6 +6,40 @@ Format based on Keep a Changelog; versions follow semver for the
 
 ## [Unreleased]
 
+## [0.16.0] — 2026-10-23
+
+### Added
+- **Complete static validation (§40)**: expression guards compile-checked
+  (undeclared states, incompatible comparisons); state type lattice
+  (`float`, `list<T>`, `map<K,V>`, records) validated; runtime typed
+  assignments checked per element (routed to `on error`); handler source
+  lines in diagnostics.
+- **Protocol inheritance (§41)**: `protocol v2 extends v1;` — inherits
+  everything, overrides handlers by trigger+guard signature;
+  `export type/fn` join handler sets as importable vocabulary (collision
+  = compile error; duplicate declarations rejected).
+- **n-role projection (§42)**: any role count; explicit attribution
+  enforced; `on X from R as <role>` pins the executor; 3-role relay runs
+  end-to-end through projected runtimes.
+- **Declarative await (§43)**: `await N <perf> into <list> within <dur>
+  as <flag>;` — collector consumes matching events, flag completes on
+  count or times out; mirrored in Python codegen (E2E validated).
+- **Local error flow (§44)**: `try { ... } catch { ... };` cuts the body
+  and runs the catch; failures inside a catch route to `on error`;
+  `handle error` one-line sugar.
+- **Typed wire fields (§45)**: `FieldValue` (str/int/float/bool) on
+  `Event::In` — native payloads skip string inference; string literals
+  convert implicitly (all construction sites keep compiling);
+  `From<ClValue>` bridge.
+- **Toolchain (§46)**: `aclc fmt` canonical idempotent formatter (all
+  declaration kinds; refuses files with imports); scenario `expect log`;
+  function recursion (direct or mutual) is a compile error.
+
+### Fixed
+- Statement splitting broke `try { ... }` blocks (brace-aware split).
+- Brace-counting underflow (usize) in handler_set parsing.
+- Python `try`/indentation emission in generated agents.
+
 ## [0.15.0] — 2026-10-23
 
 ### Added

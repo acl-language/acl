@@ -41,14 +41,19 @@ program       = { protocol_decl | role_decl | state_decl | type_decl
                 | capacity_stmt | use_stmt | abort_when_decl
                 | end_when_decl | comment | whitespace } ;
 
-protocol_decl = "protocol", identifier, "v", digit, ";" ;
+protocol_decl = "protocol", identifier, "v", digit,
+                [ "extends", identifier ], ";" ;
+              (* inheritance chain (§41): multiple protocols per file MUST
+                 form an extends chain *)
 role_decl     = "roles", identifier, { ",", identifier }, ";" ;
 state_decl    = "state", identifier, [ ":", type ], ";" ;
 type_decl     = "type", identifier, "=", "{", field_list, "}", ";" ;
 field_list    = field_decl, { ",", field_decl } ;
 field_decl    = identifier, ":", type ;
 
-type          = "bool" | "int" | "str" | "list" | "map"
+type          = "bool" | "int" | "str" | "float" | "list" | "map"
+              | "list", "<", type, ">"                    (* typed list *)
+              | "map", "<", type, ",", type, ">"        (* typed map *)
               | identifier ;                            (* user record *)
 
 fn_decl       = "fn", identifier, "(", param_list, ")", [ "->", type ],
@@ -63,13 +68,17 @@ return_stmt   = "return", [ expr ], ";" ;
 ## 3. Handlers
 
 ```ebnf
-handler       = "on", trigger, [ "when", guard ], "->", action_stmt, ";" ;
+handler       = "on", trigger, [ "when", guard ], "->", action_stmt,
+                [ "handle", "error", "->", action_stmt ], ";" ;
+              (* `handle error` is sugar for try/catch around the action *)
               | "on", trigger, [ "when", guard ], "{", { action_stmt }, "}" ;
               | "on", trigger, [ "when", guard ],
                 "handle", "error", "->", action_stmt, ";" ;
 
 trigger       = performative_alt, [ pattern ], [ "from", identifier ],
-                [ "timeout", duration ] ;
+                [ "as", identifier ], [ "timeout", duration ] ;
+              (* `as <role>` (n-role protocols, §42): the executor is that
+                 ONE role instead of every role other than the sender *)
               | "breach" | "expired" ;
 
 performative_alt = performative
@@ -94,6 +103,8 @@ pattern       = "(", str_literal, ")" ;                   (* literal pattern *)
 json_field_list = json_field, { ",", json_field } ;
 json_field    = str_literal, ":", json_value ;
 json_value    = str_literal | "$", identifier ;             (* capture var *)
+              (* wire payloads are TYPED (str|int|float|bool, §45); a
+                 bare $var capture converts natively, strings infer *)
               (* a bare $var value is normalized to the string "$var" at
                  parse time, so the pattern stays valid JSON *)
 ```
@@ -101,9 +112,19 @@ json_value    = str_literal | "$", identifier ;             (* capture var *)
 ## 4. Actions
 
 ```ebnf
-action_stmt   = send_stmt | broadcast_stmt | begin_stmt | fulfil_stmt
-              | retract_stmt | set_stmt | push_stmt | put_stmt | for_stmt
-              | abort_stmt ;
+action_stmt   = send_stmt | broadcast_stmt | await_stmt | try_stmt
+              | begin_stmt | fulfil_stmt | retract_stmt | set_stmt
+              | push_stmt | put_stmt | for_stmt | abort_stmt ;
+
+await_stmt    = "await", int_literal, performative,
+                "into", identifier, "within", duration, "as", identifier, ";" ;
+              (* declarative collection (§43): matching events are consumed
+                 into the list state; the bool flag completes or times out *)
+
+try_stmt      = "try", "{", [ action_stmt, { action_stmt } ], "}",
+                "catch", "{", [ action_stmt, { action_stmt } ], "}", ";" ;
+              (* local error flow (§44): a failing body action cuts the
+                 body and runs the catch actions *)
 
 broadcast_stmt = "broadcast", performative, [ pattern ],
                  "to", identifier, ";" ;
@@ -224,9 +245,11 @@ import_stmt   = "import", str_literal, [ "as", identifier ], ";" ;
                  sets, namespaced as <alias>.<set>; without an alias the
                  original names are used and collisions are compile errors *)
 
-export_stmt   = "export", "handler_set", identifier, ";" ;
-              (* marks a handler set importable by other modules; sets not
-                 exported stay private to the module file *)
+export_stmt   = ( "export", "handler_set", identifier
+                | "export", "type", identifier
+                | "export", "fn", identifier ), ";" ;
+              (* marks the item importable by other modules; types and
+                 functions splice under their OWN names on import *)
 
 handler_set_decl = "handler_set", identifier, "{", { handler }, "}" ;
               (* a reusable handler fragment; roles it references are
@@ -281,3 +304,9 @@ duration      = int_literal, ( "ms" | "s" | "m" ) ;
    error handler are logged only (no error loops).
 11. **Module imports**: `import` splices only exported handler sets;
    module nesting deeper than 8 levels (import cycles) is an error.
+12. **Function recursion**: a function that calls itself (directly or
+   through another function) is a compile error — the runtime has no
+   call stacks.
+13. **Await targets**: `await ... into <list>` requires a list state and
+   `as <flag>` a declared bool state; the collector consumes matching
+   events before handlers see them.
