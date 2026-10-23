@@ -1,0 +1,20 @@
+[package]
+name = "acl-ts"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "acl_ts"
+crate-type = ["cdylib"]
+
+[dependencies]
+acl-core = { path = ".." }
+napi = { version = "2", default-features = false, features = ["napi8"] }
+napi-derive = "2"
+napi-build = "2"
+ed25519-dalek = "3"
+rand = "0.10"
+serde_json = "1.0.154"
+
+[build-dependencies]
+napi-build = "2"
