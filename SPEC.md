@@ -396,6 +396,15 @@ signatures end-to-end on the ACL side (validated end-to-end against a real
 MCP server). An MCP tool thus reachable appears in the bridge's AgentCard as
 an ACL capability.
 
+## 13bis. Local agent registry (additive)
+
+Same-machine discovery without a directory service: a JSON file maps agent
+names to `{aid, public_key, capabilities[], registered_at_ms}`. APIs:
+`register` (upsert by name), `lookup(name)`, `by_capability(cap)`,
+`list`, `unregister(name)`. The registry is advisory — a peer's AgentCard
+(handshake) remains the trust root; the registry only caches where to find
+peers. Reference: `acl_core::registry` + `registry_cli`.
+
 ## 14. Spec versioning and evolution (normative)
 
 - The envelope field `acl` carries the **SPEC-VERSION** (currently `1`).
