@@ -2,6 +2,10 @@
 
 [![CI](https://github.com/acl-language/acl/actions/workflows/ci.yml/badge.svg)](https://github.com/acl-language/acl/actions/workflows/ci.yml)
 
+<p align="center">
+  <img src="docs/assets/overview.png" alt="ACL — a programming language for agent conversations: protocol source, the aclc compiler (parse + analyze, compile-time checks for dialogue legality, types, state and phases), role agents (Rust runtime or generated Python) receiving speech acts, how a protocol handler executes, and the runtime guarantees: isolated sessions, deterministic runtime, ordered replay, testable behavior" width="100%">
+</p>
+
 ACL is a programming language whose primitives are **speech acts**. You
 write a *protocol program* — a `.aclp` file that declares roles, session
 state and handlers keyed on speech acts — and the compiler turns it into
