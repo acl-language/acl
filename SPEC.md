@@ -215,7 +215,9 @@ can be relayed over HTTP untouched (relay increments `hop_count`).
 - **Identity:** Ed25519 keypair per agent. The public key is distributed via
   AgentCard (network) or handshake (`Hello` with `nonce`, local).
 - **Integrity:** `sig` covers the serialized envelope excluding the `sig`
-  field itself, in canonical field order.
+  field itself, in canonical field order. Canonical form omits absent
+  optional fields (`in_reply_to`, `reply_with`, `sig`) and omits
+  `hop_count` when zero — encoders and verifiers MUST agree on this.
 - **Replay protection:** `msg_id` uniqueness within a `ttl` window; receivers
   MUST reject `in_reply_to` values older than `ttl` that they never sent.
 - **Confidentiality:** out of scope for v0.1 (transport-level TLS is expected

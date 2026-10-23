@@ -5,6 +5,7 @@
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
+use serde_repr::{Deserialize_repr, Serialize_repr};
 use std::io::Read;
 
 pub const ACL_VERSION: u8 = 1;
@@ -14,7 +15,7 @@ pub const DEFAULT_TTL_MS: u32 = 300_000;
 // ---------------------------------------------------------------- performatives
 
 /// Speech acts (spec §5). Wire representation: u8 discriminant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize_repr, Deserialize_repr)]
 #[repr(u8)]
 pub enum Performative {
     Request = 1,
