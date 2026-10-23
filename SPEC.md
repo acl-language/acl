@@ -396,7 +396,18 @@ signatures end-to-end on the ACL side (validated end-to-end against a real
 MCP server). An MCP tool thus reachable appears in the bridge's AgentCard as
 an ACL capability.
 
-## 14. Implementation status (v0.1)
+## 14. Spec versioning and evolution (normative)
+
+- The envelope field `acl` carries the **SPEC-VERSION** (currently `1`).
+  Receivers MUST reject unknown major versions.
+- **Major** bump: any change that breaks decoding or verification of v1
+  messages. **Minor**: additive, backward-compatible (new performatives,
+  new transports). **Patch**: clarifications only.
+- Breaking changes REQUIRE an RFC (see `governance/`) with a migration
+  path; dual-stack decoders are recommended during transitions.
+- The changelog is authoritative for what changed between spec versions.
+
+## 15. Implementation status (v0.1)
 
 | component | tests / validation |
 |-----------|--------------------|
