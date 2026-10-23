@@ -222,6 +222,16 @@ can be relayed over HTTP untouched (relay increments `hop_count`).
 - Content type for envelope bodies: `application/acl-envelope`.
 - HTTP/1.1 is sufficient for compliance; HTTP/2 is optional.
 
+### 9.3 WebSocket profile (normative, as implemented and validated)
+
+- Upgrade: standard RFC 6455 HTTP `GET` with `Sec-WebSocket-Key`.
+- Each binary frame carries **one msgpack envelope** (a bare envelope, or
+  the §3 length-prefixed frame — receivers MUST accept both).
+- Client frames MUST be masked (RFC 6455 requirement); server frames are
+  not masked.
+- One request/response exchange per frame pair; a close frame ends the
+  session cleanly.
+
 ### 9.2 Transport conformance matrix (v0.1 reference implementation)
 
 | transport | status |
@@ -229,7 +239,7 @@ can be relayed over HTTP untouched (relay increments `hop_count`).
 | stdio / pipes | validated end-to-end (live pipes, Python client ↔ Rust peer) |
 | HTTP sync (`POST`) | validated end-to-end |
 | SSE streaming | validated end-to-end (signed per-event) |
-| WebSocket | reserved, not implemented |
+| WebSocket | validated end-to-end (RFC 6455, binary frames) |
 
 ## 10. Security (L2)
 
