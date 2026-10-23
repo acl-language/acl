@@ -1,6 +1,6 @@
 # ACL — Agent Communication Language
 
-**Version:** 0.18.0-draft
+**Version:** 0.18.1-draft
 **Status:** Draft specification
 **License:** Apache-2.0 (spec + reference implementation)
 
@@ -1526,3 +1526,17 @@ Cross-participant phase compatibility (proving every message arrives in
 a reachable, compatible phase across ALL participants) requires a global
 protocol analysis and remains future work; declared-phase validation and
 per-phase reachability are implemented.
+
+## 55. Loop semantics and faithful reconstruction (normative)
+
+Generated agents run `for` loops through the SAME single dispatcher as
+every other action; a caught failure inside the loop body cuts the
+remaining iterations (the Rust runtime mirrors the cut: the catch flag
+propagates through the loop and is cleared at the try boundary), and
+the loop variable is restored afterwards — including on the failure
+path. Statement splitting is block-aware: `;` at depth zero and the
+closing brace of an inline `for` or `catch` block end statements;
+payload and record braces never do; a `try` body waits for its `catch`.
+`SessionHost::replay()` is deprecated: it rebuilds ONLY from journaled
+session opens and rejects journals it cannot reconstruct faithfully;
+`replay_from()` is the reconstruction path.

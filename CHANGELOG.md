@@ -6,6 +6,35 @@ Format based on Keep a Changelog; versions follow semver for the
 
 ## [Unreleased]
 
+## [0.18.1] — 2026-10-23
+
+### Fixed
+- **`for`-loop regression in generated Python** (§55): the loop arm
+  still called the removed `_exec_one` — a loop with outgoing sends
+  produced `internal error: 'Agent' object has no attribute
+  '_exec_one'` instead of messages. Loops now run through the single
+  dispatcher; a caught failure cuts the remaining iterations and the
+  loop variable is restored. The Rust runtime mirrors the cut (one
+  semantics both runtimes).
+
+### Added
+- **Block-aware statement splitting (§55)**: `;` at depth 0 AND the
+  closing brace of inline `for`/`catch` blocks end statements; try
+  bodies wait for their catch; payload/record braces never end
+  statements; nested `for` inside `try` parses.
+- **Parity hardening (§55)**: new case combining `for` + captured
+  values + interpolated outgoing sends + forced failure + `try/catch`;
+  catch proof moved to a dedicated `caught` state (the timer's flag no
+  longer masks the assertion); capacity replay tests declare
+  `capacity 1;` IN the program and assert the rebuilt host preserves it.
+- **`SessionHost::replay()` deprecated** — rebuilds ONLY from journaled
+  opens and rejects legacy journals it cannot reconstruct faithfully
+  (use `replay_from()`).
+
+### Docs
+- README and llms.txt aligned with v0.15.0-v0.18.0: 210 tests (incl.
+  CI-run parity), 55 normative spec sections, lifecycle §49-§55.
+
 ## [0.18.0] — 2026-10-23
 
 ### Added
