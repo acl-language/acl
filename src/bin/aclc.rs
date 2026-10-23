@@ -11,13 +11,48 @@ use acl_core::idl::{self, IdlFile};
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!("usage: aclc check|lint|fmt|gen|names <args>");
+        eprintln!("usage: aclc check|lint|fmt|gen|names|protocol <args>");
         std::process::exit(2);
     }
     let cmd = args[1].as_str();
     let files = &args[2..];
 
     match cmd {
+        "protocol" => {
+            // §33: compile .aclp protocol programs — parse + §16 dialogue
+            // matrix enforced at COMPILE time
+            let mut failed = false;
+            for f in files {
+                let src = std::fs::read_to_string(f).unwrap_or_else(|e| {
+                    eprintln!("aclc: cannot read {f}: {e}");
+                    std::process::exit(2);
+                });
+                match acl_core::protocol::parse(&src) {
+                    Err(errors) => {
+                        failed = true;
+                        for e in errors {
+                            eprintln!("{f}:{e}");
+                        }
+                    }
+                    Ok(prog) => match acl_core::protocol::check(&prog) {
+                        Err(errors) => {
+                            failed = true;
+                            for e in errors {
+                                eprintln!("{f}:{e}");
+                            }
+                        }
+                        Ok(warnings) => {
+                            for w in warnings {
+                                eprintln!("{f}: warning: {w}");
+                            }
+                            println!("{f}: protocol '{}' v{} OK ({} roles, {} handlers)",
+                                prog.name, prog.version, prog.roles.len(), prog.handlers.len());
+                        }
+                    },
+                }
+            }
+            std::process::exit(if failed { 1 } else { 0 });
+        }
         "check" | "lint" | "names" | "fmt" => {
             let mut failed = false;
             for f in files {

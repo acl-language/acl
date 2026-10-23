@@ -6,6 +6,26 @@ Format based on Keep a Changelog; versions follow semver for the
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-10-23
+
+ACL becomes a programming language whose primitives are speech acts:
+protocol programs (`.aclp`) compile into agents that speak the protocol,
+with the dialogue matrix enforced at COMPILE time.
+
+### Added
+- **Protocol programs** (spec §33): `src/protocol.rs` — parser and
+  checker for `.aclp` files: `protocol`/`roles`/`state`/`on handlers`/
+  `end when`. Triggers: any performative (patterned or not), `breach`,
+  `expired`. Actions: `send`, `begin`, `fulfil`, `retract`.
+- **Compile-time dialogue checking**: every `send` is validated against
+  the §16 dialogue matrix for its trigger at BUILD time — an illegal
+  reply is a compile error, not a runtime failure. Breach/expired
+  handlers are checked against plausible session openers.
+- **`aclc protocol`**: compile subcommand (parse + check + summary).
+- 7 new tests: parse/check, pretty roundtrip, dialogue violation,
+  breach constraint, duplicate handlers, end_when states, unterminated
+  blocks.
+
 ## [0.7.0] — 2026-10-23
 
 The expressiveness layer: agents can now revise beliefs, subscribe to

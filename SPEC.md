@@ -1,6 +1,6 @@
 # ACL — Agent Communication Language
 
-**Version:** 0.7.0-draft
+**Version:** 0.8.0-draft
 **Status:** Draft specification
 **License:** Apache-2.0 (spec + reference implementation)
 
@@ -845,6 +845,51 @@ RE = receiver no longer holds p as asserted by sender.
 RE = receiver pushes matching informs.
 `unsubscribe`: FP = sender no longer wants the referenced subscription;
 RE = receiver stops pushing.
+
+## 33. Protocol programs (`.aclp`)
+
+ACL becomes a PROGRAMMING LANGUAGE whose primitives are speech acts.
+A protocol program turns the conversation itself into source code:
+the compiled artifact is an agent that speaks ACL, with no imperative
+code of its own.
+
+### 33.1 Grammar (informative)
+
+```text
+protocol <name> v<n>;
+roles <role>, ...;
+state <name>[: <type>];            // session variables
+on <trigger> -> <action>;          // one-line handler
+on <trigger> { <action>; ... }     // multi-action handler
+end when <builtin|state>;
+```
+
+Triggers: any performative (optionally patterned, `on request("quote")`),
+`breach` (an owed commitment broke), `expired` (deadline passed).
+Actions (phase 1): `send <performative>`, `begin` (activate pending
+commitment), `fulfil`, `retract(target)` (§32.1 as a statement).
+
+### 33.2 Well-formedness (normative)
+
+- Roles: non-empty, unique.
+- Handlers: at least one; no duplicate (trigger, pattern) pairs; no
+  empty handler blocks.
+- **Dialogue matrix at compile time**: every `send` inside a handler
+  MUST satisfy §16 for its trigger — `on query -> send request` does
+  not compile. `breach`/`expired` handlers may send only performatives
+  legal after at least one plausible session opener (request, propose,
+  delegate).
+- `end when <state>` requires a declared state; `fulfilled`, `expired`,
+  `breached` are builtins.
+- Unknown performatives/triggers/statements are compile errors.
+
+### 33.3 Semantics
+
+Execution = the conversation. Each handler firing is a received speech
+act; each `send`/`retract` is an emitted one. State variables are the
+session state (§5); `begin`/`fulfil` transition the commitment lifecycle
+(§6.2). Compile-time checking (§33.2) plus signed envelopes means the
+execution log is an auditable transcript by construction.
 
 ## 16. Dialogue rules (normative)
 

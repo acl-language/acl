@@ -11,6 +11,7 @@ pub mod cnp;
 pub mod did;
 pub mod dialogue;
 pub mod idl;
+pub mod protocol;
 pub mod schema;
 pub mod semantics;
 pub mod sealed;
