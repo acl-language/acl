@@ -265,6 +265,35 @@ fn main() {
             }
             std::process::exit(if failed { 1 } else { 0 });
         }
+                "fmt" => {
+            let mut failed = false;
+            if files.is_empty() {
+                eprintln!("usage: aclc fmt <file.aclp>");
+                std::process::exit(2);
+            }
+            for f in files {
+                let src = std::fs::read_to_string(f).unwrap_or_else(|e| {
+                    eprintln!("aclc: cannot read {f}: {e}");
+                    std::process::exit(2);
+                });
+                // §47: import/include lines are resolved away by the loader
+                // and cannot be re-emitted — refuse rather than lose them
+                if src.lines().any(|l| l.trim().starts_with("import ")) {
+                    eprintln!("aclc fmt: {f} contains 'import' statements (not preserved by canonical formatting) — skipped");
+                    continue;
+                }
+                let dir = std::path::Path::new(f)
+                    .parent()
+                    .map(|p| p.to_string_lossy().to_string());
+                match acl_core::protocol::parse_with_includes(&src, dir.as_deref()) {
+                    Err(errors) => {
+                        failed = true;
+                        for e in errors { eprintln!("{f}:{e}"); }
+                    }
+                    Ok(prog) => println!("{}", acl_core::protocol::pretty(&prog)),
+                }
+            }
+        }
         "protocol" => {
             // §33: compile .aclp protocol programs — parse + §16 dialogue
             // matrix enforced at COMPILE time

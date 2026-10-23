@@ -99,6 +99,20 @@ pub fn run(prog: &ProtocolProgram, sc: &Scenario) -> Result<Vec<String>, Vec<Str
                     trace.push(format!("step {}: state {role}.{name} == {value} ✓", i + 1));
                 }
             }
+            ScenarioStep::ExpectLog { contains } => {
+                // §47: the substring must appear in SOME role's transcript
+                let found = runtimes.values().any(|rt| {
+                    rt.transcript().iter().any(|e| e.text.contains(contains.as_str()))
+                });
+                if found {
+                    trace.push(format!("step {}: log contains {:?} ✓", i + 1, contains));
+                } else {
+                    errors.push(format!(
+                        "step {}: expect log {contains:?} — not found in any transcript",
+                        i + 1
+                    ));
+                }
+            }
             ScenarioStep::ExpectCommitment { role, status } => {
                 let Some(rt) = runtimes.get(role) else {
                     errors.push(format!("step {}: role '{role}' has no runtime yet", i + 1));

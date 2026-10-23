@@ -541,6 +541,8 @@ pub enum ScenarioStep {
     ExpectState { role: String, name: String, value: bool },
     /// `expect commitment <role> <status>;`
     ExpectCommitment { role: String, status: String },
+    /// `expect log "<substring>";` — the session transcript contains it
+    ExpectLog { contains: String },
 }
 
 impl Handler {
@@ -1629,6 +1631,13 @@ fn parse_scenario_step(line: &str) -> Result<ScenarioStep, String> {
                 value: val,
             });
         }
+        if let Some(rest) = rest.strip_prefix("log ") {
+            let contains = rest
+                .trim()
+                .trim_matches('"')
+                .to_string();
+            return Ok(ScenarioStep::ExpectLog { contains });
+        }
         if let Some(rest) = rest.strip_prefix("commitment ") {
             let (role, status) = rest
                 .split_once(' ')
@@ -2126,6 +2135,71 @@ pub fn check(prog: &ProtocolProgram) -> Result<Vec<String>, Vec<IdlError>> {
         }
     }
 
+    // ---- §47: function recursion is a compile error (no call stacks in
+    // the runtime — a cycle would hang delivery)
+    {
+        let mut calls_of: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        fn collect_calls(e: &Expr, out: &mut Vec<String>) {
+            match e {
+                Expr::Call { name, args } => {
+                    out.push(name.clone());
+                    for a in args {
+                        collect_calls(a, out);
+                    }
+                }
+                Expr::Bin { l, r, .. } => {
+                    collect_calls(l, out);
+                    collect_calls(r, out);
+                }
+                Expr::Not(x) => collect_calls(x, out),
+                Expr::Field { base, .. } => collect_calls(base, out),
+                Expr::RecLit { fields, .. } => {
+                    for (_, fe) in fields {
+                        collect_calls(fe, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for f in &prog.functions {
+            let mut cs = Vec::new();
+            for a in &f.body {
+                if let ProtocolAction::Set { expr, .. } = a {
+                    collect_calls(expr, &mut cs);
+                }
+            }
+            if let Some(e) = &f.returned {
+                collect_calls(e, &mut cs);
+            }
+            calls_of.insert(f.name.clone(), cs);
+        }
+        fn has_path(from: &str, target: &str, graph: &BTreeMap<String, Vec<String>>, seen: &mut Vec<String>) -> bool {
+            if let Some(next) = graph.get(from) {
+                for n in next {
+                    if n == target {
+                        return true;
+                    }
+                    if !seen.contains(n) {
+                        seen.push(n.clone());
+                        if has_path(n, target, graph, seen) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
+        }
+        for f in &prog.functions {
+            let mut seen = Vec::new();
+            if has_path(&f.name, &f.name, &calls_of, &mut seen) {
+                errors.push(IdlError {
+                    line: 0,
+                    message: format!("function '{}' is recursive — the runtime has no call stacks", f.name),
+                });
+            }
+        }
+    }
+
     // ---- §41: state type lattice — bool|int|str|float|list|map,
     // list<T> / map<K,V> with valid element types, or declared records
     let valid_ty = |ty: &str| -> bool {
@@ -2554,6 +2628,81 @@ pub fn pretty(prog: &ProtocolProgram) -> String {
             }
             out.push_str("}\n");
         }
+    }
+    for (n, t) in &prog.templates {
+        out.push_str(&format!("message {n} = \"{t}\";\n"));
+    }
+    if let Some(t) = &prog.transport {
+        out.push_str(&format!("transport {t};\n"));
+    }
+    if let Some(c) = prog.capacity {
+        out.push_str(&format!("capacity {c};\n"));
+    }
+    for g in &prog.abort_when {
+        out.push_str(&format!("abort when {};\n", guard_word(g)));
+    }
+    for (ty, fields) in &prog.types {
+        let fs: Vec<String> = fields.iter().map(|(f, t)| format!("{f}: {t}")).collect();
+        out.push_str(&format!("type {ty} = {{ {} }};\n", fs.join(", ")));
+    }
+    for f in &prog.functions {
+        let params: Vec<String> = f.params.iter().map(|(n, t)| format!("{n}: {t}")).collect();
+        let ret = f.ret.as_ref().map(|r| format!(" -> {r}")).unwrap_or_default();
+        out.push_str(&format!("fn {}({}){} {{\n", f.name, params.join(", "), ret));
+        for a in &f.body {
+            out.push_str(&format!("  {};\n", action_word(a)));
+        }
+        if let Some(e) = &f.returned {
+            out.push_str(&format!("  return {};\n", expr_word(e)));
+        }
+        out.push_str("}\n");
+    }
+    for (name, hs) in &prog.handler_sets {
+        out.push_str(&format!("handler_set {name} {{\n"));
+        for h in hs {
+            for l in handler_to_text(h) {
+                out.push_str(&format!("  {l}\n"));
+            }
+        }
+        out.push_str("}\n");
+    }
+    for name in &prog.exported_sets {
+        out.push_str(&format!("export handler_set {name};\n"));
+    }
+    for name in &prog.exported_types {
+        out.push_str(&format!("export type {name};\n"));
+    }
+    for name in &prog.exported_fns {
+        out.push_str(&format!("export fn {name};\n"));
+    }
+    for sc in &prog.scenarios {
+        out.push_str(&format!("scenario {} {{\n", sc.name));
+        for st in &sc.steps {
+            let line = match st {
+                ScenarioStep::Send { from, performative, pattern, to } => {
+                    let p = pattern.clone().unwrap_or_default();
+                    format!("{from} sends {}{p} to {to}", perf_word(performative))
+                }
+                ScenarioStep::ExpectSend { from, performative } => {
+                    format!("expect {from} sends {}", perf_word(performative))
+                }
+                ScenarioStep::ExpectState { role, name, value } => {
+                    if *value {
+                        format!("expect state {role}.{name}")
+                    } else {
+                        format!("expect state {role}.{name} == false")
+                    }
+                }
+                ScenarioStep::ExpectCommitment { role, status } => {
+                    format!("expect commitment {role} {status}")
+                }
+                ScenarioStep::ExpectLog { contains } => {
+                    format!("expect log \"{contains}\"")
+                }
+            };
+            out.push_str(&format!("  {line};\n"));
+        }
+        out.push_str("}\n");
     }
     if let Some(ew) = &prog.end_when {
         match ew {
@@ -3581,5 +3730,45 @@ on inform from y -> send bye;
         assert!(p.types.contains_key("Quote"), "{:?}", p.types.keys());
         assert!(p.functions.iter().any(|f| f.name == "with_fee"));
         assert!(check(&p).is_ok(), "{:?}", check(&p).unwrap_err());
+    }
+}
+
+#[cfg(test)]
+mod tooling_tests {
+    use super::*;
+
+    // §47: fn recursion is a compile error (direct and mutual)
+    #[test]
+    fn fn_recursion_is_compile_error() {
+        let es: Vec<String> = check(&parse(
+            "protocol p v1;\nroles a, b;\nfn f(x: int) -> int {\nset r = f(x);\nreturn r;\n}\non inform from a -> send bye;\non inform from b -> send bye;\n",
+        ).unwrap())
+        .unwrap_err()
+        .into_iter()
+        .map(|e| e.message)
+        .collect();
+        assert!(es.iter().any(|m| m.contains("recursive")), "{es:?}");
+    }
+
+    #[test]
+    fn non_recursive_fn_ok() {
+        let p = parse(
+            "protocol p v1;\nroles a, b;\nfn f(x: int) -> int {\nset r = x + 1;\nreturn r;\n}\nfn g(x: int) -> int {\nset r = f(x) * 2;\nreturn r;\n}\nstate n: int;\non inform from a { set n = g(1); send bye; }\non inform from b -> send bye;\n",
+        )
+        .unwrap();
+        assert!(check(&p).is_ok());
+    }
+
+    // §47: expect log parses
+    #[test]
+    fn expect_log_parses() {
+        let p = parse(
+            "protocol p v1;\nroles a, b;\nscenario s1 {\na sends inform to b;\nexpect log \"recv\";\n}\non inform from a -> send bye;\non inform from b -> send bye;\n",
+        )
+        .unwrap();
+        assert!(p.scenarios.iter().any(|sc| sc.steps.iter().any(|st| matches!(st, ScenarioStep::ExpectLog { .. }))));
+        let (passed, failed) = crate::scenario::run_all(&p);
+        assert!(failed.is_empty(), "{failed:?}");
+        assert_eq!(passed.len(), 1);
     }
 }
