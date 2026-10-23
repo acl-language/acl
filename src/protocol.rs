@@ -908,6 +908,9 @@ fn parse_single(src: &str) -> Result<ProtocolProgram, Vec<IdlError>> {
             None => raw,
         }
         .trim();
+        // §55: nested statements may contain inline blocks — split with
+        // the block-aware splitter, not raw ';'
+        let _ = ();
         if line.is_empty() {
             continue;
         }
@@ -1613,22 +1616,63 @@ fn peel_phase(head: &str) -> (String, Option<String>) {
 
 /// §45: split statements on ';' at brace-depth 0 — `try { a; b; } catch { c };`
 /// stays one statement.
+/// §55: statement splitting that understands blocks. A `;` at depth 0
+/// ends a statement — and so does the closing brace of an inline for or
+/// catch block. Payload/record/pattern braces do NOT end statements, and
+/// a try body waits for its catch before the statement is complete.
+#[derive(PartialEq, Clone, Copy)]
+enum BlkKind {
+    For,
+    TryBody,
+    CatchBody,
+    Payload,
+}
+
 fn split_stmts(src: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut depth = 0i64;
+    let mut stack: Vec<BlkKind> = Vec::new();
+    let mut expect_catch = false;
     for c in src.chars() {
         match c {
             '{' => {
                 depth += 1;
                 cur.push(c);
+                let kind = if expect_catch {
+                    expect_catch = false;
+                    BlkKind::CatchBody
+                } else if cur.trim_start().starts_with("for ") {
+                    BlkKind::For
+                } else if cur.trim_start().starts_with("try ") {
+                    BlkKind::TryBody
+                } else {
+                    BlkKind::Payload
+                };
+                stack.push(kind);
             }
             '}' => {
                 depth -= 1;
                 cur.push(c);
+                match stack.pop() {
+                    Some(BlkKind::For) | Some(BlkKind::CatchBody) if depth == 0 => {
+                        let done = std::mem::take(&mut cur);
+                        if !done.trim().is_empty() {
+                            out.push(done);
+                        }
+                    }
+                    Some(BlkKind::TryBody) => {
+                        // `try { ... } catch { ... }` is ONE statement
+                        expect_catch = true;
+                    }
+                    _ => {}
+                }
             }
             ';' if depth == 0 => {
-                out.push(std::mem::take(&mut cur));
+                let done = std::mem::take(&mut cur);
+                if !done.trim().is_empty() {
+                    out.push(done);
+                }
             }
             _ => cur.push(c),
         }
@@ -1678,8 +1722,8 @@ fn parse_for_block(line: &str) -> Result<ProtocolAction, String> {
         .trim()
         .split_once(" in ")
         .ok_or("for needs 'for var in list'")?;
-    let actions: Vec<ProtocolAction> = body
-        .split(';')
+    let actions: Vec<ProtocolAction> = split_stmts(&body)
+        .iter()
         .filter(|p| !p.trim().is_empty())
         .map(|p| parse_action(p.trim()))
         .collect::<Result<_, _>>()?;
@@ -1852,6 +1896,10 @@ fn parse_action(stmt: &str) -> Result<ProtocolAction, String> {
         let phase = rest.trim_end_matches(';').trim().to_string();
         return Ok(ProtocolAction::Enter { phase });
     }
+    if s.starts_with("for ") && s.ends_with('}') {
+        // §55: inline for-block is a STATEMENT too (legal inside try/for)
+        return parse_for_block(s);
+    }
     if let Some(rest) = s.strip_prefix("try ") {
         // §45: `try { a; b; } catch { c; };` — inline form
         let (body_src, catch_src) = rest
@@ -1867,14 +1915,14 @@ fn parse_action(stmt: &str) -> Result<ProtocolAction, String> {
             .trim_end_matches('}')
             .trim();
         let mut body = Vec::new();
-        for stmt in body_inner.split(';') {
+        for stmt in split_stmts(body_inner) {
             if stmt.trim().is_empty() {
                 continue;
             }
             body.push(parse_action(stmt.trim())?);
         }
         let mut catch = Vec::new();
-        for stmt in catch_inner.split(';') {
+        for stmt in split_stmts(catch_inner) {
             if stmt.trim().is_empty() {
                 continue;
             }
@@ -4050,5 +4098,20 @@ mod nested_analysis_tests {
             warnings.iter().any(|w| w.contains("without key 'pct'")),
             "{warnings:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod split_stmts_tests {
+    use super::*;
+
+    #[test]
+    fn split_stmts_handles_nested_for() {
+        let body = r#" push items, "p1"; push items, "p2"; for it in items { send inform {"i": "${it}"} to a; } set x = x / 0; "#;
+        let stmts = split_stmts(body);
+        assert_eq!(stmts.len(), 4, "{stmts:?}");
+        let f = stmts[2].trim();
+        assert!(f.starts_with("for it in items") && f.ends_with('}'), "{f:?}");
+        assert_eq!(stmts[3].trim(), "set x = x / 0");
     }
 }

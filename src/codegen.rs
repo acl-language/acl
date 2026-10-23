@@ -677,7 +677,11 @@ pub fn gen_agent_py(prog: &ProtocolProgram, role: &str) -> Result<String, Vec<cr
                 for item in lst:
                     self.states[a["var"]] = item
                     for sub in a["actions"]:
-                        self._exec_one(sub)
+                        # ONE dispatcher — nested execution is identical
+                        self._run_one(sub, out)
+                    if self._jump:
+                        # a caught failure cuts the remaining iterations
+                        break
                 if saved is None:
                     self.states.pop(a["var"], None)
                 else:

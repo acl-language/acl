@@ -1085,6 +1085,8 @@ impl Runtime {
                     self.catch_stack.push(catch.clone());
                     let inner = self.run_actions(body, ev, &captures);
                     self.catch_stack.pop();
+                    // §55: the cut stops at the try boundary
+                    self.catch_jump = false;
                     out.extend(inner);
                 }
                 ProtocolAction::Await { count, performative, into, within_ms, flag } => {
@@ -1342,9 +1344,10 @@ format!(
     ) -> Vec<OutEvent> {
         let mut out = Vec::new();
         for a in actions {
-            // §45: a caught failure cuts the remaining body short
+            // §55: a caught failure cuts the remaining body — the flag is
+            // cleared at the try boundary (so the cut propagates through
+            // enclosing for loops too)
             if self.catch_jump {
-                self.catch_jump = false;
                 break;
             }
             match a {
@@ -1361,6 +1364,11 @@ format!(
                             for item in snapshot {
                                 self.states.insert(var.clone(), item.clone());
                                 out.extend(self.run_actions(actions, ev, &captures));
+                                // §55: a caught failure inside the body cuts
+                                // the remaining iterations
+                                if self.catch_jump {
+                                    break;
+                                }
                             }
                             match saved {
                                 Some(v) => {

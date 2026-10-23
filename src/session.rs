@@ -240,23 +240,30 @@ impl SessionHost {
 
     /// §35.9: reconstruct a host from a journal — deterministic replay.
     /// The replayed host must be indistinguishable from the original.
+    /// §55: DEPRECATED — role inference from the first sender is UNSOUND
+    /// (the peer is not the session's own role). This helper now rebuilds
+    /// ONLY from journaled opens (the faithful path) and REJECTS legacy
+    /// journals it cannot reconstruct faithfully; use `replay_from`.
+    #[deprecated(note = "role inference from senders is unsound; use replay_from")]
     pub fn replay(program: &ProtocolProgram, journal: &[(SessionId, Event)]) -> Result<Self, String> {
-        let mut host = SessionHost::new(program)?;
-        // collect session→role from the first event of each session
-        // (roles aren't in events; the journal records them via a
-        // pseudo-event at open time — here we re-open by role map passed
-        // through the journal's first In per session)
-        let mut opened: BTreeMap<SessionId, String> = BTreeMap::new();
-        for (id, ev) in journal {
-            if let Event::In { from, .. } = ev {
-                opened.entry(id.clone()).or_insert_with(|| from.clone());
-            }
+        let opens: Vec<(SessionId, &str)> = journal
+            .iter()
+            .filter_map(|(id, ev)| match ev {
+                Event::SessionOpened { role } => Some((id.clone(), role.as_str())),
+                _ => None,
+            })
+            .collect();
+        if opens.is_empty() {
+            return Err(
+                "replay(): legacy journal without journaled session opens cannot be                  reconstructed faithfully — persist with journal_with_roles() and use                  replay_from()"
+                    .to_string(),
+            );
         }
-        // NOTE: `from` is the PEER, not the session's own role. The role
-        // must be recorded at open time — sessions replay with the role
-        // captured in the journal header (see journal_with_roles).
-        for (id, role) in &opened {
-            host.open(id, role)?;
+        let mut host = SessionHost::new(program)?;
+        for (id, ev) in journal {
+            if let Event::SessionOpened { .. } = ev {
+                let _ = host.deliver(id, ev.clone());
+            }
         }
         for (id, ev) in journal {
             if host.is_open(id) {
@@ -683,6 +690,16 @@ mod ordered_open_replay_tests {
         .unwrap()
     }
 
+    /// §55: the tested capacity must be DECLARED in the program — the
+    /// rebuilt host derives it from the program, not from a field poked
+    /// on the original host
+    fn prog_capacity1() -> crate::protocol::ProtocolProgram {
+        parse(
+            "protocol p v1;\nroles a, b;\ncapacity 1;\non inform from a -> send bye;\non inform from b -> send bye;\n",
+        )
+        .unwrap()
+    }
+
     fn inform(from: &str) -> Event {
         Event::In {
             from: from.into(),
@@ -695,9 +712,9 @@ mod ordered_open_replay_tests {
     // §54: capacity 1 + close + reopen — replay follows the ORDERED opens
     #[test]
     fn replay_respects_capacity_and_reincarnation() {
-        let program = prog();
+        let program = prog_capacity1();
         let mut host = SessionHost::new(&program).unwrap();
-        host.capacity = 1;
+        assert_eq!(host.capacity, 1);
         host.open("s1", "b").unwrap();
         host.deliver("s1", inform("a")).unwrap();
         host.close("s1").unwrap();
@@ -712,6 +729,8 @@ mod ordered_open_replay_tests {
         assert!(!rebuilt.is_open("s1"));
         assert!(rebuilt.is_open("s2"));
         assert_eq!(rebuilt.session_count(), 1);
+        // §55: the rebuilt host PRESERVES the declared capacity
+        assert_eq!(rebuilt.capacity, 1);
         assert_eq!(rebuilt.journal().len(), host.journal().len());
     }
 
@@ -719,9 +738,9 @@ mod ordered_open_replay_tests {
     // lifecycle records in the header
     #[test]
     fn same_id_reincarnation_replays() {
-        let program = prog();
+        let program = prog_capacity1();
         let mut host = SessionHost::new(&program).unwrap();
-        host.capacity = 1;
+        assert_eq!(host.capacity, 1);
         host.open("s1", "b").unwrap();
         host.deliver("s1", inform("a")).unwrap();
         host.close("s1").unwrap();
@@ -732,6 +751,7 @@ mod ordered_open_replay_tests {
         let rebuilt = SessionHost::replay_from(&program, &roles, &grants, &journal).unwrap();
         assert!(rebuilt.is_open("s1"));
         assert_eq!(rebuilt.session_count(), 1);
+        assert_eq!(rebuilt.capacity, 1);
         assert_eq!(rebuilt.journal().len(), host.journal().len());
         // the header records the LATEST incarnation's role
         assert_eq!(roles.len(), 1);

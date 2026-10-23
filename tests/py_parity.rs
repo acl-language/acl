@@ -16,11 +16,13 @@ phase done;
 state x: int;
 state y: int;
 state flag: bool;
+state caught: bool;
+state items: list;
 on inform {"n": $n} from a in start {
-  try { set x = $n * 2; set y = x + 1; enter done; begin job; send inform {"r": "${y}"} to a; } catch { set y = -1; }
+  try { set x = $n * 2; set y = x + 1; enter done; begin job; send inform {"r": "${y}"} to a; } catch { set caught = true; }
 }
 on inform {"n": $n} from a in done {
-  try { set x = x / 0; } catch { set flag = true; }
+  try { push items, "p1"; push items, "p2"; for it in items { send inform {"i": "${it}"} to a; } set x = x / 0; } catch { set caught = true; }
   fulfil job;
 }
 every 1s as b while not flag -> set flag = true;
@@ -32,7 +34,17 @@ fn state_text(v: &StateValue) -> String {
         StateValue::Int(i) => i.to_string(),
         StateValue::Float(f) => f.to_string(),
         StateValue::Str(s) => s.clone(),
-        StateValue::List(_) => "<list>".into(),
+        StateValue::List(l) => {
+            let items: Vec<String> = l
+                .iter()
+                .map(|v| match v {
+                    StateValue::Str(s) => format!("\"{}\"", s),
+                    StateValue::Int(i) => i.to_string(),
+                    _ => "?".to_string(),
+                })
+                .collect();
+            format!("[{}]", items.join(", "))
+        }
         StateValue::Map(_) => "<map>".into(),
         StateValue::Record(_) => "<record>".into(),
         StateValue::Unset => "unset".into(),
@@ -70,7 +82,17 @@ fn rust_run() -> (Vec<String>, BTreeMap<String, String>, BTreeMap<String, String
         fields: Some(BTreeMap::from([("n".into(), FieldValue::Int(3))])),
     });
     for o in &o2 {
-        outs.push(format!("{}", acl_core::runtime::perf_name_pub(o.performative)));
+        let f: BTreeMap<String, String> = o
+            .fields
+            .iter()
+            .flatten()
+            .map(|(k, v)| (k.clone(), v.text()))
+            .collect();
+        outs.push(format!(
+            "{}:{}",
+            o.to.as_deref().unwrap_or(""),
+            serde_json::to_string(&f).unwrap_or_default()
+        ));
     }
     let states: BTreeMap<String, String> = r
         .states_snapshot()
@@ -112,10 +134,13 @@ for o in o1:
 ag.tick(1500)
 o2 = ag.deliver("a", "inform", None, {"n": 3})
 for o in o2:
-    outs.append(o["performative"])
+    f = o["fields"] or {}
+    outs.append(str(o["to"]) + ":" + json.dumps({k: str(v) for k, v in sorted(f.items())}, separators=(",", ":")))
 def st(v):
     if v is None: return "unset"
     if isinstance(v, bool): return "true" if v else "false"
+    if isinstance(v, list):
+        return "[" + ", ".join(json.dumps(x) if isinstance(x, str) else str(x) for x in v) + "]"
     return str(v)
 states = {k: st(v) for k, v in ag.states.items()}
 commitments = {k: str(v) for k, v in ag.commitments.items()}
@@ -160,9 +185,13 @@ print(json.dumps({"outs": outs, "states": states, "commitments": commitments}))
     }
     // the exercised paths MUST include: catch, phase transition, fulfil
     assert_eq!(
-        rust_states.get("flag").map(String::as_str),
+        rust_states.get("caught").map(String::as_str),
         Some("true"),
-        "catch path must have run"
+        "catch path must have run (flag is set by the timer, not the catch)"
+    );
+    assert!(
+        rust_states.get("items").map(String::as_str).unwrap_or("").contains("p1"),
+        "for body must have collected items"
     );
     assert_eq!(
         rust_commitments.get("job").map(String::as_str),
