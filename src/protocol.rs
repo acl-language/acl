@@ -963,6 +963,17 @@ pub fn parse(src: &str) -> Result<ProtocolProgram, Vec<IdlError>> {
                 Some((h, s)) => (h.trim(), true, s.trim().to_string()),
                 None => (rest.trim_end_matches('{').trim(), false, String::new()),
             };
+            // inline block: `on X { act; act; }` — split the block body off
+            // BEFORE trigger parsing (a content pattern's braces must not
+            // leak into the trigger's from-clause)
+            let mut block_body: Option<String> = None;
+            let head = if !arrow && rest.ends_with('}') && rest.contains('{') {
+                let i = rest.rfind('{').unwrap();
+                block_body = Some(rest[i + 1..rest.len() - 1].to_string());
+                rest[..i].trim()
+            } else {
+                head
+            };
             // §34: peel `when <guard>` (before from-parsing)
             let (head, guard) = match head.rfind(" when ") {
                 Some(i) => (head[..i].trim(), match parse_guard(head[i + 6..].trim()) {
@@ -999,7 +1010,7 @@ pub fn parse(src: &str) -> Result<ProtocolProgram, Vec<IdlError>> {
             } else {
                 vec![head.to_string()]
             };
-            let inline_block = !arrow && line.contains('{') && line.ends_with('}');
+            let inline_block = block_body.is_some();
             if expanded.len() > 1 && !arrow && !inline_block {
                 errors.push(IdlError {
                     line: line_no,
@@ -1035,9 +1046,9 @@ pub fn parse(src: &str) -> Result<ProtocolProgram, Vec<IdlError>> {
                 prog.handlers.extend(hs);
             } else if line.ends_with('{') {
                 handler = Some(hs.remove(0));
-            } else if line.contains('{') && line.ends_with('}') {
-                // inline block: `on X { act; act; }`
-                let body = &line[line.find('{').unwrap() + 1..line.len() - 1];
+            } else if let Some(body_src) = block_body.take() {
+                // inline block: `on X { act; act; }` — body already split off
+                let body = body_src;
                 for stmt in body.split(';') {
                     if stmt.trim().is_empty() {
                         continue;
@@ -1379,6 +1390,183 @@ fn parse_action(stmt: &str) -> Result<ProtocolAction, String> {
 
 // ---------------------------------------------------------------- check
 
+/// §38.6: static type of an expression — Some only when statically known
+/// ("int" | "float" | "str" | "bool" | declared record type name).
+pub fn static_ty(e: &Expr, prog: &ProtocolProgram) -> Option<String> {
+    match e {
+        Expr::LitInt(_) => Some("int".into()),
+        Expr::LitStr(_) => Some("str".into()),
+        Expr::LitBool(_) => Some("bool".into()),
+        Expr::State(n) => prog
+            .states
+            .iter()
+            .find(|s| &s.name == n)
+            .and_then(|s| s.ty.clone()),
+        Expr::Field { base, name } => {
+            let bt = static_ty(base, prog)?;
+            prog.types
+                .get(&bt)?
+                .iter()
+                .find(|(f, _)| f == name)
+                .map(|(_, t)| t.clone())
+        }
+        Expr::RecLit { ty, .. } => Some(ty.clone()),
+        Expr::Call { name, .. } => prog
+            .functions
+            .iter()
+            .find(|f| &f.name == name)
+            .and_then(|f| f.ret.clone()),
+        Expr::Not(_) => Some("bool".into()),
+        Expr::Bin { op, l, r } => match op {
+            BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne
+            | BinOp::And | BinOp::Or => Some("bool".into()),
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+                let lt = static_ty(l, prog);
+                let rt = static_ty(r, prog);
+                match (lt, rt) {
+                    (Some(a), Some(b)) if a == b => Some(a),
+                    (Some(a), Some(b))
+                        if (a == "int" && b == "float") || (a == "float" && b == "int") =>
+                    {
+                        Some("float".into())
+                    }
+                    _ => None,
+                }
+            }
+        },
+        Expr::Capture(_) | Expr::Arg(_) => None,
+    }
+}
+
+/// §38.6: widening rule — int widens to float, nothing else coerces.
+fn ty_assign_ok(declared: &str, got: &str) -> bool {
+    declared == got || (declared == "float" && got == "int")
+}
+
+/// §38.6: walk assignment actions; check declared state types against
+/// inferred expression types and record field existence (recursively
+/// through `for` bodies).
+fn check_action_types(
+    prog: &ProtocolProgram,
+    actions: &[ProtocolAction],
+    errors: &mut Vec<IdlError>,
+) {
+    for a in actions {
+        match a {
+            ProtocolAction::Set { name, field, expr } => {
+                if let Some(f) = field {
+                    // field write `set q.price = ...`: q must be a record
+                    // and 'price' one of its declared fields
+                    let declared = prog
+                        .states
+                        .iter()
+                        .find(|s| &s.name == name)
+                        .and_then(|s| s.ty.clone());
+                    if let Some(dt) = declared {
+                        match prog.types.get(&dt) {
+                            Some(fields) => {
+                                if !fields.iter().any(|(fname, _)| fname == f) {
+                                    errors.push(IdlError {
+                                        line: 0,
+                                        message: format!(
+                                            "record '{dt}' has no field '{f}' (set {name}.{f})"
+                                        ),
+                                    });
+                                }
+                            }
+                            None => errors.push(IdlError {
+                                line: 0,
+                                message: format!(
+                                    "'{dt}' is not a declared record type (set {name}.{f})"
+                                ),
+                            }),
+                        }
+                    }
+                } else if let Some(dt) = prog
+                    .states
+                    .iter()
+                    .find(|s| &s.name == name)
+                    .and_then(|s| s.ty.clone())
+                {
+                    if let Some(gt) = static_ty(expr, prog) {
+                        if !ty_assign_ok(&dt, &gt) {
+                            errors.push(IdlError {
+                                line: 0,
+                                message: format!(
+                                    "type mismatch: state '{name}' is '{dt}' but expression is '{gt}'"
+                                ),
+                            });
+                        }
+                    }
+                }
+                check_expr_fields(prog, expr, errors);
+            }
+            ProtocolAction::Push { expr, .. } | ProtocolAction::Put { expr, .. } => {
+                check_expr_fields(prog, expr, errors);
+            }
+            ProtocolAction::For { actions, .. } => {
+                check_action_types(prog, actions, errors)
+            }
+            _ => {}
+        }
+    }
+}
+
+/// §38.6: recursively check record field access/literals inside an expr.
+fn check_expr_fields(prog: &ProtocolProgram, e: &Expr, errors: &mut Vec<IdlError>) {
+    match e {
+        Expr::Field { base, name } => {
+            if let Some(bt) = static_ty(base, prog) {
+                match prog.types.get(&bt) {
+                    Some(fields) => {
+                        if !fields.iter().any(|(f, _)| f == name) {
+                            errors.push(IdlError {
+                                line: 0,
+                                message: format!("record '{bt}' has no field '{name}'"),
+                            });
+                        }
+                    }
+                    None => {
+                        if matches!(bt.as_str(), "int" | "str" | "bool" | "float") {
+                            errors.push(IdlError {
+                                line: 0,
+                                message: format!("'{bt}' is not a record — no field '{name}'"),
+                            });
+                        }
+                    }
+                }
+            }
+            check_expr_fields(prog, base, errors);
+        }
+        Expr::Bin { l, r, .. } => {
+            check_expr_fields(prog, l, errors);
+            check_expr_fields(prog, r, errors);
+        }
+        Expr::Not(x) => check_expr_fields(prog, x, errors),
+        Expr::Call { args, .. } => {
+            for a in args {
+                check_expr_fields(prog, a, errors);
+            }
+        }
+        Expr::RecLit { ty, fields } => {
+            if let Some(decl) = prog.types.get(ty) {
+                for (f, _) in fields {
+                    if !decl.iter().any(|(df, _)| df == f) {
+                        errors.push(IdlError {
+                            line: 0,
+                            message: format!("record '{ty}' has no field '{f}'"),
+                        });
+                    }
+                }
+            }
+            for (_, fe) in fields {
+                check_expr_fields(prog, fe, errors);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Compile-time well-formedness — the dialogue matrix (§16) applied to the
 /// PROGRAM, not the runtime. Returns warnings; errors abort compilation.
 pub fn check(prog: &ProtocolProgram) -> Result<Vec<String>, Vec<IdlError>> {
@@ -1626,6 +1814,11 @@ pub fn check(prog: &ProtocolProgram) -> Result<Vec<String>, Vec<IdlError>> {
                 _ => {}
             }
         }
+    }
+
+    // ---- §38.6: static type checks — assignments & record field access ----
+    for h in &prog.handlers {
+        check_action_types(prog, &h.actions, &mut errors);
     }
 
     // ---- §34: LIVENESS — every handler can reach a terminal action ----
@@ -2359,5 +2552,76 @@ mod handler_set_tests {
         .unwrap();
         assert_eq!(prog.handler_sets["tiny"].len(), 1);
         assert_eq!(prog.handlers.len(), 4);
+    }
+}
+
+#[cfg(test)]
+mod static_type_tests {
+    use super::*;
+
+    fn check_errs(src: &str) -> Vec<String> {
+        let prog = parse(src).unwrap();
+        check(&prog)
+            .unwrap_err()
+            .into_iter()
+            .map(|e| e.message)
+            .collect()
+    }
+
+    #[test]
+    fn set_type_mismatch_caught() {
+        let errs = check_errs(
+            "protocol p v1;\nroles a, b;\nstate total: int;\nstate flag: bool;\non inform from a { set total = 1 + 2; set flag = 3; set total = \"x\"; send bye; }\n",
+        );
+        assert!(errs.iter().any(|m| m.contains("state 'flag' is 'bool'")), "{errs:?}");
+        assert!(errs.iter().any(|m| m.contains("state 'total' is 'int'") && m.contains("'str'")), "{errs:?}");
+        // 1 + 2 → int → total:int OK — no error for it
+        assert!(!errs.iter().any(|m| m.contains("'total' is 'int' but expression is 'int'")), "{errs:?}");
+    }
+
+    #[test]
+    fn arg_and_capture_stay_dynamic() {
+        // arg.* and $captures are statically unknown — must NOT error
+        let prog = parse(
+            "protocol p v1;\nroles a, b;\nstate total: int;\non inform {\"amount\": $v} from a { set total = $v; send bye; }\n",
+        )
+        .unwrap();
+        assert!(check(&prog).is_ok());
+    }
+
+    #[test]
+    fn record_field_access_checked() {
+        let errs = check_errs(
+            "type Quote = { price: int, currency: str };\nprotocol p v1;\nroles a, b;\nstate q: Quote;\nstate bad: int;\non inform from a { set q.wrong = 5; set bad = q.price + 1; set bad = q.price.nope; send bye; }\n",
+        );
+        assert!(errs.iter().any(|m| m.contains("'Quote' has no field 'wrong'")), "{errs:?}");
+        assert!(!errs.iter().any(|m| m.contains("q.price + 1") || (m.contains("no field 'price'"))), "{errs:?}");
+        assert!(errs.iter().any(|m| m.contains("no field 'nope'")), "{errs:?}");
+    }
+
+    #[test]
+    fn field_on_scalar_rejected() {
+        let errs = check_errs(
+            "protocol p v1;\nroles a, b;\nstate total: int;\non inform from a { set total = total.price; send bye; }\n",
+        );
+        assert!(errs.iter().any(|m| m.contains("not a record")), "{errs:?}");
+    }
+
+    #[test]
+    fn int_widens_to_float() {
+        let prog = parse(
+            "protocol p v1;\nroles a, b;\nstate r: float;\non inform from a { set r = 1 + 2; send bye; }\n",
+        )
+        .unwrap();
+        assert!(check(&prog).is_ok());
+    }
+
+    #[test]
+    fn bool_expr_types_check() {
+        let prog = parse(
+            "protocol p v1;\nroles a, b;\nstate flag: bool;\non inform from a { set flag = 1 < 2 and not (3 == 4); send bye; }\n",
+        )
+        .unwrap();
+        assert!(check(&prog).is_ok());
     }
 }
