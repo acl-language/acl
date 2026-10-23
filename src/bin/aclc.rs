@@ -7,6 +7,7 @@
 //!   aclc names <file.acl>...          print fully-qualified names
 
 use acl_core::idl::{self, IdlFile};
+use std::path::Path;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -72,6 +73,56 @@ fn main() {
                 }
             }
             std::process::exit(if failed { 1 } else { 0 });
+        }
+        "publish" | "protocols" | "fetch" => {
+            // §35.15: protocol registry — publish/list/fetch (checksummed)
+            let cmd = cmd;
+            match cmd {
+                "publish" => {
+                    if files.len() < 3 {
+                        eprintln!("usage: aclc publish <file.aclp> <registry.json> [publisher]");
+                        std::process::exit(2);
+                    }
+                    let src = std::fs::read_to_string(&files[0]).unwrap_or_else(|e| {
+                        eprintln!("aclc: cannot read {}: {e}", files[0]);
+                        std::process::exit(2);
+                    });
+                    let mut reg = acl_core::registry_protocols::ProtocolRegistry::load(Path::new(&files[1]))
+                        .unwrap_or_else(|e| { eprintln!("registry: {e}"); std::process::exit(2); });
+                    match reg.publish(&src, files.get(2).map(|s| s.as_str())) {
+                        Ok((name, ver)) => {
+                            reg.save(Path::new(&files[1])).unwrap_or_else(|e| { eprintln!("save: {e}"); std::process::exit(2); });
+                            println!("published {}@v{}", name, ver);
+                        }
+                        Err(e) => { eprintln!("{e}"); std::process::exit(1); }
+                    }
+                }
+                "protocols" => {
+                    let reg = acl_core::registry_protocols::ProtocolRegistry::load(Path::new(files.get(0).map(|s| s.as_str()).unwrap_or("protocols.json")))
+                        .unwrap_or_else(|e| { eprintln!("registry: {e}"); std::process::exit(2); });
+                    for (name, ver, roles) in reg.list() {
+                        println!("{}@v{} roles=[{}]", name, ver, roles.join(","));
+                    }
+                    if reg.is_empty() { println!("(empty registry)"); }
+                }
+                "fetch" => {
+                    if files.len() < 3 {
+                        eprintln!("usage: aclc fetch <name> <version> <registry.json>");
+                        std::process::exit(2);
+                    }
+                    let reg = acl_core::registry_protocols::ProtocolRegistry::load(Path::new(&files[2]))
+                        .unwrap_or_else(|e| { eprintln!("registry: {e}"); std::process::exit(2); });
+                    let ver: u32 = files[1].trim_start_matches('v').parse().unwrap_or_else(|_| {
+                        eprintln!("bad version '{}'", files[1]);
+                        std::process::exit(2);
+                    });
+                    match reg.fetch_verified(&files[0], ver) {
+                        Ok(prog) => println!("fetched {}@v{} (integrity verified): roles=[{}]", prog.name, prog.version, prog.roles.join(",")),
+                        Err(e) => { eprintln!("{e}"); std::process::exit(1); }
+                    }
+                }
+                _ => unreachable!(),
+            }
         }
         "scenarios" => {
             // §35.12: run every scenario in the program (deterministic)

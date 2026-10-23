@@ -6,6 +6,25 @@ Format based on Keep a Changelog; versions follow semver for the
 
 ## [Unreleased]
 
+## [0.12.0] — 2026-10-23
+
+The three remaining gaps closed: enforced capability gating, a language
+server, and a tamper-evident protocol registry.
+
+### Added
+- **Capability enforcement, default-on** (§36.1): `SessionHost` grants
+  nothing by default — a program with `use` declarations cannot open
+  sessions until granted (`new_gated`); peer AgentCards verified via
+  `peer_satisfies`. stdlib.* fragments are exempt.
+- **`acl-lsp`** (§36.2): LSP server for `.aclp` — publishDiagnostics
+  (parse + all semantic checks, line numbers), completion (keywords,
+  performatives, declared states/roles). Validated end-to-end over
+  stdio JSON-RPC framing.
+- **Protocol registry** (§36.3): `aclc publish|protocols|fetch` —
+  file-backed, SHA-256 checksummed source; fetch verifies integrity
+  before parsing (tamper detection tested).
+- 3 new tests (**122/122**).
+
 ## [0.11.0] — 2026-10-23
 
 The complete programming language: computation, collections, failure

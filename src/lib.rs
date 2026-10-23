@@ -22,6 +22,7 @@ pub mod semantics;
 pub mod sealed;
 pub mod idempotency;
 pub mod registry;
+pub mod registry_protocols;
 pub mod replay;
 pub mod rdf;
 use serde::{Deserialize, Serialize};

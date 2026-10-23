@@ -1084,6 +1084,33 @@ merged states are compile errors.
 <journal.jsonl>` is the protocol debugger — replays a journal step by
 step and prints each role's transcript (seq, direction, text).
 
+## 36. Closing the gaps (normative)
+
+### 36.1 Capability enforcement (default-on)
+
+The §35.6 declaration is ENFORCED, not decorative: `SessionHost` grants
+nothing by default. A program with required capabilities cannot open a
+session until the environment grants them (`new_gated(grants)`), and a
+peer's AgentCard can be checked against the program's requirements
+(`peer_satisfies`). `stdlib.*` names are library fragments, not
+capabilities.
+
+### 36.2 Language Server
+
+`acl-lsp` — an LSP server for `.aclp` (stdio JSON-RPC):
+`textDocument/publishDiagnostics` (parse + dialogue/linearity/liveness/
+guard errors with line numbers, warnings for liveness), completion
+(keywords, performatives, declared states and roles), full-sync
+didOpen/didChange.
+
+### 36.3 Protocol registry
+
+File-backed registry with integrity: `aclc publish <file.aclp>
+<registry.json> [publisher]` stores the source + SHA-256 checksum;
+`aclc protocols <registry.json>` lists; `aclc fetch <name> <version>
+<registry.json>` verifies the checksum before parsing — a tampered
+registry fails to fetch.
+
 ## 16. Dialogue rules (normative)
 
 A conversation has policy: after a given performative, only certain replies

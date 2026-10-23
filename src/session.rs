@@ -16,6 +16,10 @@ pub type SessionId = String;
 pub struct SessionHost {
     pub program: ProtocolProgram,
     pub capacity: usize,
+    /// §35.6 enforcement: capabilities the environment GRANTED to this
+    /// host. A program requiring a capability not present here cannot
+    /// open sessions — the declaration is enforceable, not decorative.
+    granted: std::collections::BTreeSet<String>,
     sessions: BTreeMap<SessionId, Runtime>,
     /// §35.9: the journal — every event delivered, in order
     journal: Vec<(SessionId, Event)>,
@@ -28,14 +32,61 @@ impl SessionHost {
         Ok(SessionHost {
             program: program.clone(),
             capacity: program.capacity.unwrap_or(usize::MAX),
+            granted: std::collections::BTreeSet::new(),
             sessions: BTreeMap::new(),
             journal: Vec::new(),
             outbox: Vec::new(),
         })
     }
 
-    /// open a session — capacity is enforced (§35.8)
+    /// §35.6: gated constructor — the environment grants capabilities;
+    /// missing grants reject session opens.
+    pub fn new_gated(
+        program: &ProtocolProgram,
+        granted: &[String],
+    ) -> Result<Self, String> {
+        let mut host = SessionHost::new(program)?;
+        for g in granted {
+            host.granted.insert(g.clone());
+        }
+        Ok(host)
+    }
+
+    /// verify a peer's capability list against this program's needs
+    /// (the AgentCard check, §35.6)
+    pub fn peer_satisfies(card_capabilities: &[String]) -> impl Fn(&ProtocolProgram) -> Result<(), String> + '_ {
+        move |prog| {
+            let missing: Vec<&str> = prog
+                .capabilities
+                .iter()
+                .map(|c| c.name.as_str())
+                .filter(|n| !card_capabilities.contains(&n.to_string()))
+                .collect();
+            if missing.is_empty() {
+                Ok(())
+            } else {
+                Err(format!("peer AgentCard lacks: {}", missing.join(", ")))
+            }
+        }
+    }
+
+    /// open a session — capacity AND capability grants are enforced (§35.6)
     pub fn open(&mut self, id: &str, role: &str) -> Result<(), String> {
+        // capability gate: default-on. A program that declares required
+        // capabilities cannot open sessions the environment did not grant.
+        let ungranted: Vec<&str> = self
+            .program
+            .capabilities
+            .iter()
+            .map(|c| c.name.as_str())
+            .filter(|name| !name.starts_with("stdlib.") && !self.granted.contains(*name))
+            .collect();
+        if !ungranted.is_empty() {
+            return Err(format!(
+                "capability gate: session '{id}' rejected — program requires {} which was not granted",
+                ungranted.join(", ")
+            ));
+        }
         if self.sessions.contains_key(id) {
             return Err(format!("session '{id}' already open"));
         }
@@ -240,6 +291,42 @@ mod tests {
         assert!(host.same_state_as(&rebuilt), "replay must reconstruct exact state");
         // and the replayed host continues deterministically
         let _ = original; // silence unused in this scope shape
+    }
+
+    #[test]
+    fn capability_gate_is_enforced() {
+        let prog = parse(
+            "protocol p v1;\nroles a, b;\nuse fs.read as reader;\nuse net.http;\non query from a -> send inform to a;\non inform from b -> send bye;\n",
+        )
+        .unwrap();
+        // default-on: plain host grants NOTHING — open rejected
+        let mut host = SessionHost::new(&prog).unwrap();
+        let err = host.open("s1", "a").unwrap_err();
+        assert!(err.contains("capability gate"), "{err}");
+        // partially granted: still rejected
+        assert!(SessionHost::new_gated(&prog, &["fs.read".into()])
+            .unwrap()
+            .open("s1", "a")
+            .is_err());
+        // gated host with all grants: works
+        let mut host = SessionHost::new_gated(
+            &prog,
+            &["fs.read".into(), "net.http".into()],
+        )
+        .unwrap();
+        host.open("s1", "a").unwrap();
+        assert_eq!(host.session_count(), 1);
+        // peer AgentCard check
+        let cards = vec![
+            vec!["fs.read".to_string(), "net.http".to_string(), "acl.speak".to_string()],
+            vec!["acl.speak".to_string()],
+        ];
+        SessionHost::peer_satisfies(&cards[0])(&prog)
+            .expect("peer has all needed capabilities");
+        assert!(SessionHost::peer_satisfies(&cards[1])(&prog).is_err());
+        // stdlib.* names are not capabilities (not gated)
+        let prog2 = parse("protocol q v1;\nroles a,b;\nuse stdlib.fipa;\non query from a -> send inform to a;\non inform from b -> send bye;\n").unwrap();
+        SessionHost::new_gated(&prog2, &[]).expect("stdlib.* needs no grant");
     }
 
     #[test]
