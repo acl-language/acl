@@ -526,3 +526,81 @@ mod full_replay_tests {
         assert_eq!(a.now_ms(), b.now_ms());
     }
 }
+
+#[cfg(test)]
+mod concurrent_conversations_tests {
+    use super::*;
+    use crate::protocol::parse;
+    use crate::runtime::StateValue;
+
+    // §53: multiple concurrent conversations of the SAME role are
+    // independent instances — states AND conversation phases do not leak
+    #[test]
+    fn concurrent_instances_have_independent_phases_and_states() {
+        let prog = parse(
+            "protocol p v1;\nroles a, b;\nphase start;\nphase accepted;\nstate n: int;\non inform {\"k\": $k} from a in start { set n = $k; enter accepted; }\non inform {\"k\": $k} from a in accepted { set n = n + $k; }\non inform from b -> send bye;\n",
+        )
+        .unwrap();
+        let mut host = SessionHost::new(&prog).unwrap();
+        host.open("s1", "b").unwrap();
+        host.open("s2", "b").unwrap();
+        host.deliver(
+            "s1",
+            Event::In {
+                from: "a".into(),
+                performative: crate::Performative::Inform,
+                pattern: None,
+                fields: Some(BTreeMap::from([(
+                    "k".into(),
+                    crate::runtime::FieldValue::Int(5),
+                )])),
+            },
+        )
+        .unwrap();
+        // s1 entered accepted; s2 MUST still be in start
+        host.deliver(
+            "s2",
+            Event::In {
+                from: "a".into(),
+                performative: crate::Performative::Inform,
+                pattern: None,
+                fields: Some(BTreeMap::from([(
+                    "k".into(),
+                    crate::runtime::FieldValue::Int(7),
+                )])),
+            },
+        )
+        .unwrap();
+        let s1 = host.sessions.get("s1").unwrap();
+        let s2 = host.sessions.get("s2").unwrap();
+        // each instance followed its OWN path: s1 n=5 (start handler),
+        // s2 n=7 (its own start handler) — no cross-contamination
+        assert_eq!(s1.states_snapshot().get("n"), Some(&StateValue::Int(5)));
+        assert_eq!(s2.states_snapshot().get("n"), Some(&StateValue::Int(7)));
+        assert_eq!(s1.now_phase(), "accepted");
+        assert_eq!(s2.now_phase(), "accepted");
+        // a second event in s1 runs the ACCEPTED handler (n = n + k),
+        // while s2 is untouched
+        host.deliver(
+            "s1",
+            Event::In {
+                from: "a".into(),
+                performative: crate::Performative::Inform,
+                pattern: None,
+                fields: Some(BTreeMap::from([(
+                    "k".into(),
+                    crate::runtime::FieldValue::Int(3),
+                )])),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            host.sessions.get("s1").unwrap().states_snapshot().get("n"),
+            Some(&StateValue::Int(8))
+        );
+        assert_eq!(
+            host.sessions.get("s2").unwrap().states_snapshot().get("n"),
+            Some(&StateValue::Int(7))
+        );
+    }
+}

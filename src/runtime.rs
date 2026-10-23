@@ -583,6 +583,11 @@ impl Runtime {
         }
     }
 
+    /// §53: the current conversation phase (instance-scoped)
+    pub fn now_phase(&self) -> &str {
+        &self.phase
+    }
+
     /// §49: the runtime clock (absolute, host-injected) — replay equality
     pub fn now_ms(&self) -> i64 {
         self.now_ms
