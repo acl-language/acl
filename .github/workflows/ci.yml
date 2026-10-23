@@ -18,7 +18,9 @@ jobs:
         run: cargo build --bin peer --bin httpd --bin interop --bin mcp_bridge
       - name: Build acl-py binding
         working-directory: acl-py
-        run: PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 cargo build
+        run: |
+          PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 cargo build
+          cp target/debug/libacl_py.so target/debug/acl_py.abi3.so
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
