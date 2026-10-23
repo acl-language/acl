@@ -61,9 +61,19 @@ The compiler enforces the rules at BUILD time:
 - liveness: handlers that cannot reach a terminal action warn as deadlock
 
 Statements available: `send <perf> [to <role>] [retry N backoff D exp]`,
-`begin`, `fulfil`, `retract(target)`, `set x = <expr>`, `push`/`put`,
-`for x in list { ... }`, `abort`. Expressions are pure (18 builtins);
-time is host-injected (`tick()`), never a hidden clock.
+`broadcast <perf> to <list>`, `begin`, `fulfil`, `retract(target)`,
+`set x = <expr>`, `push`/`put`, `for x in list { ... }`, `abort`.
+Expressions are pure (19 builtins, incl. `prefer(list, key)` for
+contract-net bid selection); time is host-injected (`tick()`), never a
+hidden clock.
+
+Language extras (spec §39): guards over typed pattern captures
+(`when $p > 100`), trigger alternation (`on (accept | reject)`),
+static assignment typing, `on error { ... }` for internal failures
+(with `$reason`), rich templates (`fmt("x ${expr}")`, `$${` = literal),
+reusable fragments with visibility (`handler_set` / `include
+handler_set ns.name` / `export`) and module imports
+(`import "file.aclp" as m;` — only exported sets splice, namespaced).
 
 ## Compile and run
 

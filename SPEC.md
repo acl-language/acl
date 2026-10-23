@@ -1,6 +1,6 @@
 # ACL — Agent Communication Language
 
-**Version:** 0.14.0-draft
+**Version:** 0.15.0-draft
 **Status:** Draft specification
 **License:** Apache-2.0 (spec + reference implementation)
 
@@ -1279,3 +1279,87 @@ The grammar also defines:
 
 Error codes are normative: implementations must use the same codes for
 the same classes of violation, so that diagnostics are portable.
+
+## 39. Protocol language — guards, types, fan-out, templates, modules (normative)
+
+This section completes the language layer of §33-§35 and §38. The
+implementations live in `src/protocol.rs` (parse/check) and
+`src/runtime.rs` (evaluation); the grammar productions are in
+[GRAMMAR.md](GRAMMAR.md).
+
+### 39.1 Expression guards and typed captures
+
+A guard that references a pattern capture or uses a comparison operator
+is a full expression, evaluated at delivery time with the trigger's
+captures in scope; captures shadow session states. Capture values are
+type-inferred from the payload (int, float, bool, else string), so
+`on inform {"price": $p} when $p > 100 -> ...` compares numerically. A
+bare `$var` value inside a content pattern is normalized to the JSON
+string `"$var"` at parse time.
+
+### 39.2 Trigger alternation
+
+`on (accept | reject) from buyer` expands at parse time into one handler
+per alternative with identical guard and actions. Only the one-line and
+inline-block forms accept alternation; a block-form alternation is a
+compile error.
+
+### 39.3 Handler sets (fragments)
+
+`handler_set name { ... }` declares a reusable handler fragment;
+`include handler_set name;` splices its handlers into the current
+protocol. Roles referenced by the fragment are checked against the
+including protocol's roles at include time. A set may be declared once
+per file (duplicate = compile error).
+
+### 39.4 Static typing
+
+`static_ty` infers the static type of an expression (literals, declared
+state types, record fields, user function return types, arithmetic and
+comparison operators). Assignment to a typed state with a known
+incompatible type is a compile error; `int` widens to `float`; captures
+and `arg.*` are statically unknown and keep the runtime checks of §35.1.
+Record field access (`q.price`) and record literals (`Quote { price: 5 }`)
+are validated against the declared `type` — unknown fields and field
+access on scalars are compile errors.
+
+### 39.5 Errors as flow
+
+Internal action failures — `set`/`push`/`put` evaluation errors,
+non-list/non-map container violations, and send retry exhaustion — are
+routed to the session's unattributed `on error` handler as a synthetic
+Error event with the failure text in the `$reason` capture. The failure
+is always logged; failures inside the error handler itself are logged
+only (recursion is cut off — no error loops). `on error from X` handlers
+receive only external Error messages from role X.
+
+### 39.6 Broadcast and bid selection
+
+`broadcast <perf> [payload] to <list_state>;` emits one send per role
+named in the list state (contract-net announce). Dialogue legality is
+enforced exactly like an ordinary send; the target must be a declared
+state. `prefer(list, key)` selects the map or record with the LOWEST
+numeric value for `key` (empty list yields unset) — the bid-award
+primitive for contract-net.
+
+### 39.7 Rich template interpolation
+
+`fmt` accepts either a registered template name or an inline template
+containing `${expr}` interpolations — full expressions (states,
+captures, arithmetic, record fields) evaluated in the caller's scope.
+`$${` is the literal escape for `${`. Registered templates late-bind
+their `${expr}` interpolations at the call site and keep positional
+`{0}`-style placeholders. Unmatched `${` is an evaluation error.
+
+### 39.8 Modules and visibility
+
+`export handler_set name;` marks a fragment importable; everything else
+in a module file stays private. `import "file.aclp" as ns;` loads the
+module (with its own includes/imports, depth-limited to 8 — import
+cycles are errors) and splices ONLY the exported sets, namespaced as
+`ns.<set>`; without an alias the original names are used and name
+collisions between imports are compile errors. `include handler_set
+ns.name;` then splices the imported fragment into the protocol.
+
+The `aclc` tool resolves includes and imports relative to the edited
+file's own directory, for every subcommand that reads a `.aclp`.

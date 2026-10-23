@@ -76,6 +76,28 @@ host injects `tick()`), declarative retry
 (`send X retry 3 backoff 2s exp`), abort with compensation
 (`abort when <guard>`, latched).
 
+**Composition and modules (§39)** — expression guards over typed
+pattern captures (`when $p > 100`), trigger alternation
+(`on (accept | reject)`), reusable handler fragments with visibility
+(`handler_set` + `include handler_set ns.name;`, `export` marks what is
+importable), and module imports (`import "common.aclp" as m;`) with
+namespace collision detection.
+
+**Static typing** — `set` assignments are type-checked at compile time
+(int widens to float; captures and `arg.*` stay runtime-checked), and
+record field access/literals are validated against declared types.
+
+**Errors as flow** — internal failures (bad `set`/`push`/`put`, retry
+exhaustion) route to an `on error` handler with `$reason`, guarded
+against error loops.
+
+**Contract-net** — `broadcast propose to bidders;` fans out one send per
+role in a list state; `prefer(bids, "price")` picks the lowest bid.
+
+**Rich templates** — `fmt("price ${p} total ${total + 2}")` interpolates
+full expressions inline; registered templates late-bind `${expr}` at the
+call site and keep positional `{0}` placeholders.
+
 **Compile-time guarantees** — dialogue matrix (an illegal reply is a
 compile error), linearity (every send must have a receiver — orphan
 sends are compile errors), liveness (handlers that cannot reach a

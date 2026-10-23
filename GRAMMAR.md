@@ -36,7 +36,8 @@ whitespace    = space | tab | newline ;
 ```ebnf
 program       = { protocol_decl | role_decl | state_decl | type_decl
                 | fn_decl | handler | timer_handler | scenario_block
-                | include_stmt | message_stmt | transport_stmt
+                | include_stmt | import_stmt | export_stmt
+                | handler_set_decl | message_stmt | transport_stmt
                 | capacity_stmt | use_stmt | abort_when_decl
                 | end_when_decl | comment | whitespace } ;
 
@@ -67,9 +68,20 @@ handler       = "on", trigger, [ "when", guard ], "->", action_stmt, ";" ;
               | "on", trigger, [ "when", guard ],
                 "handle", "error", "->", action_stmt, ";" ;
 
-trigger       = performative, [ pattern ], [ "from", identifier ],
+trigger       = performative_alt, [ pattern ], [ "from", identifier ],
                 [ "timeout", duration ] ;
               | "breach" | "expired" ;
+
+performative_alt = performative
+                 | "(", performative, { "|", performative }, ")" ;
+              (* alternation expands at parse time into one handler per
+                 alternative with identical guard and actions — only valid
+                 in the one-line and inline-block forms *)
+
+(* an unattributed `on error` handler (no `from`) additionally receives
+   internal failures: set/push/put evaluation errors and send retry
+   exhaustion arrive as synthetic Error events with the failure text in
+   the `$reason` capture (§39) *)
 
 timer_handler = "every", duration, [ "while", guard ], [ "as", identifier ],
                 "->", action_stmt, ";" ;
@@ -82,14 +94,21 @@ pattern       = "(", str_literal, ")" ;                   (* literal pattern *)
 json_field_list = json_field, { ",", json_field } ;
 json_field    = str_literal, ":", json_value ;
 json_value    = str_literal | "$", identifier ;             (* capture var *)
+              (* a bare $var value is normalized to the string "$var" at
+                 parse time, so the pattern stays valid JSON *)
 ```
 
 ## 4. Actions
 
 ```ebnf
-action_stmt   = send_stmt | begin_stmt | fulfil_stmt | retract_stmt
-              | set_stmt | push_stmt | put_stmt | for_stmt
+action_stmt   = send_stmt | broadcast_stmt | begin_stmt | fulfil_stmt
+              | retract_stmt | set_stmt | push_stmt | put_stmt | for_stmt
               | abort_stmt ;
+
+broadcast_stmt = "broadcast", performative, [ pattern ],
+                 "to", identifier, ";" ;
+              (* fan-out: one send per role named in the list state;
+                 dialogue legality is checked like an ordinary send *)
 
 send_stmt     = "send", performative,
                 [ pattern ],                              (* fields *)
@@ -129,23 +148,39 @@ atom          = int_literal
               | identifier                                (* state ref *)
               | dot_expr                                  (* arg.x, q.price *)
               | identifier, "(", arg_list, ")"            (* function call *)
+              | identifier, "{", field_init_list, "}"     (* record literal *)
               | "(", expr, ")" ;
+
+field_init_list = field_init, { ",", field_init } ;
+field_init      = identifier, ":", expr ;
 
 arg_list      = [ expr, { ",", expr } ] ;
 
 (* builtin functions *)
 builtin_fn    = "add" | "sub" | "mul" | "div" | "min" | "max" | "abs"
               | "len" | "sum" | "count" | "concat" | "upper" | "lower"
-              | "str" | "int" | "exists" | "first" | "last" | "fmt" ;
+              | "str" | "int" | "exists" | "first" | "last" | "fmt"
+              | "prefer" ;
+              (* prefer(list, key) — contract-net bid selection: the map or
+                 record in `list` with the LOWEST numeric value for `key`;
+                 empty list yields unset *)
 ```
 
 ## 6. Guards
 
 ```ebnf
-guard         = or_guard ;
+guard         = or_guard | expr_guard ;
+
 or_guard      = and_guard, { "or", and_guard } ;
 and_guard     = guard_atom, { "and", guard_atom } ;
 guard_atom    = [ "not" ], identifier ;
+
+expr_guard    = expr ;
+              (* any guard containing a capture reference or a comparison
+                 operator is parsed as a full expression and evaluated by
+                 the runtime with the trigger's captures in scope —
+                 captures shadow session states. Example:
+                 `on inform {"price": $p} when $p > 100 -> ...` *)
 ```
 
 ## 7. Scenarios (§35.12)
@@ -179,6 +214,23 @@ include_stmt  = "include", str_literal,
                 [ "with", "roles", "(", role_mapping, ")" ], ";" ;
 role_mapping  = role_map, { ",", role_map } ;
 role_map      = identifier, "=", identifier ;
+
+include_set_stmt = "include", "handler_set", qualified_name, ";" ;
+              (* splices a declared handler set into the current protocol;
+                 names may be namespaced (module.set) by an import *)
+
+import_stmt   = "import", str_literal, [ "as", identifier ], ";" ;
+              (* loads a module file and splices ONLY its exported handler
+                 sets, namespaced as <alias>.<set>; without an alias the
+                 original names are used and collisions are compile errors *)
+
+export_stmt   = "export", "handler_set", identifier, ";" ;
+              (* marks a handler set importable by other modules; sets not
+                 exported stay private to the module file *)
+
+handler_set_decl = "handler_set", identifier, "{", { handler }, "}" ;
+              (* a reusable handler fragment; roles it references are
+                 checked against the INCLUDING protocol at include time *)
 
 abort_when_decl = "abort", "when", guard, ";" ;
 end_when_decl   = "end", "when", ( "fulfilled" | "expired" | "breached"
@@ -214,3 +266,18 @@ duration      = int_literal, ( "ms" | "s" | "m" ) ;
    Violation = compile error E030.
 7. **Capability gate**: `use <cap>` requires the host to grant the
    capability before session open. Violation = runtime error E040.
+8. **Static expression types**: a `set` to a declared typed state whose
+   expression type is statically known and incompatible is a compile
+   error (state `int` accepts `int`; `float` accepts `int` and `float`;
+   captures and `arg.*` are statically unknown and stay runtime-checked).
+   Record field access `q.price` and record literals are validated
+   against the declared `type` — unknown fields are compile errors.
+9. **Handler-set visibility**: a `handler_set` may be declared once per
+   file (duplicate = compile error); `export handler_set x` requires a
+   declared set with that name; `include handler_set ns.x` requires an
+   imported set — violations are compile errors.
+10. **Internal error routing**: internal action failures route to the
+   unattributed `on error` handler with `$reason`; failures inside the
+   error handler are logged only (no error loops).
+11. **Module imports**: `import` splices only exported handler sets;
+   module nesting deeper than 8 levels (import cycles) is an error.

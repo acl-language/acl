@@ -6,6 +6,42 @@ Format based on Keep a Changelog; versions follow semver for the
 
 ## [Unreleased]
 
+## [0.15.0] — 2026-10-23
+
+### Added
+- **Expression guards + typed captures (§39.1)**: `when $p > 100` —
+  guards are full expressions evaluated with the trigger's captures in
+  scope; capture values are type-inferred (int/float/bool/string).
+- **Trigger alternation (§39.2)**: `on (accept | reject) from buyer`
+  expands to one handler per alternative.
+- **Handler sets (§39.3)**: `handler_set name { ... }` fragments spliced
+  via `include handler_set name;`, roles checked at include time.
+- **Static typing (§39.4)**: compile-time assignment type checks (int
+  widens to float; captures/args stay dynamic), record field access and
+  record literals validated against declared types; record literals
+  `Type { field: value }` are now parseable.
+- **Errors as flow (§39.5)**: internal failures (set/push/put, retry
+  exhaustion) route to `on error` with `$reason`, recursion-guarded.
+- **Contract-net (§39.6)**: `broadcast <perf> to <list>;` fan-out +
+  `prefer(list, key)` lowest-bid selection.
+- **Rich templates (§39.7)**: `fmt("x ${expr}")` inline interpolation
+  with `$${` escape; registered templates late-bind `${expr}` and keep
+  `{0}` positional placeholders.
+- **Modules (§39.8)**: `export handler_set name;` + `import "f.aclp" as
+  ns;` — only exported sets splice, namespaced, collision detection,
+  cycle-guarded recursion; `aclc` resolves includes/imports relative to
+  the program file.
+- Python codegen: guards/captures/broadcast/prefer/templates supported
+  in generated agents (validated by running the generated code).
+
+### Fixed
+- Tokenizer zero-progress loop on `$` capture tokens (hung tests).
+- Bare `$var` in content patterns produced invalid JSON — normalized to
+  `"$var"` at parse time.
+- Inline handler blocks split the block body before trigger parsing
+  (payload braces no longer leak into the `from` clause).
+- Python emission used `null` instead of `None` for unset `set` fields.
+
 ## [0.14.0] — 2026-10-23
 
 ### Added
