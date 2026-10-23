@@ -21,21 +21,43 @@ fn main() {
         .and_then(|i| args.get(i + 1))
         .and_then(|v| v.parse().ok())
         .unwrap_or(9200);
+    let token: Option<String> = args
+        .iter()
+        .position(|a| a == "--token")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
     let mut seed = [0u8; 32];
     rand::rng().fill_bytes(&mut seed);
     let key = SigningKey::from_bytes(&seed);
     std::fs::write("/tmp/acl-httpd.pub", key.verifying_key().to_bytes()).expect("pub");
+    match &token {
+        Some(_) => eprintln!("[acl-httpd] bearer-token auth ENABLED"),
+        None => eprintln!("[acl-httpd] bearer-token auth DISABLED (dev mode)"),
+    }
 
     let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind");
     eprintln!("[acl-httpd] listening on 127.0.0.1:{port}, acl=1");
     for stream in listener.incoming() {
         if let Ok(s) = stream {
-            handle(s, &key);
+            handle(s, &key, token.as_deref());
         }
     }
 }
 
-fn handle(mut stream: TcpStream, key: &SigningKey) {
+/// §37: transport auth — check `Authorization: Bearer <token>`
+fn authorized(head: &str, token: Option<&str>) -> bool {
+    match token {
+        None => true, // dev mode: no auth required
+        Some(t) => head
+            .lines()
+            .any(|l| {
+                let l = l.trim();
+                l.starts_with("authorization:") || l.starts_with("Authorization:")
+            } && l.to_lowercase().contains(&format!("bearer {t}"))),
+    }
+}
+
+fn handle(mut stream: TcpStream, key: &SigningKey, token: Option<&str>) {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
     // read until we have full headers, then body per content-length
@@ -81,6 +103,14 @@ fn handle(mut stream: TcpStream, key: &SigningKey) {
         None => (path_q.clone(), None),
     };
     eprintln!("[acl-httpd] {method} {path}");
+
+    // §37: bearer-token gate on every ACL-carrying route (agent-card stays
+    // open: capability discovery must be verifiable pre-auth)
+    if !authorized(&head, token) && path != "/agent-card" {
+        let resp = "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n                    WWW-Authenticate: Bearer realm=\"acl\"\r\n\r\n";
+        let _ = stream.write_all(resp.as_bytes());
+        return;
+    }
 
     let my_aid = Aid::new("http://127.0.0.1/agent/acl-httpd");
 

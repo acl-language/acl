@@ -1,6 +1,7 @@
 //! Local agent registry (spec roadmap): discovery for same-machine agents
 //! without a directory service. File-backed JSON at a caller-chosen path.
 
+use crate::AgentCard;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -77,6 +78,66 @@ impl Registry {
         }
         Ok(removed)
     }
+
+    // ------------------------------------------------ AgentCard integration
+
+    /// Build a registry entry from a signed AgentCard (§7). The card is the
+    /// source of truth: name, endpoint (as aid), capabilities, public key.
+    pub fn entry_from_card(card: &AgentCard) -> RegistryEntry {
+        RegistryEntry {
+            name: card.name.clone(),
+            aid: card.endpoint.0.clone(),
+            public_key: card
+                .public_key
+                .as_ref()
+                .map(|pk| pk.iter().map(|b| format!("{b:02x}")).collect::<String>())
+                .unwrap_or_default(),
+            capabilities: card.capabilities.iter().map(|c| c.name.clone()).collect(),
+            registered_at_ms: 0,
+        }
+    }
+
+    /// Register an agent directly from its AgentCard (replaces by name).
+    pub fn register_card(&self, card: &AgentCard) -> Result<(), String> {
+        self.register(Self::entry_from_card(card))
+    }
+
+    /// Discovery: agents with a capability, returned as best-effort
+    /// AgentCards reconstructed from the registry (public key restored
+    /// when present; signature NOT carried — verify at contact time).
+    pub fn discover_cards(&self, cap: &str) -> Vec<AgentCard> {
+        self.by_capability(cap)
+            .into_iter()
+            .map(|e| {
+                let pk = (0..e.public_key.len())
+                    .step_by(2)
+                    .filter_map(|i| e.public_key.get(i..i + 2).and_then(|h| u8::from_str_radix(h, 16).ok()))
+                    .collect::<Vec<u8>>();
+                AgentCard {
+                    name: e.name.clone(),
+                    version: "1".into(),
+                    description: format!("discovered via registry ({})", e.aid),
+                    endpoint: crate::Aid(e.aid.clone()),
+                    capabilities: e
+                        .capabilities
+                        .iter()
+                        .map(|c| crate::Capability {
+                            name: c.clone(),
+                            input_schema: None,
+                            output_schema: None,
+                            examples: None,
+                        })
+                        .collect(),
+                    auth_scheme: "ed25519".into(),
+                    key_id: None,
+                    public_key: if pk.len() == 32 { Some(pk) } else { None },
+                    rate_hint: None,
+                    valid_until: None,
+                    sig: None,
+                }
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -125,6 +186,42 @@ mod tests {
         r.register(e2).unwrap();
         assert_eq!(r.list().len(), 1);
         assert_eq!(r.lookup("kenji").unwrap().aid, "local:2:kenji");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn register_card_and_discover() {
+        use crate::Capability;
+        let path = tmp("d");
+        let r = Registry::open(&path);
+        let card = AgentCard {
+            name: "argus".into(),
+            version: "1.0".into(),
+            description: "watcher".into(),
+            endpoint: crate::Aid::new("http://127.0.0.1:9200"),
+            capabilities: vec![Capability {
+                name: "log.watch".into(),
+                input_schema: Some(serde_json::json!({"type": "object"})),
+                output_schema: None,
+                examples: None,
+            }],
+            auth_scheme: "ed25519".into(),
+            key_id: None,
+            public_key: Some((0u8..32).collect()),
+            rate_hint: None,
+            valid_until: None,
+            sig: None,
+        };
+        r.register_card(&card).unwrap();
+        assert_eq!(r.lookup("argus").unwrap().capabilities, vec!["log.watch"]);
+        // discovery by capability returns reconstructed cards
+        let found = r.discover_cards("log.watch");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].name, "argus");
+        assert_eq!(found[0].capabilities[0].name, "log.watch");
+        assert!(found[0].public_key.is_some());
+        // no capability match -> empty
+        assert!(r.discover_cards("nope").is_empty());
         let _ = std::fs::remove_file(&path);
     }
 

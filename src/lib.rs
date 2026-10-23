@@ -174,6 +174,16 @@ pub enum Body {
     /// §32: cancel a prior subscription.
     #[serde(rename = "unsubscribe")]
     Unsubscribe { target_msg_id: String },
+    /// §37: identity rotation — SIGNED BY THE OLD KEY, carries the new
+    /// did:key. Receivers update their registry; continuity is provable
+    /// because the rotation itself verifies under the old identity.
+    #[serde(rename = "key_rotation")]
+    KeyRotation {
+        new_did: String,
+        valid_from_ms: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
 }
 
 /// §32: declarative message matcher — the filter construct that
@@ -595,5 +605,69 @@ mod tests {
         let js = serde_json::to_vec(&env).unwrap();
         println!("msgpack {} bytes vs json {} bytes", mp.len(), js.len());
         assert!(mp.len() < js.len());
+    }
+}
+
+
+/// §37: identity rotation — build a rotation statement signed by the OLD
+/// key. Continuity is provable: the message verifies under the old
+/// did:key and announces the new one; receivers update their registries.
+pub fn rotate_identity(
+    from: &Aid,
+    old_key: &ed25519_dalek::SigningKey,
+    new_key: &ed25519_dalek::SigningKey,
+    reason: Option<&str>,
+    now_ms: i64,
+) -> Result<Envelope, AclError> {
+    let new_did = crate::did::verifying_key_to_did_key(&new_key.verifying_key());
+    let mut env = Envelope::new(
+        from.clone(),
+        Aid::new("local:registry:identity"),
+        Performative::Inform,
+        Body::KeyRotation {
+            new_did: new_did.to_string(),
+            valid_from_ms: now_ms,
+            reason: reason.map(|r| r.to_string()),
+        },
+    );
+    env.msg_id = new_msg_id();
+    env.ts = now_ms;
+    env.sign(old_key)?;
+    Ok(env)
+}
+
+
+#[cfg(test)]
+mod rotation_tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+    use rand::Rng;
+
+    #[test]
+    fn key_rotation_verifies_with_old_key_and_announces_new_did() {
+        let mut old_seed = [0u8; 32];
+        rand::rng().fill_bytes(&mut old_seed);
+        let mut new_seed = [0u8; 32];
+        rand::rng().fill_bytes(&mut new_seed);
+        let old_key = SigningKey::from_bytes(&old_seed);
+        let new_key = SigningKey::from_bytes(&new_seed);
+
+        let from = Aid::new("did:key:z6old");
+        let env = rotate_identity(&from, &old_key, &new_key, Some("scheduled rotation"), 1_700_000_000_000)
+            .expect("rotation envelope");
+
+        // 1. verifies under the OLD key (continuity proof)
+        env.verify(&old_key.verifying_key()).expect("rotation must verify with old key");
+        // 2. carries the NEW did:key
+        match &env.body {
+            Body::KeyRotation { new_did, .. } => {
+                let expected = crate::did::verifying_key_to_did_key(&new_key.verifying_key());
+                assert_eq!(new_did, &expected);
+            }
+            other => panic!("expected KeyRotation, got {other:?}"),
+        }
+        // 3. roundtrip on the wire
+        let decoded = Envelope::decode(&env.encode().unwrap()).unwrap();
+        decoded.verify(&old_key.verifying_key()).unwrap();
     }
 }

@@ -1,0 +1,31 @@
+// acl.std.agent_ops — vocabulary for operating AI agents (§37):
+// telemetry, agent status, tool calls, delegation, heartbeats.
+// Spoken by the pilots/daemons in the reference deployment.
+
+namespace acl.std.agent_ops v1;
+
+type Aid = string;
+
+type Str = string;
+
+type Int = int;
+
+type Float = number;
+
+type Map = object;
+
+predicate agent_healthy(agent: Aid) -> bool;
+predicate agent_status(agent: Aid, status: Str) -> bool;
+predicate heartbeat(agent: Aid, seq: Int) -> bool;
+predicate tool_call(call_id: Str, tool: Str, args: Map) -> bool;
+predicate tool_result(call_id: Str, ok: bool, output: Str) -> bool;
+predicate telemetry(agent: Aid, metric: Str, value: Float) -> bool;
+predicate delegation_active(task_id: Str, from: Aid, to: Aid) -> bool;
+
+action delegate_task(task_id: Str, to: Aid, description: Str) -> bool;
+action run_tool(call_id: Str, tool: Str, args: Map) -> bool;
+action report_status(agent: Aid) -> bool;
+action rotate_identity(old_did: Aid) -> bool;
+
+// commitment: "I will answer this tool call within N ms"
+predicate sla_acknowledged(call_id: Str, deadline_ms: Int) -> bool;

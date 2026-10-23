@@ -28,6 +28,7 @@ fn body_to_value(b: &Body) -> serde_json::Value {
         Body::Cl { expressions } => serde_json::json!({ "k": "Cl", "e": expressions }),
         Body::Subscribe { watch, until_ms } => serde_json::json!({ "k": "Subscribe", "w": watch, "u": until_ms }),
         Body::Unsubscribe { target_msg_id } => serde_json::json!({ "k": "Unsubscribe", "t": target_msg_id }),
+        Body::KeyRotation { new_did, valid_from_ms, reason } => serde_json::json!({ "k": "KeyRotation", "d": new_did, "v": valid_from_ms, "r": reason }),
     }
 }
 

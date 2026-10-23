@@ -88,6 +88,56 @@ pub fn acl_to_a2a_task(env: &Envelope) -> Option<serde_json::Value> {
     Some(task)
 }
 
+/// §13bis: full A2A task JSON -> ACL Envelope (the inverse of
+/// `acl_to_a2a_task`). Rebuilds the performative from the task state and
+/// the body from artifacts/metadata. `None` when the state is unknown.
+pub fn a2a_task_to_acl(task: &serde_json::Value) -> Option<Envelope> {
+    let state = task["status"]["state"].as_str()?;
+    let performative = a2a_state_to_acl(state)?;
+    let id = task["id"].as_str()?.to_string();
+    let context = task["contextId"].as_str().unwrap_or("").to_string();
+    let ctx2 = context.clone();
+    // Completed tasks carry artifacts -> Result body; others keep a Text/Progress-shaped body
+    let body = if state == "COMPLETED" {
+        let output = task.get("metadata").cloned().unwrap_or(serde_json::json!({}));
+        let artifacts: Vec<crate::Artifact> = task["artifacts"]
+            .as_array()
+            .map(|arts| {
+                arts.iter()
+                    .map(|a| crate::Artifact {
+                        name: a["artifactId"].as_str().unwrap_or("").to_string(),
+                        mime: a["parts"][0]["data"]["mime"].as_str().unwrap_or("application/json").to_string(),
+                        bytes: Vec::new(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Body::Result { output, artifacts }
+    } else if state == "FAILED" {
+        let reason = task["status"]["message"]["parts"][0]["text"]
+            .as_str()
+            .unwrap_or("failed via A2A")
+            .to_string();
+        let code = task["status"]["message"]["code"].as_u64().unwrap_or(500) as u16;
+        Body::Failure { target_msg_id: context.clone(), code, reason, recoverable: false }
+    } else {
+        Body::Progress {
+            target_msg_id: ctx2,
+            percent: Some(50),
+            note: Some(state.to_string()),
+        }
+    };
+    let mut env = Envelope::new(
+        crate::Aid::new("a2a:bridge"),
+        crate::Aid::new("did:acl:local"),
+        performative,
+        body,
+    );
+    env.msg_id = id;
+    env.reply_with = Some(context);
+    Some(env)
+}
+
 /// Map an A2A task-state JSON object back to the ACL performative it implies.
 pub fn a2a_state_to_acl(state: &str) -> Option<Performative> {
     Some(match state {
@@ -160,6 +210,50 @@ pub fn acl_result_to_mcp(env: &Envelope) -> serde_json::Value {
 /// capability name lookup on a card (used when routing tools/call)
 pub fn card_has_capability(card: &AgentCard, name: &str) -> bool {
     card.capabilities.iter().any(|Capability { name: n, .. }| n == name)
+}
+
+/// §13bis: validate an MCP call's arguments against the card's declared
+/// input schema — JSON-schema-lite: `required` fields must be present
+/// with non-null values, and `type` is checked when declared.
+pub fn validate_arguments(
+    card: &AgentCard,
+    name: &str,
+    arguments: &serde_json::Value,
+) -> Result<(), String> {
+    let Some(cap) = card.capabilities.iter().find(|c| c.name == name) else {
+        return Err(format!("capability '{name}' not on card"));
+    };
+    let Some(schema) = &cap.input_schema else {
+        return Ok(()); // no schema declared: accept anything
+    };
+    let args = arguments.as_object().ok_or("arguments must be an object")?;
+    if let Some(required) = schema["required"].as_array() {
+        for field in required {
+            let field = field.as_str().unwrap_or_default();
+            if !args.contains_key(field) {
+                return Err(format!("missing required argument '{field}'"));
+            }
+        }
+    }
+    if let Some(props) = schema["properties"].as_object() {
+        for (key, spec) in props {
+            let Some(v) = args.get(key) else { continue };
+            let want = spec["type"].as_str().unwrap_or("");
+            let ok = match want {
+                "string" => v.is_string(),
+                "number" => v.is_number(),
+                "integer" => v.is_i64() || v.is_u64(),
+                "boolean" => v.is_boolean(),
+                "object" => v.is_object(),
+                "array" => v.is_array(),
+                _ => true, // unknown/unspecified type: accept
+            };
+            if !ok {
+                return Err(format!("argument '{key}' expected type {want}"));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -276,6 +370,62 @@ mod tests {
         assert_eq!(tools["result"]["tools"][0]["inputSchema"]["required"][0], "text");
         assert!(card_has_capability(&card, "text.reverse"));
         assert!(!card_has_capability(&card, "other"));
+    }
+
+    #[test]
+    fn validate_arguments_checks_required_and_types() {
+        let card = AgentCard {
+            name: "demo".into(),
+            version: "1".into(),
+            description: "d".into(),
+            endpoint: Aid::local(1, "t"),
+            capabilities: vec![Capability {
+                name: "text.reverse".into(),
+                input_schema: Some(serde_json::json!({
+                    "type": "object",
+                    "required": ["text"],
+                    "properties": {"text": {"type": "string"}, "count": {"type": "integer"}}
+                })),
+                output_schema: None,
+                examples: None,
+            }],
+            auth_scheme: "none".into(),
+            key_id: None,
+            public_key: None,
+            rate_hint: None,
+            valid_until: None,
+            sig: None,
+        };
+        // ok
+        validate_arguments(&card, "text.reverse", &serde_json::json!({"text": "abc"})).unwrap();
+        // missing required
+        assert!(validate_arguments(&card, "text.reverse", &serde_json::json!({})).is_err());
+        // wrong type
+        assert!(validate_arguments(&card, "text.reverse", &serde_json::json!({"text": 5})).is_err());
+        // wrong type on optional
+        assert!(validate_arguments(&card, "text.reverse", &serde_json::json!({"text": "a", "count": "many"})).is_err());
+        // unknown capability
+        assert!(validate_arguments(&card, "nope", &serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn a2a_full_roundtrip_acl_to_task_and_back() {
+        let e = env(
+            Performative::Inform,
+            Body::Result {
+                output: serde_json::json!({"reversed": "cba"}),
+                artifacts: vec![],
+            },
+        );
+        let task = acl_to_a2a_task(&e).unwrap();
+        let back = a2a_task_to_acl(&task).unwrap();
+        // the inverse bridge preserves the state mapping and correlation id
+        assert_eq!(back.performative, Performative::Inform);
+        assert_eq!(back.msg_id, e.msg_id);
+        match &back.body {
+            Body::Result { output, .. } => assert_eq!(output["reversed"], "cba"),
+            other => panic!("expected Result, got {other:?}"),
+        }
     }
 
     #[test]

@@ -256,6 +256,10 @@ pub struct Runtime {
     templates: Vec<(String, String)>,
     /// abort latch: compensation runs once
     aborted: bool,
+    /// §16 enforcement: reject off-policy replies (opt-in)
+    enforce_dialogue: bool,
+    /// last performative we SENT (awaiting a legal reply)
+    last_out: Option<Performative>,
     /// §35.4: abort conditions from the program
     abort_when: Vec<crate::protocol::Guard>,
 }
@@ -300,6 +304,8 @@ impl Runtime {
             pending: Vec::new(),
             now_ms: 0,
             aborted: false,
+            enforce_dialogue: false,
+            last_out: None,
             templates: prog.templates.clone(),
             abort_when: prog.abort_when.clone(),
             session: None,
@@ -432,6 +438,11 @@ impl Runtime {
             .collect()
     }
 
+    /// §16: enable strict dialogue-matrix enforcement for this runtime
+    pub fn enforce_dialogue(&mut self, on: bool) {
+        self.enforce_dialogue = on;
+    }
+
     pub fn commitment(&self) -> CommitmentStatus {
         self.commitment
     }
@@ -452,6 +463,25 @@ impl Runtime {
         self.log(Dir::In, event_text(&ev));
         if let Event::In { performative, .. } = &ev {
             self.last_seen = Some(*performative);
+        }
+        // §16: when enforcement is on, an incoming In-event must be a
+        // legal reply to our last outgoing move (off-policy = logged and
+        // silently dropped — the handler does NOT fire)
+        if self.enforce_dialogue {
+            if let Event::In { performative, .. } = &ev {
+                if let Some(prev) = self.last_out {
+                    if !dialogue_legal(prev, *performative) {
+                        self.log(
+                            Dir::State,
+                            format!(
+                                "off-policy reply dropped: {:?} after our {:?} (§16)",
+                                performative, prev
+                            ),
+                        );
+                        return Vec::new();
+                    }
+                }
+            }
         }
         let mut out = match self.matching_handler(&ev) {
             Some(hidx) => self.run_handler(hidx, &ev),
@@ -520,6 +550,7 @@ impl Runtime {
         for a in &actions {
             match a {
                 ProtocolAction::Send { performative, to, fields, retry } => {
+                    self.last_out = Some(*performative);
                     self.log(
                         Dir::Out,
                         format!(
@@ -1468,6 +1499,42 @@ end when fulfilled;
         // abort latched: no second compensation
         let out2 = a.deliver(Event::In { from: "b".into(), performative: Performative::Accept, pattern: None, fields: None });
         assert!(!out2.iter().any(|o| o.performative == Performative::Failure));
+    }
+
+    #[test]
+    fn dialogue_enforcement_drops_off_policy_replies() {
+        // seller proposes; buyer must answer accept/reject/error/bye
+        let prog = parse(
+            "protocol p v1;\nroles a, b;\non request from b -> send propose to b;\non propose from a -> send bye;\non accept from b -> begin;\non breach -> send failure to b;\non failure from b -> send bye;\n",
+        )
+        .unwrap();
+        let mut a = Runtime::new(&prog, "a").unwrap();
+        a.enforce_dialogue(true);
+        // a emits propose (last_out = Propose)
+        let out = a.deliver(Event::In {
+            from: "b".into(),
+            performative: Performative::Request,
+            pattern: None,
+            fields: None,
+        });
+        assert_eq!(out[0].performative, Performative::Propose);
+        // peer answers inform — ILLEGAL after propose → dropped
+        let out = a.deliver(Event::In {
+            from: "b".into(),
+            performative: Performative::Inform,
+            pattern: None,
+            fields: None,
+        });
+        assert!(out.is_empty());
+        assert!(a.transcript().iter().any(|e| e.text.contains("off-policy")));
+        // peer answers accept — LEGAL → begin fires
+        a.deliver(Event::In {
+            from: "b".into(),
+            performative: Performative::Accept,
+            pattern: None,
+            fields: None,
+        });
+        assert_eq!(a.commitment(), crate::cl::CommitmentStatus::Active);
     }
 
     #[test]

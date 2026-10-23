@@ -13,6 +13,22 @@ use std::net::TcpListener;
 
 const WS_GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
+/// §37: token from query param (`ws://...?token=...`)
+fn authorized(path_q: Option<&str>, token: Option<&str>) -> bool {
+    match token {
+        None => true,
+        Some(t) => path_q
+            .and_then(|q| {
+                q.split('&').find_map(|kv| {
+                    let (k, v) = kv.split_once('=')?;
+                    (k == "token").then(|| v.to_string())
+                })
+            })
+            .map(|v| v == t)
+            .unwrap_or(false),
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let port: u16 = args
@@ -28,17 +44,32 @@ fn main() {
     std::fs::write("/tmp/acl-wsd.pub", key.verifying_key().to_bytes()).expect("pub");
     eprintln!("[acl-wsd] listening on 127.0.0.1:{port}");
 
+    let token: Option<String> = args
+        .iter()
+        .position(|a| a == "--token")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+    match &token {
+        Some(_) => eprintln!("[acl-wsd] token auth ENABLED"),
+        None => eprintln!("[acl-wsd] token auth DISABLED (dev mode)"),
+    }
     for stream in TcpListener::bind(("127.0.0.1", port)).expect("bind").incoming() {
         if let Ok(s) = stream {
-            let _ = serve(s, &key, &my_aid);
+            let _ = serve(s, &key, &my_aid, token.as_deref());
         }
     }
 }
 
-fn serve(mut stream: std::net::TcpStream, key: &SigningKey, my_aid: &Aid) -> std::io::Result<()> {
+fn serve(
+    mut stream: std::net::TcpStream,
+    key: &SigningKey,
+    my_aid: &Aid,
+    token: Option<&str>,
+) -> std::io::Result<()> {
     // --- read HTTP upgrade request
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut ws_key = String::new();
+    let mut upgrade_path = String::new();
     let mut line = String::new();
     loop {
         line.clear();
@@ -46,11 +77,24 @@ fn serve(mut stream: std::net::TcpStream, key: &SigningKey, my_aid: &Aid) -> std
         if n == 0 || line == "\r\n" {
             break;
         }
+        if line.starts_with("GET ") {
+            upgrade_path = line
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or_default()
+                .to_string();
+        }
         if let Some(v) = line.strip_prefix("Sec-WebSocket-Key:") {
             ws_key = v.trim().to_string();
         }
     }
     if ws_key.is_empty() {
+        return Ok(());
+    }
+    // §37: token via query param on the upgrade path
+    let path_q = upgrade_path.split_once('?').map(|(_, q)| q.to_string());
+    if !authorized(path_q.as_deref(), token) {
+        let _ = stream.write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n");
         return Ok(());
     }
     // accept = base64(sha1(key + GUID))

@@ -329,6 +329,48 @@ mod tests {
         SessionHost::new_gated(&prog2, &[]).expect("stdlib.* needs no grant");
     }
 
+    /// §37: soak — many concurrent sessions, many events, then verify
+    /// determinism end to end (replay equality over the full journal).
+    #[test]
+    fn soak_many_sessions_and_events() {
+        let prog = parse(&PROG.replace("capacity 2;", "capacity 200;")).unwrap();
+        let mut host = SessionHost::new(&prog).unwrap();
+        let sessions: Vec<String> = (0..200).map(|i| format!("s{i}")).collect();
+        for id in &sessions {
+            host.open(id, "seller").unwrap();
+        }
+        for round in 0..25 {
+            for id in sessions.iter().cycle().take(200) {
+                let ev = if round == 0 {
+                    event("buyer", Performative::Request, Some("(\"q\")"))
+                } else if round % 2 == 1 {
+                    event("buyer", Performative::Accept, None)
+                } else {
+                    event("buyer", Performative::Query, None)
+                };
+                let _ = host.deliver(id, ev);
+            }
+        }
+        assert_eq!(host.session_count(), 200);
+        assert_eq!(host.journal().len(), 200 * 25);
+        // replay the whole journal into a fresh host — must be identical
+        let (roles, journal) = host.journal_with_roles();
+        assert_eq!(roles.len(), 200);
+        let rebuilt = SessionHost::replay_from(&prog, &roles, &journal).unwrap();
+        assert!(
+            host.same_state_as(&rebuilt),
+            "soak replay must reconstruct exact state"
+        );
+        // outbox: exactly one propose per session (round 0), and retries
+        // of accept are idempotent (begin ignored, logged)
+        let proposes = host
+            .outbox()
+            .iter()
+            .filter(|(_, o)| o.performative == Performative::Propose)
+            .count();
+        assert_eq!(proposes, 200);
+    }
+
     #[test]
     fn journal_records_unhandled_events_too() {
         let prog = parse(PROG).unwrap();

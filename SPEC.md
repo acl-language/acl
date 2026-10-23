@@ -371,8 +371,10 @@ Sealed = { sender_pub (32B X25519), salt (12B), ciphertext }
 ```
 
 - Key agreement: X25519 ECDH between the sender's static secret and the
-  recipient's public key; the 32-byte shared secret is the ChaCha20-Poly1305
-  key directly (v0.1 simplification; HKDF extraction is a v0.2 TODO).
+  recipient's public key. The symmetric key is HKDF-SHA256 extracted
+  and expanded from the shared secret (salt = the 12-byte message salt,
+  info = `acl-sealed-v1-key`) — raw shared secrets are never used as
+  symmetric keys (§10.1 hardening, v0.2).
 - Encryption: ChaCha20-Poly1305 with AAD = `"acl-sealed-v1"`, nonce = `salt`.
 - `sender_pub` travels in the clear so the recipient can derive the same key.
 - The outer envelope keeps `msg_id` and `reply_with` of the inner one (so

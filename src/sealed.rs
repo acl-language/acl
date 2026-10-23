@@ -7,7 +7,9 @@
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
+use hkdf::Hkdf;
 use rand::Rng;
+use sha2::Sha256;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::{AclError, Body, Envelope, Performative, Aid};
@@ -24,9 +26,15 @@ pub fn seal(
     let mut salt = [0u8; 12];
     rand::rng().fill_bytes(&mut salt);
 
-    // key = shared secret (32 bytes) used directly as ChaCha20 key;
-    // salt travels in the clear as the nonce base.
-    let cipher = ChaCha20Poly1305::new(shared.as_bytes().into());
+    // §10.1 (v0.2): HKDF-SHA256 extraction and expansion — the raw shared
+    // secret is NEVER used directly as the symmetric key.
+    // Salt: the 12-byte random salt (domain-separated from the nonce use
+    // via the info label). Info: "acl-sealed-v1-key".
+    let hk = Hkdf::<Sha256>::new(Some(&salt), shared.as_bytes());
+    let mut key = [0u8; 32];
+    hk.expand(b"acl-sealed-v1-key", &mut key)
+        .expect("valid key length");
+    let cipher = ChaCha20Poly1305::new((&key).into());
     let plaintext = inner.encode()?;
     let ciphertext = cipher
         .encrypt(
@@ -67,7 +75,13 @@ pub fn open(
         <[u8; 32]>::try_from(sender_pub.as_slice()).map_err(|_| AclError::BadKey)?,
     );
     let shared = recipient_secret.diffie_hellman(&sender_pk);
-    let cipher = ChaCha20Poly1305::new(shared.as_bytes().into());
+    // §10.1 (v0.2): mirror the sender's HKDF derivation using the salt
+    // embedded in the sealed body.
+    let hk = Hkdf::<Sha256>::new(Some(salt), shared.as_bytes());
+    let mut key = [0u8; 32];
+    hk.expand(b"acl-sealed-v1-key", &mut key)
+        .expect("valid key length");
+    let cipher = ChaCha20Poly1305::new((&key).into());
     let plaintext = cipher
         .decrypt(
             Nonce::from_slice(salt),
@@ -78,6 +92,24 @@ pub fn open(
         )
         .map_err(|_| AclError::BadKey)?;
     Envelope::decode(&plaintext)
+}
+
+
+/// §10.2: Derive a session-specific symmetric key from a root secret.
+/// Used to derive ephemeral keys for specific message streams (e.g. per
+/// agent-pair, per task-id) without re-running the full ECDH handshake
+/// for every message (reduces CPU overhead and exposure).
+/// `root_secret` must be the 32-byte ECDH shared secret.
+/// `session_id` is an opaque string distinguishing the channel (e.g.
+/// "agent-a-to-b-task-123").
+pub fn derive_session_key(root_secret: &[u8], session_id: &str) -> [u8; 32] {
+    let hk = Hkdf::<Sha256>::new(None, root_secret);
+    let mut key = [0u8; 32];
+    // Info binds the derivation to the exact channel identity and purpose.
+    let info = format!("acl-session-v1-{}", session_id);
+    hk.expand(info.as_bytes(), &mut key)
+        .expect("valid key length");
+    key
 }
 
 #[cfg(test)]
@@ -147,5 +179,21 @@ mod tests {
             ciphertext[0] ^= 0xff;
         }
         assert!(open(&sealed, &recipient).is_err());
+    }
+
+    #[test]
+    fn session_key_derivation_is_deterministic_and_distinct() {
+        let secret = random_secret();
+        let shared = secret.diffie_hellman(&PublicKey::from(&random_secret()));
+        let root = shared.as_bytes();
+
+        let k1 = derive_session_key(root, "session-a");
+        let k2 = derive_session_key(root, "session-a");
+        let k3 = derive_session_key(root, "session-b");
+
+        // deterministic: same input -> same key
+        assert_eq!(k1, k2);
+        // distinct sessions -> distinct keys
+        assert_ne!(k1, k3);
     }
 }

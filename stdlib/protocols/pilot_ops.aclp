@@ -1,0 +1,23 @@
+// pilot_ops — orchestrator delegates a tool call to a pilot with an SLA
+protocol pilot_ops v1;
+roles orchestrator, pilot;
+use acl.speak;
+use acl.schema.validate;
+
+state call_id: str;
+state answered: bool;
+
+on delegate("run_tool") from orchestrator -> send propose to orchestrator;
+on accept from orchestrator -> begin;
+on inform("tool_result") from orchestrator -> fulfil;
+on breach -> send failure to orchestrator;
+on propose from pilot -> send accept to pilot;
+on failure from pilot -> send bye;
+end when fulfilled;
+
+scenario "delegate and fulfil" {
+  orchestrator sends delegate("run_tool") to pilot;
+  expect pilot sends propose;
+  expect orchestrator sends accept;
+  expect commitment pilot active;
+}

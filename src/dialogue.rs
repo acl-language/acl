@@ -37,10 +37,70 @@ pub fn dialogue_legal(prev: Performative, reply: Performative) -> bool {
     legal_replies(prev).contains(&reply)
 }
 
+/// §16 enforcement: tracks the last performative this side SENT and
+/// validates each incoming reply against the matrix. Off-policy replies
+/// are reported (receivers SHOULD reject them; strict enforcement is a
+/// session policy choice).
+#[derive(Debug, Default, Clone)]
+pub struct DialogueTracker {
+    /// last performative this side sent (the one awaiting a reply)
+    pub last_out: Option<Performative>,
+    /// session openers always reset expectations (§16: new conversation)
+    openers: bool,
+}
+
+impl DialogueTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// record an outgoing performative (it now awaits a legal reply)
+    pub fn on_send(&mut self, p: Performative) {
+        self.last_out = Some(p);
+    }
+
+    /// validate an incoming reply against what we last sent.
+    /// `Ok(true)` = legal reply, `Ok(false)` = no expectation open
+    /// (peer opened a new conversation — legal), `Err` = off-policy.
+    pub fn on_receive(&self, reply: Performative) -> Result<bool, (Performative, Performative)> {
+        match self.last_out {
+            None => Ok(true), // peer opened the conversation
+            Some(prev) => {
+                if dialogue_legal(prev, reply) {
+                    Ok(true)
+                } else {
+                    Err((prev, reply))
+                }
+            }
+        }
+    }
+
+    /// clear the expectation (e.g. after receiving the final answer)
+    pub fn close(&mut self) {
+        self.last_out = None;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use Performative::*;
+
+    #[test]
+    fn tracker_rejects_off_policy_replies() {
+        let mut t = DialogueTracker::new();
+        // we sent a Propose: peer may only Accept/Reject/Error/Bye
+        t.on_send(Performative::Propose);
+        assert!(t.on_receive(Performative::Accept).is_ok());
+        assert!(t.on_receive(Performative::Inform).is_err());
+        assert!(t.on_receive(Performative::Request).is_err());
+        // no expectation: anything is legal (peer opened)
+        let t2 = DialogueTracker::new();
+        assert!(t2.on_receive(Performative::Request).is_ok());
+        // close clears
+        t.close();
+        assert!(t.on_receive(Performative::Request).is_ok());
+    }
 
     #[test]
     fn core_matrix() {
