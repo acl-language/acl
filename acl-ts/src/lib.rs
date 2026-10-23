@@ -271,6 +271,13 @@ fn json_to_body(v: &serde_json::Value) -> Option<Body> {
             salt: vec![],
             ciphertext: vec![],
         },
+        "Cl" => {
+            let exprs: Vec<acl_core::cl::ClExpr> = serde_json::from_value(
+                f.get("expressions").cloned().unwrap_or(serde_json::Value::Null),
+            )
+            .ok()?;
+            Body::Cl { expressions: exprs }
+        }
         "Delegate" => Body::Delegate {
             task: Box::new(Body::Task {
                 description: "nested".into(),
@@ -300,6 +307,10 @@ fn body_to_json(b: &Body) -> serde_json::Value {
         Body::Error { code, message, details } => ("Error", serde_json::json!({ "code": code, "message": message, "details": details })),
         Body::Hello { nonce, .. } => ("Hello", serde_json::json!({ "nonce": nonce })),
         Body::Sealed { .. } => ("Sealed", serde_json::json!({})),
+        Body::Cl { expressions } => {
+            let v = serde_json::to_value(expressions).unwrap_or(serde_json::Value::Null);
+            ("Cl", serde_json::json!({ "expressions": v }))
+        }
         Body::Delegate { chain, .. } => ("Delegate", serde_json::json!({ "chain": chain })),
     };
     serde_json::json!({ "t": t, "v": v })

@@ -156,6 +156,63 @@ Error      = { code, message, details? }
 Hello      = { agent_card | card_hash, nonce }
 ```
 
+### 6.2 Content language (CL)
+
+The body variants above are structurally typed; the **content language**
+adds the shared *vocabulary* agents use inside them. A `Cl` body carries a
+list of expressions, each tagged by `op`:
+
+```text
+ClExpr  = Fact | Action | Query | Commitment
+
+Fact    = { op:"fact",  predicate, args (object, canonical order), truth=true|false }
+Action  = { op:"action", name, params, result_schema? }
+Query   = { op:"query",  predicate, args }
+Commitment = { op:"commitment", debtor, creditor, act: Action,
+                deadline_ms?, status: proposed|active|fulfilled|breached|cancelled }
+```
+
+**Grammar matrix (normative, `cl::well_formed`)** — which ops a performative
+may carry; receivers SHOULD reject ill-formed bodies:
+
+| performative | allowed CL ops |
+|--------------|----------------|
+| `inform`     | `fact` (any truth value) |
+| `request`    | `action` |
+| `query`      | `query` |
+| `propose`    | `commitment{status=proposed}` |
+| `accept`     | `commitment{status=active}` |
+| `delegate`   | `action` |
+| others       | CL not allowed (own body variant) |
+
+**Commitment lifecycle:** `proposed → active → fulfilled | breached |
+cancelled`; `proposed → cancelled`. All other transitions are invalid.
+`accept` on a proposed commitment activates it; the debtor owes the
+creditor the act until a terminal state.
+
+**Canonical serialization:** `Fact.args` MUST be an object serialized in
+sorted-key order (BTreeMap in the reference) so identical facts produce
+identical bytes — signatures stay stable regardless of how callers built
+the argument object.
+
+**Example** — inform carrying a fact:
+
+```json
+{"t":"Cl","v":{"expressions":[
+  {"op":"fact","predicate":"file_exists","args":{"path":"/tmp/report.pdf"},"truth":true}
+]}}
+```
+
+**Example** — propose carrying a commitment:
+
+```json
+{"t":"Cl","v":{"expressions":[
+  {"op":"commitment","debtor":"local:123:kenji","creditor":"local:1:argus",
+   "act":{"op":"action","name":"text.reverse","params":{"text":"abc"}},
+   "deadline_ms":1700000000000,"status":"proposed"}
+]}}
+```
+
 ## 7. AgentCard (L4)
 
 A signed capability descriptor, analogous to A2A's Agent Card but binary and

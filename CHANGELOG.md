@@ -5,6 +5,11 @@ Format based on Keep a Changelog; versions follow semver for the
 **implementation** and a separate `SPEC-VERSION` for the protocol.
 
 ## [Unreleased]
+### Added
+- **Content Language (CL)** (spec §6.2): shared grammar for facts, typed
+  actions, queries and commitments with per-performative grammar matrix and
+  commitment lifecycle; canonical arg ordering for stable signatures.
+  Supported in acl-core, acl-py and acl-ts.
 
 ## [0.1.0] — 2026-10-22
 

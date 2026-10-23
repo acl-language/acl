@@ -25,6 +25,7 @@ fn body_to_value(b: &Body) -> serde_json::Value {
         Body::Hello { nonce, .. } => serde_json::json!({ "k": "Hello", "n": nonce }),
         Body::Sealed { ciphertext, .. } => serde_json::json!({ "k": "Sealed", "c": ciphertext }),
         Body::Delegate { chain, .. } => serde_json::json!({ "k": "Delegate", "c": chain }),
+        Body::Cl { expressions } => serde_json::json!({ "k": "Cl", "e": expressions }),
     }
 }
 

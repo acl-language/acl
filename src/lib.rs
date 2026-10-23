@@ -5,6 +5,7 @@
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 pub mod bridge;
+pub mod cl;
 pub mod sealed;
 pub mod idempotency;
 pub mod registry;
@@ -122,6 +123,11 @@ pub enum Body {
         sender_pub: Vec<u8>,
         salt: Vec<u8>,
         ciphertext: Vec<u8>,
+    },
+    /// §6.2: content-language expressions (shared grammar for
+    /// facts/actions/queries/commitments). Grammar matrix in cl::well_formed.
+    Cl {
+        expressions: Vec<crate::cl::ClExpr>,
     },
 }
 

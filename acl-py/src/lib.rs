@@ -112,6 +112,12 @@ fn body_from_py(body: &Bound<'_, PyAny>) -> PyResult<Body> {
             salt: vec![],
             ciphertext: vec![],
         }),
+        "Cl" => {
+            let exprs_val = json_or_null("expressions")?;
+            let exprs: Vec<acl_core::cl::ClExpr> = serde_json::from_value(exprs_val)
+                .map_err(|e| PyValueError::new_err(format!("bad CL expressions: {e}")))?;
+            Ok(Body::Cl { expressions: exprs })
+        }
         other => Err(PyValueError::new_err(format!("unknown body kind {other}"))),
     }
 }
@@ -203,6 +209,10 @@ fn body_to_py(py: Python<'_>, b: &Body) -> PyObject {
                 ("ciphertext", ciphertext.clone().into_pyobject(py).unwrap().unbind().into()),
             ],
         ),
+        Body::Cl { expressions } => {
+            let val = serde_json::to_value(expressions).unwrap_or(serde_json::Value::Null);
+            ("Cl", vec![("expressions", json_to_py(py, &val))])
+        }
     };
     d.set_item("t", t).unwrap();
     let vd = PyDict::new(py);
