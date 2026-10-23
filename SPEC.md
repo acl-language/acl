@@ -210,6 +210,27 @@ Timeouts: a client SHOULD consider a task failed if no message (including
 The envelope does not change between transports. A message composed over stdio
 can be relayed over HTTP untouched (relay increments `hop_count`).
 
+### 9.1 HTTP profile (normative, as implemented and validated)
+
+- `POST /` — request body is the framed envelope (4-byte length header +
+  msgpack), or a bare envelope; response body is the framed reply envelope.
+  Sync request→response only.
+- `GET /agent-card` — framed `Hello` envelope carrying the signed AgentCard.
+- `GET /events?...` — `text/event-stream`. Each event is
+  `event: acl\ndata: <base64(msgpack envelope)>\n\n`. Progress and the final
+  Result are **separately signed envelopes**; a client MUST verify each.
+- Content type for envelope bodies: `application/acl-envelope`.
+- HTTP/1.1 is sufficient for compliance; HTTP/2 is optional.
+
+### 9.2 Transport conformance matrix (v0.1 reference implementation)
+
+| transport | status |
+|-----------|--------|
+| stdio / pipes | validated end-to-end (live pipes, Python client ↔ Rust peer) |
+| HTTP sync (`POST`) | validated end-to-end |
+| SSE streaming | validated end-to-end (signed per-event) |
+| WebSocket | reserved, not implemented |
+
 ## 10. Security (L2)
 
 - **Identity:** Ed25519 keypair per agent. The public key is distributed via
@@ -225,19 +246,122 @@ can be relayed over HTTP untouched (relay increments `hop_count`).
 
 ## 11. Reference Implementation
 
-`acl-core` (Rust) implements L1–L4 of this spec:
-- MessagePack encode/decode of `Envelope`
-- Ed25519 sign/verify
-- `AgentCard` struct + signing
-- Streaming frame codec (4-byte length header)
+`acl-core` (Rust) is the reference implementation of L1–L5:
 
-Language bindings planned: Python (PyO3), TypeScript (napi-rs).
+- MessagePack (named-field) encode/decode of `Envelope` and every `Body`
+  variant; version check (`acl == 1`) on decode
+- Ed25519 sign/verify for envelopes and AgentCards (canonical §10 rule)
+- AgentCard + Capability structures with self-signature
+- Streaming frame codec (4-byte big-endian length header), 16 MiB cap
+- Bridge adapters (§13): A2A state/task mapping, MCP tools mapping
+
+Binaries:
+
+- `acl-peer` — a complete ACL agent over the stdio transport; implements the
+  §8 workflow (`request` → `input_required` → `inform` → `result`), serves
+  `agent.card` queries, handles `bye`.
+- `acl-httpd` — HTTP + SSE server (§9.1): `POST /`, `GET /events`,
+  `GET /agent-card`; per-event signatures on the SSE stream.
+- `acl-mcp-bridge` — translates between ACL and a real MCP server
+  (JSON-RPC over stdio): `tools/call` ↔ `request`/Task, `tools/list` ↔
+  signed AgentCard.
+
+## 11.1 Python binding (`acl-py`)
+
+Native extension built with PyO3 (abi3), exposing:
+
+```python
+import acl_py
+key = acl_py.AclKey()                      # Ed25519 keypair
+env = acl_py.AclEnvelope(from_aid, to_aid, "request",
+                         {"t": "Task", "v": {"description": ..., "input": {...}}},
+                         in_reply_to=None, reply_with=None)
+env.sign(key); raw = env.encode()
+env2 = acl_py.AclEnvelope.decode(raw); env2.verify(pub)
+acl_py.write_frame(raw) / acl_py.read_frame(stream)
+acl_py.ACL_VERSION, acl_py.new_msg_id()
+```
+
+Bodies are plain Python dicts (`{"t": kind, "v": {...}}`); missing optional
+fields decode as `None`. Cross-check requirement: an envelope signed by
+`acl-py` MUST be verifiable by any independent implementation of §10
+(validated against the spec-only Python codec).
+
+## 11.2 Independent-implementation interop
+
+Interoperability of this spec is proven by an independent codec implemented
+**from this document only** (no reference source consulted):
+
+- Decodes every field of a reference-encoded envelope
+- Verifies reference signatures using only the §10 canonical rule
+- Its signed envelopes are verified by the reference implementation
+
+Any ambiguity discovered this way is a spec bug and MUST be fixed here
+(this is how the canonical-encoding rule in §10 and the `u8` performative
+discriminant in §5 were pinned down).
 
 ## 12. Compliance
 
 An implementation is ACL-0.1 compliant if it can:
-1. Encode/decode every performative in §5 with its body variant from §6.
-2. Frame messages on at least one transport from §9.
-3. Sign and verify envelopes per §10 (or explicitly declare `auth: none`).
+1. Encode/decode every performative in §5 with its body variant from §6
+   (performatives on the wire are the **u8 discriminant**, never a string).
+2. Frame messages on at least one transport from §9 (§9.1 profile for HTTP).
+3. Sign and verify envelopes per §10 (or explicitly declare `auth: none`),
+   agreeing on the canonical omission rules.
 4. Expose and verify AgentCards per §7 (or run in local mode where the
    handshake provides the key).
+5. Pass the §11.2 interop test against the reference implementation.
+
+## 13. Bridges (ecosystem interop)
+
+ACL does not replace existing protocols; it bridges to them.
+
+### 13.1 ACL ↔ A2A (Agent2Agent v1.0)
+
+Performatives map onto the A2A task lifecycle:
+
+| ACL (performative)      | A2A TaskState     |
+|-------------------------|-------------------|
+| `request`, `delegate`   | `SUBMITTED`       |
+| `progress`              | `WORKING`         |
+| `input_required`        | `INPUT_REQUIRED`  |
+| `inform` / Result       | `COMPLETED`       |
+| `inform` / Text         | `WORKING`         |
+| `failure`               | `FAILED`          |
+| `cancel`                | `CANCELED`        |
+| `reject`                | `REJECTED`        |
+
+`acl_to_a2a_task` emits an A2A-shaped task object: `id` = `msg_id`,
+`contextId` = `reply_with`, `artifacts` from Result artifacts, Failure
+reason carried as the status message. `propose`/`accept`/`hello`/`bye` have
+no A2A equivalent and are not mapped. Mapping is unit-tested in both
+directions (`a2a_state_to_acl`).
+
+### 13.2 ACL ↔ MCP (Model Context Protocol)
+
+| ACL                             | MCP                                   |
+|---------------------------------|---------------------------------------|
+| AgentCard capabilities          | `tools/list` result (name, inputSchema) |
+| `request` / Task{description, input} | `tools/call` {name, arguments}   |
+| `inform` / Result{output}       | `tools/call` result {content, isError} |
+
+A bridge agent presents itself as an ACL peer, performs the MCP `initialize`
+handshake on the other side, and translates both directions — preserving ACL
+signatures end-to-end on the ACL side (validated end-to-end against a real
+MCP server). An MCP tool thus reachable appears in the bridge's AgentCard as
+an ACL capability.
+
+## 14. Implementation status (v0.1)
+
+| component | tests / validation |
+|-----------|--------------------|
+| acl-core codec (L1–L5) | 11/11 unit tests (roundtrip, sign/tamper, framing, card) |
+| spec-only Python codec | interop both directions with acl-core (§11.2) |
+| `acl-py` binding | 5/5 (incl. cross-verification by the spec-only codec) |
+| stdio transport (`acl-peer`) | live-pipe demo: §8 workflow + signed card |
+| HTTP/SSE transport (`acl-httpd`) | live demo: sync POST, signed SSE stream, card |
+| A2A bridge | unit-tested state/task mapping |
+| MCP bridge (`acl-mcp-bridge`) | end-to-end against a real MCP server (node) |
+
+Not yet implemented: WebSocket transport, sealed envelopes (v0.2),
+TypeScript binding, live-network A2A peer validation, public governance.
