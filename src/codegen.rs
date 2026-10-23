@@ -63,7 +63,7 @@ fn py_action(a: &ProtocolAction) -> String {
         ProtocolAction::Set { name, field, expr } => format!(
             "{{\"kind\": \"set\", \"name\": \"{}\", \"field\": {}, \"expr\": {}}}",
             name,
-            match field { Some(f) => format!("\"{f}\""), None => "null".into() },
+            match field { Some(f) => format!("\"{f}\""), None => "None".into() },
             py_expr(expr),
         ),
         ProtocolAction::Push { state, expr } => format!(
@@ -85,6 +85,62 @@ fn py_action(a: &ProtocolAction) -> String {
             py_expr(expr)
         ),
     }
+}
+
+/// §38.9: split a template text into literal/expr segments at `${...}`
+/// boundaries (brace-balanced); `$${` is the literal escape.
+enum FmtSeg {
+    Text(String),
+    Expr(Expr),
+}
+
+fn fmt_segments(txt: &str) -> Vec<FmtSeg> {
+    let esc = "\u{1}";
+    let cs: Vec<char> = txt.replace("$${", esc).chars().collect();
+    let mut out = Vec::new();
+    let mut lit = String::new();
+    let mut i = 0;
+    while i < cs.len() {
+        if cs[i] == '$' && i + 1 < cs.len() && cs[i + 1] == '{' {
+            let mut depth = 1i64;
+            let mut j = i + 2;
+            while j < cs.len() && depth > 0 {
+                match cs[j] {
+                    '{' => depth += 1,
+                    '}' => depth -= 1,
+                    _ => {}
+                }
+                j += 1;
+            }
+            if depth != 0 {
+                lit.push(cs[i]);
+                i += 1;
+                continue;
+            }
+            if !lit.is_empty() {
+                let t = std::mem::take(&mut lit).replace(esc, "${");
+                out.push(FmtSeg::Text(t));
+            }
+            let src: String = cs[i + 2..j - 1].iter().collect();
+            match Expr::parse_expr(src.trim()) {
+                Ok(e) => out.push(FmtSeg::Expr(e)),
+                Err(_) => {
+                    let t: String = cs[i..j].iter().collect();
+                    out.push(FmtSeg::Text(t.replace(esc, "${")));
+                }
+            }
+            i = j;
+        } else {
+            lit.push(cs[i]);
+            i += 1;
+        }
+    }
+    if !lit.is_empty() {
+        out.push(FmtSeg::Text(lit.replace(esc, "${")));
+    }
+    // escape restoration inside expr-preceding texts is handled by the
+    // final replacement below for already-pushed segments too
+    out
 }
 
 fn py_expr(e: &Expr) -> String {
@@ -113,6 +169,27 @@ fn py_expr(e: &Expr) -> String {
             format!("{{\"op\": \"{}\", \"l\": {}, \"r\": {}}}", o, py_expr(l), py_expr(r))
         }
         Expr::Not(x) => format!("{{\"not\": {}}}", py_expr(x)),
+        Expr::Call { name, args } if name == "fmt" && !args.is_empty() => {
+            // §38.9: fmt with an inline "${...}" literal is emitted as
+            // pre-parsed segments; fmt with a template name keeps the
+            // positional form (resolved against TEMPLATES at runtime)
+            if let Expr::LitStr(txt) = &args[0] {
+                if txt.contains("${") {
+                    let segs = fmt_segments(txt);
+                    let segs = segs
+                        .iter()
+                        .map(|seg| match seg {
+                            FmtSeg::Text(t) => format!("{{\"s\": {}}}", serde_json::to_string(t).unwrap_or_default()),
+                            FmtSeg::Expr(e) => format!("{{\"e\": {}}}", py_expr(e)),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return format!("{{\"tmpl\": [{segs}]}}");
+                }
+            }
+            let a: Vec<String> = args.iter().map(py_expr).collect();
+            format!("{{\"fmtname\": {}, \"args\": [{}]}}", py_expr(&args[0]), a[1..].join(", "))
+        }
         Expr::Call { name, args } => {
             let a: Vec<String> = args.iter().map(py_expr).collect();
             format!("{{\"call\": \"{}\", \"args\": [{}]}}", name, a.join(", "))
@@ -172,6 +249,27 @@ pub fn gen_agent_py(prog: &ProtocolProgram, role: &str) -> Result<String, Vec<cr
         )
         .unwrap_or_default()
     ));
+    // §38.9: templates are pre-parsed into literal/expr segments
+    let templates: std::collections::BTreeMap<String, serde_json::Value> = prog
+        .templates
+        .iter()
+        .map(|(n, t)| {
+            let segs: Vec<serde_json::Value> = fmt_segments(t)
+                .into_iter()
+                .map(|seg| match seg {
+                    FmtSeg::Text(t) => serde_json::json!({ "s": t }),
+                    FmtSeg::Expr(e) => serde_json::json!({
+                        "e": serde_json::from_str::<serde_json::Value>(&py_expr(&e)).unwrap_or_default()
+                    }),
+                })
+                .collect();
+            (n.clone(), serde_json::json!(segs))
+        })
+        .collect();
+    out.push_str(&format!(
+        "    TEMPLATES = {}\n",
+        serde_json::to_string(&templates).unwrap_or_default()
+    ));
     out.push_str("    HANDLERS = [\n");
     for h in &ep.handlers {
         let (kind, base) = match &h.trigger {
@@ -225,6 +323,15 @@ pub fn gen_agent_py(prog: &ProtocolProgram, role: &str) -> Result<String, Vec<cr
         if isinstance(v, int):
             return v != 0
         return len(v) > 0
+
+    def _text(self, v):
+        if v is True:
+            return "true"
+        if v is False:
+            return "false"
+        if v is None:
+            return "unset"
+        return str(v)
 
     def _guard(self, g):
         if g is None:
@@ -287,6 +394,29 @@ pub fn gen_agent_py(prog: &ProtocolProgram, role: &str) -> Result<String, Vec<cr
         return False
 
     def _eval(self, e):
+        if "tmpl" in e:
+            # §38.9 rich interpolation: pre-parsed segments
+            out = ""
+            for seg in e["tmpl"]:
+                if "s" in seg:
+                    out += seg["s"]
+                else:
+                    out += self._text(self._eval(seg["e"]))
+            return out
+        if "fmtname" in e:
+            tname = self._eval(e["fmtname"])
+            segs = self.TEMPLATES.get(tname)
+            if segs is None:
+                raise ValueError("no message template '%s'" % tname)
+            out = ""
+            for seg in segs:
+                if "s" in seg:
+                    out += seg["s"]
+                else:
+                    out += self._text(self._eval(seg["e"]))
+            for idx, a in enumerate(e["args"]):
+                out = out.replace("{%d}" % idx, self._text(self._eval(a)))
+            return out
         if "lit" in e:
             return e["lit"]
         if "state" in e:

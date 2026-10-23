@@ -424,20 +424,53 @@ impl Runtime {
                     .map(|a| eval(a, self, scope))
                     .collect::<Result<_, _>>()?;
                 if name == "fmt" {
-                    // fmt(template_name, args...) — §35.3 user templates
+                    // fmt(template_or_inline, args...) — §35.3 user templates
+                    // + §38.9 rich interpolation: `${expr}` (states, captures,
+                    // arithmetic, fields) evaluated in the caller's scope;
+                    // `$${` is the literal escape. A registered template name
+                    // wins over an inline literal.
                     let tname = match vals.first() {
                         Some(StateValue::Str(s)) => s.clone(),
                         _ => return Err("fmt needs a template name".into()),
                     };
-                    let template = self
-                        .templates
-                        .iter()
-                        .find(|(n, _)| *n == tname)
-                        .map(|(_, t)| t.clone())
-                        .ok_or_else(|| format!("no message template '{tname}'"))?;
-                    let mut out = template;
-                    for (i, v) in vals[1..].iter().enumerate() {
-                        out = out.replace(&format!("{{{i}}}"), &value_text(v));
+                    let template = match self.templates.iter().find(|(n, _)| *n == tname) {
+                        Some((_, t)) => t.clone(),
+                        None if tname.contains("${") => tname,
+                        None => return Err(format!("no message template '{tname}'")),
+                    };
+                    let esc = "\u{1}";
+                    let mut out = String::new();
+                    let cs: Vec<char> = template.replace("$${", esc).chars().collect();
+                    let mut i = 0;
+                    while i < cs.len() {
+                        if cs[i] == '$' && i + 1 < cs.len() && cs[i + 1] == '{' {
+                            let mut depth = 1i64;
+                            let mut j = i + 2;
+                            while j < cs.len() && depth > 0 {
+                                match cs[j] {
+                                    '{' => depth += 1,
+                                    '}' => depth -= 1,
+                                    _ => {}
+                                }
+                                j += 1;
+                            }
+                            if depth != 0 {
+                                return Err("unterminated ${ in template".into());
+                            }
+                            let src: String = cs[i + 2..j - 1].iter().collect();
+                            let e = crate::protocol::Expr::parse_expr(src.trim())?;
+                            let v = self.eval(&e, ev, scope)?;
+                            out.push_str(&value_text(&v));
+                            i = j;
+                        } else {
+                            out.push(cs[i]);
+                            i += 1;
+                        }
+                    }
+                    let mut out = out.replace(esc, "${");
+                    // positional {i} placeholders still supported
+                    for (idx, v) in vals[1..].iter().enumerate() {
+                        out = out.replace(&format!("{{{idx}}}"), &value_text(v));
                     }
                     return Ok(StateValue::Str(out));
                 }
@@ -1928,5 +1961,71 @@ mod broadcast_tests {
             }
             other => panic!("expected winner record, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod rich_template_tests {
+    use super::*;
+    use crate::protocol::parse;
+
+    // §38.9: inline fmt with ${expr} — states, arithmetic, captures
+    #[test]
+    fn inline_fmt_interpolates_exprs() {
+        let prog = parse(
+            "protocol p v1;\nroles a, b;\nstate total: int;\non inform {\"price\": $p} from a { set total = 40; set msg = fmt(\"price ${$p} total ${total + 2} for ${arg.item}\"); }\non inform from b -> send bye;\n",
+        )
+        .unwrap();
+        let mut r = Runtime::new(&prog, "b").unwrap();
+        r.deliver(Event::In {
+            from: "a".into(),
+            performative: Performative::Inform,
+            pattern: None,
+            fields: Some(BTreeMap::from([("item".into(), "widget".into()), ("price".into(), "150".into())])),
+        });
+        match r.states_snapshot().get("msg") {
+            Some(StateValue::Str(s)) => {
+                assert_eq!(s, "price 150 total 42 for widget");
+            }
+            other => panic!("expected interpolated msg, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn registered_template_late_binding_and_positional() {
+        let prog = parse(
+            "protocol p v1;\nroles a, b;\nstate who: str;\nmessage invoice = \"INVOICE ${who} item {0}\";\non inform from a { set who = \"bob\"; set msg = fmt(\"invoice\", \"widget\"); }\non inform from b -> send bye;\n",
+        )
+        .unwrap();
+        let mut r = Runtime::new(&prog, "b").unwrap();
+        r.deliver(Event::In {
+            from: "a".into(),
+            performative: Performative::Inform,
+            pattern: None,
+            fields: None,
+        });
+        match r.states_snapshot().get("msg") {
+            Some(StateValue::Str(s)) => assert_eq!(s, "INVOICE bob item widget"),
+            other => panic!("expected template msg, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dollar_dollar_brace_is_literal() {
+        let prog = parse(
+            "protocol p v1;\nroles a, b;\nstate total: int;\non inform from a { set total = 5; set msg = fmt(\"cost $${total}\"); }\non inform from b -> send bye;\n",
+        )
+        .unwrap();
+        let mut r = Runtime::new(&prog, "b").unwrap();
+        r.deliver(Event::In {
+            from: "a".into(),
+            performative: Performative::Inform,
+            pattern: None,
+            fields: None,
+        });
+        assert_eq!(
+            r.states_snapshot().get("msg"),
+            Some(&StateValue::Str("cost ${total}".into()))
+        );
     }
 }
