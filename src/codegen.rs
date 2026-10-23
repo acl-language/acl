@@ -46,6 +46,11 @@ fn py_action(a: &ProtocolAction) -> String {
                 None => "None".into(),
             }
         ),
+        ProtocolAction::Try { body, catch } => format!(
+            "{{\"kind\": \"try\", \"body\": [{}], \"catch\": [{}]}}",
+            body.iter().map(py_action).collect::<Vec<_>>().join(", "),
+            catch.iter().map(py_action).collect::<Vec<_>>().join(", ")
+        ),
         ProtocolAction::Await { count, performative, into, within_ms, flag } => format!(
             "{{\"kind\": \"await\", \"count\": {count}, \"performative\": \"{}\", \"into\": \"{into}\", \"within_ms\": {within_ms}, \"flag\": \"{flag}\"}}",
             py_perf(performative)
@@ -313,6 +318,8 @@ pub fn gen_agent_py(prog: &ProtocolProgram, role: &str) -> Result<String, Vec<cr
         self._arg = {}
         self._caps = {}
         self._awaits = []
+        self._catch = None
+        self._jump = False
         self.states = {k: None for k in self.STATES}
         self.commitment = "proposed"   # proposed -> active -> fulfilled/breached
         self.timer_due = [0] * len([h for h in self.HANDLERS if h["kind"] == "timer"])
@@ -509,6 +516,16 @@ pub fn gen_agent_py(prog: &ProtocolProgram, role: &str) -> Result<String, Vec<cr
             elif a["kind"] == "set":
                 self.states[a["name"]] = self._eval(a["expr"])
                 self.transcript.append(("state", "set:" + a["name"]))
+            elif a["kind"] == "try":
+                # §45: handler-local error flow — a failing action in
+                # the body cuts it short and runs the catch actions
+                self._catch = a["catch"]
+                for b in a["body"]:
+                    self._run_one(b, out)
+                    if self._jump:
+                        break
+                self._catch = None
+                self._jump = False
             elif a["kind"] == "await":
                 # §44: arm the collector; flag starts False
                 self._awaits.append({
@@ -585,6 +602,90 @@ pub fn gen_agent_py(prog: &ProtocolProgram, role: &str) -> Result<String, Vec<cr
             if self._match(h, performative, pattern, fields):
                 return self._run(h)
         return []   # logged, unhandled (§33.4 auditability)
+
+    def _run_one(self, a, out):
+        # §45: one action; failures route like the Rust runtime
+        try:
+            if a["kind"] == "send":
+                self.transcript.append(("out", a["performative"]))
+                out.append({"to": a["to"], "performative": a["performative"], "fields": a["fields"]})
+            elif a["kind"] == "begin":
+                if self.commitment == "proposed":
+                    self.commitment = "active"
+                self.transcript.append(("state", "begin"))
+            elif a["kind"] == "fulfil":
+                if self.commitment == "active":
+                    self.commitment = "fulfilled"
+                self.transcript.append(("state", "fulfil"))
+            elif a["kind"] == "retract":
+                self.states[a["target"]] = False
+                self.transcript.append(("state", "retract:" + a["target"]))
+            elif a["kind"] == "set":
+                self.states[a["name"]] = self._eval(a["expr"])
+                self.transcript.append(("state", "set:" + a["name"]))
+            elif a["kind"] == "try":
+                # §45: handler-local error flow — a failing action in
+                # the body cuts it short and runs the catch actions
+                self._catch = a["catch"]
+                for b in a["body"]:
+                    self._run_one(b, out)
+                    if self._jump:
+                        break
+                self._catch = None
+                self._jump = False
+            elif a["kind"] == "await":
+                # §44: arm the collector; flag starts False
+                self._awaits.append({
+                    "count_left": a["count"],
+                    "performative": a["performative"],
+                    "into": a["into"],
+                    "deadline_ms": self._now + a["within_ms"],
+                    "flag": a["flag"],
+                })
+                self.states[a["flag"]] = False
+            elif a["kind"] == "broadcast":
+                # §38.8: fan-out — one send per role in the list state
+                for r in (self.states.get(a["to"]) or []):
+                    self.transcript.append(("out", a["performative"]))
+                    out.append({"to": r, "performative": a["performative"], "fields": a["fields"]})
+            elif a["kind"] == "push":
+                cur = self.states.get(a["state"])
+                if cur is None:
+                    self.states[a["state"]] = [self._eval(a["expr"])]
+                elif isinstance(cur, list):
+                    cur.append(self._eval(a["expr"]))
+                self.transcript.append(("state", "push:" + a["state"]))
+            elif a["kind"] == "put":
+                cur = self.states.get(a["state"])
+                if cur is None:
+                    self.states[a["state"]] = {}
+                if isinstance(self.states[a["state"]], dict):
+                    key = self._eval({"lit": 0, "str": a["key"]}) if False else a["key"]
+                    self.states[a["state"]][key] = self._eval(a["expr"])
+                self.transcript.append(("state", "put:" + a["state"]))
+            elif a["kind"] == "for":
+                lst = list(self.states.get(a["over"]) or [])
+                saved = self.states.get(a["var"])
+                for item in lst:
+                    self.states[a["var"]] = item
+                    for sub in a["actions"]:
+                        self._exec_one(sub)
+                if saved is None:
+                    self.states.pop(a["var"], None)
+                else:
+                    self.states[a["var"]] = saved
+            elif a["kind"] == "abort":
+                self.commitment = "breached"
+                self.transcript.append(("state", "abort"))
+        except Exception as e:
+            if self._catch:
+                catch = self._catch
+                self._catch = None
+                for c in catch:
+                    self._run_one(c, out)
+                self._jump = True
+            else:
+                self.transcript.append(("state", "internal error: %s" % e))
 
     def fire(self, kind):
         """Deliver 'breach' or 'expired' state events."""

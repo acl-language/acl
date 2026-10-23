@@ -288,6 +288,13 @@ pub struct Runtime {
     handling_error: bool,
     /// §44: active await collectors
     awaits: Vec<AwaitSpec>,
+    /// §45: active try/catch — the catch actions of the innermost `try`
+    catch_stack: Vec<Vec<ProtocolAction>>,
+    /// §45: set when a caught failure cuts the remaining body short
+    catch_jump: bool,
+    /// §45: true while catch actions run — failures inside a catch are
+    /// NOT caught by the same try (routes to the session's on error)
+    in_catch: bool,
     /// §35.4: host-injected clock (set by tick)
     now_ms: i64,
     /// §35.3: message templates for fmt()
@@ -352,6 +359,9 @@ impl Runtime {
             pending: Vec::new(),
             handling_error: false,
             awaits: Vec::new(),
+            catch_stack: Vec::new(),
+            catch_jump: false,
+            in_catch: false,
             now_ms: 0,
             aborted: false,
             enforce_dialogue: false,
@@ -882,9 +892,16 @@ impl Runtime {
                         }
                         other => {
                             let reason = format!("broadcast to '{to}': not a list ({:?})", other.map(value_text).unwrap_or_default());
-                            out.extend(self.deliver_internal_error(reason));
+                            self.action_failed(reason, &mut out);
                         }
                     }
+                }
+                ProtocolAction::Try { body, catch } => {
+                    // §45: handler-local error flow
+                    self.catch_stack.push(catch.clone());
+                    let inner = self.run_actions(body, ev);
+                    self.catch_stack.pop();
+                    out.extend(inner);
                 }
                 ProtocolAction::Await { count, performative, into, within_ms, flag } => {
                     // §44: arm the collector; flag starts false
@@ -907,12 +924,12 @@ impl Runtime {
                 ProtocolAction::Set { name, field, expr } => match self.eval(expr, ev, &captures) {
                     Ok(v) => {
                         if let Err(e) = self.set_state(name, v.clone()) {
-                            out.extend(self.deliver_internal_error(format!("set {name}: {e}")));
+                            self.action_failed(format!("set {name}: {e}"), &mut out);
                         } else {
                             self.log(Dir::State, format!("set {} = {}", name, value_text(&v)));
                         }
                     }
-                    Err(e) => out.extend(self.deliver_internal_error(format!("set {name}: {e}"))),
+                    Err(e) => self.action_failed(format!("set {name}: {e}"), &mut out),
                 },
                 ProtocolAction::Push { state, expr } => match self.eval(expr, ev, &captures) {
                     Ok(v) => {
@@ -922,10 +939,12 @@ impl Runtime {
                             if let Some(ty) = self.program_states.get(state) {
                                 if let Some(elem) = ty.strip_prefix("list<").map(|t| t.strip_suffix('>').unwrap_or(t)) {
                                     if ty.starts_with("list<") && !self.value_matches_type(elem, &v) {
-                                        out.extend(self.deliver_internal_error(format!(
+                                        self.action_failed(
+                                            format!(
                                             "push {state}: element {} does not match '{ty}'",
-                                            value_text(&v)
-                                        )));
+                                            value_text(&v)),
+                                            &mut out,
+                                        );
                                         continue;
                                     }
                                 }
@@ -934,7 +953,7 @@ impl Runtime {
                         if !is_list {
                             let other = self.states.get(state).cloned().unwrap_or(StateValue::Unset);
                             let reason = format!("push {state}: not a list ({})", value_text(&other));
-                            out.extend(self.deliver_internal_error(reason));
+                            self.action_failed(reason, &mut out);
                             continue;
                         }
                         match self.states.get_mut(state) {
@@ -945,7 +964,7 @@ impl Runtime {
                         }
                         self.log(Dir::State, format!("push {}", state));
                     }
-                    Err(e) => out.extend(self.deliver_internal_error(format!("push {state}: {e}"))),
+                    Err(e) => self.action_failed(format!("push {state}: {e}"), &mut out),
                 },
                 ProtocolAction::Put { state, key, expr } => match self.eval(expr, ev, &captures) {
                     Ok(v) => {
@@ -958,9 +977,12 @@ impl Runtime {
                                         let (kt, vt) = inner.split_once(',').map(|(a, b)| (a.trim(), b.trim())).unwrap_or(("str", inner));
                                         let kv = StateValue::Str(key.clone());
                                         if !self.value_matches_type(kt, &kv) || !self.value_matches_type(vt, &v) {
-                                            out.extend(self.deliver_internal_error(format!(
-                                                "put {state}[{key}]: key/value does not match '{ty}'"
-                                            )));
+                                            self.action_failed(
+                                                format!(
+                                                "put {state}[{key}]: key/value does not match '{ty}'"),
+                                                &mut out,
+                                            );
+                                            continue;
                                             continue;
                                         }
                                     }
@@ -970,7 +992,7 @@ impl Runtime {
                         if !is_map {
                             let other = self.states.get(state).cloned().unwrap_or(StateValue::Unset);
                             let reason = format!("put {state}: not a map ({})", value_text(&other));
-                            out.extend(self.deliver_internal_error(reason));
+                            self.action_failed(reason, &mut out);
                             continue;
                         }
                         match self.states.get_mut(state) {
@@ -983,7 +1005,7 @@ impl Runtime {
                         }
                         self.log(Dir::State, format!("put {}[{}]", state, key));
                     }
-                    Err(e) => out.extend(self.deliver_internal_error(format!("put {state}: {e}"))),
+                    Err(e) => self.action_failed(format!("put {state}: {e}"), &mut out),
                 },
                 ProtocolAction::For { var, over, actions } => {
                     // iterate a SNAPSHOT (the body may mutate the list);
@@ -1063,9 +1085,37 @@ impl Runtime {
     }
 
     /// run a list of actions (used by `for` bodies)
+    /// §45: route an action failure — inside a `try` the catch actions
+    /// run and the remaining body is cut; otherwise the session's
+    /// `on error` handler fires (§38.7)
+    fn action_failed(&mut self, reason: String, out: &mut Vec<OutEvent>) {
+        if !self.in_catch {
+            if let Some(catch) = self.catch_stack.last().cloned() {
+                // §45: run the catch with catch suppression (a failure
+                // INSIDE the catch routes to the session's on error), and
+                // only THEN latch the body cut
+                self.in_catch = true;
+                self.log(Dir::State, format!("caught: {reason}"));
+                out.extend(self.run_actions(&catch, &Event::InternalError(reason)));
+                self.in_catch = false;
+                self.catch_jump = true;
+                return;
+            }
+        }
+        out.extend(self.deliver_internal_error(reason));
+    }
+
+
+
+
     fn run_actions(&mut self, actions: &[ProtocolAction], ev: &Event) -> Vec<OutEvent> {
         let mut out = Vec::new();
         for a in actions {
+            // §45: a caught failure cuts the remaining body short
+            if self.catch_jump {
+                self.catch_jump = false;
+                break;
+            }
             match a {
                 ProtocolAction::For { .. } | ProtocolAction::Abort => {
                     // nested for: clone through a single-handler trick is
@@ -2397,5 +2447,65 @@ mod await_tests {
         r.tick(500);
         assert_eq!(r.states_snapshot().get("ready"), Some(&StateValue::Bool(false)));
         assert!(r.transcript().iter().any(|e| e.text.contains("await timed out")));
+    }
+}
+
+#[cfg(test)]
+mod try_catch_tests {
+    use super::*;
+    use crate::protocol::parse;
+
+    // §45: a caught failure runs the catch and CUTS the remaining body
+    #[test]
+    fn try_catch_cuts_body_and_runs_catch() {
+        let prog = parse(
+            "protocol p v1;\nroles a, b;\nstate x: int;\nstate y: int;\non inform from a { try { set x = 1 / 0; set y = 5; } catch { set y = 9; } }\non inform from b -> send bye;\n",
+        )
+        .unwrap();
+        let mut r = Runtime::new(&prog, "b").unwrap();
+        r.deliver(Event::In { from: "a".into(), performative: Performative::Inform, pattern: None, fields: None });
+        let snap = r.states_snapshot();
+        // x stayed unset (failure), y got the CATCH value, not the body's 5
+        assert_eq!(snap.get("y"), Some(&StateValue::Int(9)));
+        assert_eq!(snap.get("x"), Some(&StateValue::Unset));
+        assert!(r.transcript().iter().any(|e| e.text.contains("caught: set x")));
+    }
+
+    #[test]
+    fn try_success_skips_catch() {
+        let prog = parse(
+            "protocol p v1;\nroles a, b;\nstate x: int;\non inform from a { try { set x = 7; } catch { set x = 0; } }\non inform from b -> send bye;\n",
+        )
+        .unwrap();
+        let mut r = Runtime::new(&prog, "b").unwrap();
+        r.deliver(Event::In { from: "a".into(), performative: Performative::Inform, pattern: None, fields: None });
+        assert_eq!(r.states_snapshot().get("x"), Some(&StateValue::Int(7)));
+    }
+
+    // §45: `handle error` one-line sugar == try/catch
+    #[test]
+    fn handle_error_sugar_wraps_in_try() {
+        let prog = parse(
+            "protocol p v1;\nroles a, b;\nstate x: int;\nstate y: int;\non inform from a -> set x = 1 / 0 handle error -> set y = 3;\non inform from b -> send bye;\n",
+        )
+        .unwrap();
+        let h = &prog.handlers[0];
+        assert!(h.actions.iter().any(|a| matches!(a, ProtocolAction::Try { .. })), "{:?}", h.actions);
+        let mut r = Runtime::new(&prog, "b").unwrap();
+        r.deliver(Event::In { from: "a".into(), performative: Performative::Inform, pattern: None, fields: None });
+        assert_eq!(r.states_snapshot().get("y"), Some(&StateValue::Int(3)));
+        // uncaught path: NO session-level on error fired (caught locally)
+        assert!(!r.transcript().iter().any(|e| e.text.contains("internal error: set x")));
+    }
+
+    #[test]
+    fn uncaught_failure_still_routes_to_on_error() {
+        let prog = parse(
+            "protocol p v1;\nroles a, b;\nstate x: int;\nstate caught: bool;\non inform from a { set x = 1 / 0; }\non error { set caught = true; }\non inform from b -> send bye;\n",
+        )
+        .unwrap();
+        let mut r = Runtime::new(&prog, "b").unwrap();
+        r.deliver(Event::In { from: "a".into(), performative: Performative::Inform, pattern: None, fields: None });
+        assert_eq!(r.states_snapshot().get("caught"), Some(&StateValue::Bool(true)));
     }
 }

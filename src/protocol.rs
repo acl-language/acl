@@ -74,6 +74,11 @@ pub enum ProtocolAction {
     /// §38.8: `broadcast <perf> [payload] to <list_state>;` — fan-out to
     /// every role named in a list state (contract-net announce)
     Broadcast { performative: Performative, fields: Option<BTreeMap<String, String>>, to: String },
+    /// §45: `try { ... } catch { ... };` — a failing action inside the
+    /// body (set/push/put eval error, container violation, fmt failure)
+    /// cuts the body short and runs the catch actions instead of routing
+    /// to the session's `on error` handler
+    Try { body: Vec<ProtocolAction>, catch: Vec<ProtocolAction> },
     /// §44: `await N <perf> into <list> within <dur> as <flag>;` —
     /// declarative collection: matching events push their payload into the
     /// list state; when N arrive the flag goes true; on deadline it goes
@@ -1356,7 +1361,18 @@ fn parse_single(src: &str) -> Result<ProtocolProgram, Vec<IdlError>> {
             if arrow {
                 // one-line form: `on X -> send Y;` (no block)
                 let stmt = sends.trim_end_matches(';').trim();
-                match parse_action(stmt) {
+                // §45: `on X -> <action> handle error -> <action>;` wraps
+                // the body in a try/catch — handler-local error flow
+                let action = match stmt.split_once(" handle error -> ") {
+                    Some((body_part, catch_part)) => {
+                        match (parse_action(body_part.trim()), parse_action(catch_part.trim())) {
+                            (Ok(b), Ok(c)) => Ok(ProtocolAction::Try { body: vec![b], catch: vec![c] }),
+                            (Err(e), _) | (_, Err(e)) => Err(e),
+                        }
+                    }
+                    None => parse_action(stmt),
+                };
+                match action {
                     Ok(a) => {
                         for h in &mut hs {
                             h.actions.push(a.clone());
@@ -1370,7 +1386,7 @@ fn parse_single(src: &str) -> Result<ProtocolProgram, Vec<IdlError>> {
             } else if let Some(body_src) = block_body.take() {
                 // inline block: `on X { act; act; }` — body already split off
                 let body = body_src;
-                for stmt in body.split(';') {
+                for stmt in split_stmts(&body) {
                     if stmt.trim().is_empty() {
                         continue;
                     }
@@ -1519,6 +1535,34 @@ fn parse_single(src: &str) -> Result<ProtocolProgram, Vec<IdlError>> {
         }
     }
     if errors.is_empty() { Ok(prog) } else { Err(errors) }
+}
+
+/// §45: split statements on ';' at brace-depth 0 — `try { a; b; } catch { c };`
+/// stays one statement.
+fn split_stmts(src: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut depth = 0i64;
+    for c in src.chars() {
+        match c {
+            '{' => {
+                depth += 1;
+                cur.push(c);
+            }
+            '}' => {
+                depth -= 1;
+                cur.push(c);
+            }
+            ';' if depth == 0 => {
+                out.push(std::mem::take(&mut cur));
+            }
+            _ => cur.push(c),
+        }
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur);
+    }
+    out
 }
 
 fn parse_trigger(head: &str) -> Result<OnTrigger, String> {
@@ -1708,6 +1752,36 @@ fn parse_action(stmt: &str) -> Result<ProtocolAction, String> {
         let performative = perf_from_word(perf_w)
             .ok_or_else(|| format!("unknown performative '{perf_w}'"))?;
         return Ok(ProtocolAction::Broadcast { performative, fields, to: target });
+    }
+    if let Some(rest) = s.strip_prefix("try ") {
+        // §45: `try { a; b; } catch { c; };` — inline form
+        let (body_src, catch_src) = rest
+            .split_once("} catch {")
+            .ok_or_else(|| format!("bad try: '{s}' (want 'try {{ ... }} catch {{ ... }};')"))?;
+        let body_inner = body_src
+            .split_once('{')
+            .ok_or_else(|| format!("bad try: '{s}' (missing body brace)"))?
+            .1;
+        let catch_inner = catch_src
+            .trim_end_matches(';')
+            .trim()
+            .trim_end_matches('}')
+            .trim();
+        let mut body = Vec::new();
+        for stmt in body_inner.split(';') {
+            if stmt.trim().is_empty() {
+                continue;
+            }
+            body.push(parse_action(stmt.trim())?);
+        }
+        let mut catch = Vec::new();
+        for stmt in catch_inner.split(';') {
+            if stmt.trim().is_empty() {
+                continue;
+            }
+            catch.push(parse_action(stmt.trim())?);
+        }
+        return Ok(ProtocolAction::Try { body, catch });
     }
     if let Some(rest) = s.strip_prefix("await ") {
         // §44: `await 3 propose into bids within 5s as bids_ready;`
@@ -2560,6 +2634,11 @@ fn action_word(a: &ProtocolAction) -> String {
             into,
             within_ms,
             flag
+        ),
+        ProtocolAction::Try { body, catch } => format!(
+            "try {{ {} }} catch {{ {} }}",
+            body.iter().map(action_word).collect::<Vec<_>>().join("; "),
+            catch.iter().map(action_word).collect::<Vec<_>>().join("; ")
         ),
         ProtocolAction::For { var, over, actions } => {
             let inner: Vec<String> = actions.iter().map(|a| action_word(a)).collect();

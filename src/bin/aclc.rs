@@ -80,6 +80,7 @@ fn main() {
                                                 format!("broadcast {:?} to {to}", performative),
                                             acl_core::protocol::ProtocolAction::Await { count, performative, into, .. } =>
                                                 format!("await {count} {:?} into {into}", performative),
+                                            acl_core::protocol::ProtocolAction::Try { .. } => "try/catch".into(),
                                         }).collect();
                                         println!("    on {} -> {}", t, a.join("; "));
                                     }
