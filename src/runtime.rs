@@ -193,6 +193,9 @@ pub enum Event {
     },
     /// an owed commitment was broken (by the OTHER side or by time)
     Breach,
+    /// §38.7: an internal action failure (set/push/put eval error, send
+    /// retry exhaustion) — routed to the session's `on error` handler
+    InternalError(String),
     /// the deadline passed
     Expired,
 }
@@ -256,6 +259,8 @@ pub struct Runtime {
     pub(crate) last_seen: Option<Performative>,
     /// §35.5: sends awaiting retry
     pending: Vec<PendingSend>,
+    /// §38.7: recursion guard for internal-error routing
+    handling_error: bool,
     /// §35.4: host-injected clock (set by tick)
     now_ms: i64,
     /// §35.3: message templates for fmt()
@@ -316,6 +321,7 @@ impl Runtime {
                 .collect(),
             last_seen: None,
             pending: Vec::new(),
+            handling_error: false,
             now_ms: 0,
             aborted: false,
             enforce_dialogue: false,
@@ -491,6 +497,25 @@ impl Runtime {
         self.log.push(LogEntry { seq: self.seq, dir, text });
     }
 
+    /// §38.7: route an internal failure to the session's `on error`
+    /// handler. The failure is always logged; the handler runs at most one
+    /// level deep (failures inside it are logged only — no error loops).
+    pub fn deliver_internal_error(&mut self, reason: String) -> Vec<OutEvent> {
+        self.log(Dir::State, format!("internal error: {reason}"));
+        if self.handling_error {
+            return Vec::new();
+        }
+        let ev = Event::InternalError(reason);
+        if let Some((hidx, caps)) = self.matching_handler(&ev) {
+            self.handling_error = true;
+            let out = self.run_handler(hidx, &ev, caps);
+            self.handling_error = false;
+            out
+        } else {
+            Vec::new()
+        }
+    }
+
     /// Deliver an event: find the FIRST handler whose trigger matches and
     /// execute its actions in order. Returns what the agent emits.
     pub fn deliver(&mut self, ev: Event) -> Vec<OutEvent> {
@@ -607,6 +632,13 @@ impl Runtime {
             }
             (OnTrigger::Breach, Event::Breach) => Some((i, BTreeMap::new())),
             (OnTrigger::Expired, Event::Expired) => Some((i, BTreeMap::new())),
+            // §38.7: internal failures match ONLY an unattributed `on error`
+            // handler (an `on error from X` is for external error messages)
+            (OnTrigger::Event { performative: Performative::Error, from: None, .. }, Event::InternalError(reason)) => {
+                let mut caps = BTreeMap::new();
+                caps.insert("reason".to_string(), StateValue::Str(reason.clone()));
+                Some((i, caps))
+            }
             _ => None,
         })
     }
@@ -646,7 +678,7 @@ impl Runtime {
                         self.log(Dir::State, format!("set {} = {}", name, value_text(&v)));
                         self.set_state(name, v);
                     }
-                    Err(e) => self.log(Dir::State, format!("set {} failed: {}", name, e)),
+                    Err(e) => out.extend(self.deliver_internal_error(format!("set {name}: {e}"))),
                 },
                 ProtocolAction::Push { state, expr } => match self.eval(expr, ev, &captures) {
                     Ok(v) => {
@@ -664,7 +696,7 @@ impl Runtime {
                         }
                         self.log(Dir::State, format!("push {}", state));
                     }
-                    Err(e) => self.log(Dir::State, format!("push {} failed: {}", state, e)),
+                    Err(e) => out.extend(self.deliver_internal_error(format!("push {state}: {e}"))),
                 },
                 ProtocolAction::Put { state, key, expr } => match self.eval(expr, ev, &captures) {
                     Ok(v) => {
@@ -684,7 +716,7 @@ impl Runtime {
                         }
                         self.log(Dir::State, format!("put {}[{}]", state, key));
                     }
-                    Err(e) => self.log(Dir::State, format!("put {} failed: {}", state, e)),
+                    Err(e) => out.extend(self.deliver_internal_error(format!("put {state}: {e}"))),
                 },
                 ProtocolAction::For { var, over, actions } => {
                     // iterate a SNAPSHOT (the body may mutate the list);
@@ -878,14 +910,12 @@ impl Runtime {
                         ..p
                     });
                 } else {
-                    self.log(
-                        Dir::State,
-                        format!(
-                            "retry exhausted: {} to {}",
-                            perf_name(p.performative),
-                            p.to.clone().unwrap_or_default()
-                        ),
+                    let reason = format!(
+                        "send {} to {}: retry exhausted",
+                        perf_name(p.performative),
+                        p.to.clone().unwrap_or_default()
                     );
+                    out.extend(self.deliver_internal_error(reason));
                 }
             } else {
                 still_pending.push(p);
@@ -1160,6 +1190,7 @@ fn event_text(ev: &Event) -> String {
         ),
         Event::Breach => "breach".into(),
         Event::Expired => "expired".into(),
+        Event::InternalError(r) => format!("internal error: {r}"),
     }
 }
 
@@ -1691,5 +1722,84 @@ end when fulfilled;
             fields: Some(BTreeMap::from([("cur".into(), "usd".into())])),
         });
         assert_eq!(out[0].performative, Performative::Propose);
+    }
+}
+
+#[cfg(test)]
+mod internal_error_tests {
+    use super::*;
+    use crate::protocol::parse;
+    use std::collections::BTreeMap;
+    #[test]
+    fn set_failure_fires_on_error() {
+        let prog = parse(
+            "protocol p v1;\nroles a, b;\nstate x: int;\non inform from a { set x = 1 / 0; }\non error { set x = $reason; }\n",
+        )
+        .unwrap();
+        let mut r = Runtime::new(&prog, "b").unwrap();
+        let out = r.deliver(Event::In {
+            from: "a".into(),
+            performative: Performative::Inform,
+            pattern: None,
+            fields: None,
+        });
+        assert!(out.is_empty());
+        match r.states_snapshot().get("x") {
+            Some(StateValue::Str(s)) => assert!(s.contains("division by zero"), "{s}"),
+            other => panic!("expected error reason in x, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_error_handler_is_just_logged() {
+        let prog = parse(
+            "protocol p v1;\nroles a, b;\nstate x: int;\non inform from a { set x = 1 / 0; }\n",
+        )
+        .unwrap();
+        let mut r = Runtime::new(&prog, "b").unwrap();
+        let out = r.deliver(Event::In {
+            from: "a".into(),
+            performative: Performative::Inform,
+            pattern: None,
+            fields: None,
+        });
+        assert!(out.is_empty());
+        assert!(r.transcript().iter().any(|e| e.text.contains("internal error")));
+    }
+
+    #[test]
+    fn retry_exhaustion_fires_on_error() {
+        let prog = parse(
+            "protocol p v1;\nroles a, b;\nstate flagged: bool;\non inform from a { send inform to a retry 1 backoff 50ms; }\non error { set flagged = true; }\n",
+        )
+        .unwrap();
+        let mut r = Runtime::new(&prog, "b").unwrap();
+        r.deliver(Event::In {
+            from: "a".into(),
+            performative: Performative::Inform,
+            pattern: None,
+            fields: None,
+        });
+        let out = r.tick(500);
+        assert!(out.is_empty(), "exhausted retry must not re-send: {out:?}");
+        assert_eq!(r.states_snapshot().get("flagged"), Some(&StateValue::Bool(true)));
+    }
+
+    #[test]
+    fn error_in_error_handler_does_not_loop() {
+        let prog = parse(
+            "protocol p v1;\nroles a, b;\nstate x: int;\nstate y: int;\non inform from a { set x = 1 / 0; }\non error { set y = 2 / 0; }\n",
+        )
+        .unwrap();
+        let mut r = Runtime::new(&prog, "b").unwrap();
+        let out = r.deliver(Event::In {
+            from: "a".into(),
+            performative: Performative::Inform,
+            pattern: None,
+            fields: None,
+        });
+        assert!(out.is_empty()); // terminates — no loop
+        let errs: Vec<_> = r.transcript().iter().filter(|e| e.text.contains("internal error")).collect();
+        assert_eq!(errs.len(), 2, "{:?}", errs.iter().map(|e| &e.text).collect::<Vec<_>>());
     }
 }
