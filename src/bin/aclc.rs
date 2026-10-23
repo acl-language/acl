@@ -235,7 +235,15 @@ fn main() {
                             from: v["from"].as_str().unwrap_or("peer").to_string(),
                             performative: perf,
                             pattern: v["pattern"].as_str().map(|s| s.to_string()),
-                            fields: v["fields"].as_object().map(|o| o.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string())).collect()),
+                            fields: v["fields"].as_object().map(|o| {
+                                o.iter()
+                                    .map(|(k, v)| match v {
+                                        serde_json::Value::Number(n) => (k.clone(), n.as_i64().map(acl_core::runtime::FieldValue::Int).unwrap_or(acl_core::runtime::FieldValue::Float(n.as_f64().unwrap_or_default()))),
+                                        serde_json::Value::Bool(b) => (k.clone(), acl_core::runtime::FieldValue::Bool(*b)),
+                                        _ => (k.clone(), acl_core::runtime::FieldValue::Str(v.as_str().unwrap_or_default().to_string())),
+                                    })
+                                    .collect()
+                            }),
                         },
                     ));
                 }

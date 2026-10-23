@@ -374,11 +374,12 @@ pub fn gen_agent_py(prog: &ProtocolProgram, role: &str) -> Result<String, Vec<cr
             if gv is None:
                 return False
             if wv.endswith("*"):
-                if not gv.startswith(wv[:-1]):
+                if not str(gv).startswith(wv[:-1]):
                     return False
             elif wv.startswith("$"):
-                self._caps[wv[1:]] = self._infer(gv)
-            elif gv != wv:
+                # §46: native typed values pass through; strings infer
+                self._caps[wv[1:]] = gv if isinstance(gv, (int, float, bool)) else self._infer(gv)
+            elif str(gv) != wv:
                 return False
         return True
 

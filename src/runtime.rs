@@ -198,12 +198,15 @@ pub enum StateValue {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
     /// an incoming speech act from another role (`fields` = structured
-    /// payload for content matching, §34)
+    /// payload for content matching, §34) — §46: values are TYPED on the
+    /// wire (FieldValue); string literals convert implicitly, so existing
+    /// construction sites keep compiling, and native int/float/bool skip
+    /// the `infer_value` heuristic entirely
     In {
         from: String,
         performative: Performative,
         pattern: Option<String>,
-        fields: Option<BTreeMap<String, String>>,
+        fields: Option<BTreeMap<String, FieldValue>>,
     },
     /// an owed commitment was broken (by the OTHER side or by time)
     Breach,
@@ -220,7 +223,94 @@ pub struct OutEvent {
     pub to: Option<String>,
     pub performative: Performative,
     /// structured payload (§34) — subset-matched by receiving handlers
-    pub fields: Option<BTreeMap<String, String>>,
+    pub fields: Option<BTreeMap<String, FieldValue>>,
+}
+
+/// §46: a typed field value on the wire — string literals convert
+/// implicitly (From<&str>/From<String>) so protocol programs keep working;
+/// native ints/floats/bools arrive typed and skip type inference
+#[derive(Debug, Clone, PartialEq)]
+pub enum FieldValue {
+    Str(String),
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+}
+
+impl From<&str> for FieldValue {
+    fn from(s: &str) -> Self {
+        FieldValue::Str(s.to_string())
+    }
+}
+
+impl From<String> for FieldValue {
+    fn from(s: String) -> Self {
+        FieldValue::Str(s)
+    }
+}
+
+impl From<i64> for FieldValue {
+    fn from(i: i64) -> Self {
+        FieldValue::Int(i)
+    }
+}
+
+impl From<f64> for FieldValue {
+    fn from(f: f64) -> Self {
+        FieldValue::Float(f)
+    }
+}
+
+impl From<bool> for FieldValue {
+    fn from(b: bool) -> Self {
+        FieldValue::Bool(b)
+    }
+}
+
+impl From<FieldValue> for StateValue {
+    fn from(f: FieldValue) -> Self {
+        match f {
+            FieldValue::Str(s) => StateValue::Str(s),
+            FieldValue::Int(i) => StateValue::Int(i),
+            FieldValue::Float(f) => StateValue::Float(f),
+            FieldValue::Bool(b) => StateValue::Bool(b),
+        }
+    }
+}
+
+impl FieldValue {
+    /// the plain-text rendering used by string patterns and logs
+    pub fn text(&self) -> String {
+        match self {
+            FieldValue::Str(s) => s.clone(),
+            FieldValue::Int(i) => i.to_string(),
+            FieldValue::Float(f) => f.to_string(),
+            FieldValue::Bool(b) => b.to_string(),
+        }
+    }
+
+    /// §46: typed conversion — Str goes through infer_value (a string
+    /// payload may still BE a number written as text); native types pass
+    /// through untouched
+    pub fn to_state_value(&self) -> StateValue {
+        match self {
+            FieldValue::Str(s) => infer_value(s),
+            other => other.clone().into(),
+        }
+    }
+}
+
+impl From<crate::cl::ClValue> for FieldValue {
+    fn from(v: crate::cl::ClValue) -> Self {
+        use crate::cl::ClValue;
+        match v {
+            ClValue::Str(s) => FieldValue::Str(s),
+            ClValue::Int(i) => FieldValue::Int(i),
+            ClValue::Float(f) => FieldValue::Float(f),
+            ClValue::Bool(b) => FieldValue::Bool(b),
+            other => FieldValue::Str(format!("{other:?}")),
+        }
+    }
 }
 
 /// §44: a declarative `await` collector — armed by an action, fed by
@@ -498,7 +588,7 @@ impl Runtime {
             Expr::State(n) => scope.get(n).cloned().unwrap_or_else(|| self.states.get(n).cloned().unwrap_or(StateValue::Unset)),
             Expr::Capture(n) => scope.get(n).cloned().unwrap_or(StateValue::Unset),
             Expr::Arg(a) => match arg.get(a) {
-                Some(s) => StateValue::Str(s.clone()),
+                Some(v) => v.to_state_value(),
                 None => StateValue::Unset,
             },
             Expr::Not(x) => match eval(x, self, scope)? {
@@ -703,7 +793,7 @@ impl Runtime {
                         .clone()
                         .unwrap_or_default()
                         .into_iter()
-                        .map(|(k, v)| (k, StateValue::Str(v)))
+                        .map(|(k, v)| (k, v.to_state_value()))
                         .collect(),
                 );
                 // append to the list state
@@ -770,20 +860,17 @@ impl Runtime {
                                 match fs.get(k) {
                                     None => false,
                                     Some(got_v) if want_v.ends_with('*') => {
-                                        got_v.starts_with(want_v.trim_end_matches('*'))
+                                        got_v.text().starts_with(want_v.trim_end_matches('*'))
                                     }
                                     // §35.5: capture variables `{"k": "$var"}`
                                     // — the event's value is bound to `var`,
                                     // with §38.3 type inference (int, float,
                                     // bool, else string)
                                     Some(got_v) if want_v.starts_with('$') => {
-                                        captures.insert(
-                                            want_v[1..].to_string(),
-                                            infer_value(got_v),
-                                        );
+                                        captures.insert(want_v[1..].to_string(), got_v.to_state_value());
                                         true
                                     }
-                                    Some(got_v) => got_v == want_v,
+                                    Some(got_v) => got_v.text() == want_v.to_string(),
                                 }
                             }),
                             Err(_) => false,
@@ -859,7 +946,13 @@ impl Runtime {
                             exponential: rp.exponential,
                         });
                     }
-                    out.push(OutEvent { to: to.clone(), performative: *performative, fields: fields.clone() });
+                    out.push(OutEvent {
+                            to: to.clone(),
+                            performative: *performative,
+                            fields: fields.as_ref().map(|m| {
+                                m.iter().map(|(k, v)| (k.clone(), FieldValue::Str(v.clone()))).collect()
+                            }),
+                        });
                 }
                 ProtocolAction::Broadcast { performative, fields, to } => {
                     // §38.8: fan-out — one OutEvent per role named in the
@@ -886,7 +979,9 @@ impl Runtime {
                                 out.push(OutEvent {
                                     to: Some(target),
                                     performative: *performative,
-                                    fields: fields.clone(),
+                                    fields: fields.as_ref().map(|m| {
+                                        m.iter().map(|(k, v)| (k.clone(), FieldValue::Str(v.clone()))).collect()
+                                    }),
                                 });
                             }
                         }
@@ -1233,7 +1328,13 @@ impl Runtime {
                             p.attempts_left - 1
                         ),
                     );
-                    out.push(OutEvent { to: p.to.clone(), performative: p.performative, fields: p.fields.clone() });
+                    out.push(OutEvent {
+                            to: p.to.clone(),
+                            performative: p.performative,
+                            fields: p.fields.as_ref().map(|m| {
+                                m.iter().map(|(k, v)| (k.clone(), FieldValue::Str(v.clone()))).collect()
+                            }),
+                        });
                     still_pending.push(PendingSend {
                         attempts_left: p.attempts_left - 1,
                         next_due: elapsed_ms + backoff,
@@ -1539,7 +1640,17 @@ fn event_text(ev: &Event) -> String {
             pattern.clone().unwrap_or_default(),
             fields
                 .as_ref()
-                .map(|f| format!(" {}", serde_json::to_string(f).unwrap_or_default()))
+                .map(|f| {
+                    format!(
+                        " {}",
+                        serde_json::to_string(
+                            &f.iter()
+                                .map(|(k, v)| (k.clone(), v.text()))
+                                .collect::<BTreeMap<_, _>>()
+                        )
+                        .unwrap_or_default()
+                    )
+                })
                 .unwrap_or_default()
         ),
         Event::Breach => "breach".into(),
@@ -2420,7 +2531,7 @@ mod await_tests {
                 from: "a".into(),
                 performative: Performative::Propose,
                 pattern: None,
-                fields: Some(BTreeMap::from([("who".into(), format!("b{i}")), ("price".into(), format!("{i}0"))])),
+                fields: Some(BTreeMap::from([("who".into(), FieldValue::Str(format!("b{i}"))), ("price".into(), FieldValue::Int(i * 10))])),
             });
         }
         let snap = r.states_snapshot();
@@ -2507,5 +2618,63 @@ mod try_catch_tests {
         let mut r = Runtime::new(&prog, "b").unwrap();
         r.deliver(Event::In { from: "a".into(), performative: Performative::Inform, pattern: None, fields: None });
         assert_eq!(r.states_snapshot().get("caught"), Some(&StateValue::Bool(true)));
+    }
+}
+
+#[cfg(test)]
+mod typed_fields_tests {
+    use super::*;
+    use crate::protocol::parse;
+
+    // §46: native int payload — capture is Int WITHOUT string inference
+    #[test]
+    fn native_typed_capture_is_int() {
+        let prog = parse(
+            "protocol p v1;\nroles a, b;\non inform {\"price\": $p} from a when $p > 99 -> send bye;\non inform from b -> send bye;\n",
+        )
+        .unwrap();
+        let mut r = Runtime::new(&prog, "b").unwrap();
+        let out = r.deliver(Event::In {
+            from: "a".into(),
+            performative: Performative::Inform,
+            pattern: None,
+            fields: Some(BTreeMap::from([("price".into(), FieldValue::Int(150))])),
+        });
+        assert_eq!(out[0].performative, Performative::Bye);
+    }
+
+    // §46: numeric STRING payload still infers (backward compat), but a
+    // non-numeric string does NOT become a number
+    #[test]
+    fn string_payload_inference_preserved() {
+        let prog = parse(
+            "protocol p v1;\nroles a, b;\nstate t: str;\non inform {\"cur\": $c} from a { set t = $c; }\non inform from b -> send bye;\n",
+        )
+        .unwrap();
+        let mut r = Runtime::new(&prog, "b").unwrap();
+        r.deliver(Event::In {
+            from: "a".into(),
+            performative: Performative::Inform,
+            pattern: None,
+            fields: Some(BTreeMap::from([("cur".into(), FieldValue::Str("usd".into()))])),
+        });
+        assert_eq!(r.states_snapshot().get("t"), Some(&StateValue::Str("usd".into())));
+    }
+
+    // §46: literal pattern comparison against a typed value
+    #[test]
+    fn literal_pattern_matches_typed_int() {
+        let prog = parse(
+            "protocol p v1;\nroles a, b;\non inform {\"code\": \"42\"} from a -> send bye;\non inform from b -> send bye;\n",
+        )
+        .unwrap();
+        let mut r = Runtime::new(&prog, "b").unwrap();
+        let out = r.deliver(Event::In {
+            from: "a".into(),
+            performative: Performative::Inform,
+            pattern: None,
+            fields: Some(BTreeMap::from([("code".into(), FieldValue::Int(42))])),
+        });
+        assert_eq!(out[0].performative, Performative::Bye);
     }
 }
