@@ -64,6 +64,8 @@ fn main() {
                                             acl_core::protocol::ProtocolAction::Put { state, key, .. } => format!("put {state}[{key}]"),
                                             acl_core::protocol::ProtocolAction::For { var, over, .. } => format!("for {var} in {over}"),
                                             acl_core::protocol::ProtocolAction::Abort => "abort".into(),
+                                            acl_core::protocol::ProtocolAction::Broadcast { performative, to, .. } =>
+                                                format!("broadcast {:?} to {to}", performative),
                                         }).collect();
                                         println!("    on {} -> {}", t, a.join("; "));
                                     }

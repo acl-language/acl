@@ -60,6 +60,9 @@ pub enum ProtocolAction {
     Abort,
     /// §38.1: `return <expr>;` — only legal inside a function body
     Return { expr: Expr },
+    /// §38.8: `broadcast <perf> [payload] to <list_state>;` — fan-out to
+    /// every role named in a list state (contract-net announce)
+    Broadcast { performative: Performative, fields: Option<BTreeMap<String, String>>, to: String },
 }
 
 /// §35.5: retry policy on sends — declarative, driven by the runtime's
@@ -253,7 +256,7 @@ impl Expr {
                 let one = match c {
                     '+' => "+", '-' => "-", '*' => "*", '/' => "/",
                     '<' => "<", '>' => ">", '(' => "(", ')' => ")",
-                    ',' => ",",
+                    ',' => ",", '{' => "{", '}' => "}", ':' => ":",
                     _ => return Err(format!("bad char '{c}' in expression")),
                 };
                 toks.push(Tok::Op(one));
@@ -294,6 +297,29 @@ impl Expr {
                                 e = Expr::Field { base: Box::new(e), name: f.to_string() };
                             }
                             Ok(e)
+                        }
+                        _ if self.peek().map_or(false, |t| matches!(t, Tok::Op("{"))) => {
+                            // §38.2: record literal `Bid { who: "x", price: 3 }`
+                            self.next();
+                            let mut fields: Vec<(String, Expr)> = Vec::new();
+                            loop {
+                                let fname = match self.next() {
+                                    Some(Tok::Word(w)) => w,
+                                    other => return Err(format!("bad record field near {other:?}")),
+                                };
+                                match self.next() {
+                                    Some(Tok::Op(":")) => {}
+                                    other => return Err(format!("expected ':' after record field '{fname}', got {other:?}")),
+                                }
+                                let v = self.expr()?;
+                                fields.push((fname, v));
+                                match self.next() {
+                                    Some(Tok::Op(",")) => continue,
+                                    Some(Tok::Op("}")) => break,
+                                    other => return Err(format!("bad record syntax near {other:?}")),
+                                }
+                            }
+                            Ok(Expr::RecLit { ty: w, fields })
                         }
                         _ if self.peek().map_or(false, |t| matches!(t, Tok::Op("("))) => {
                             // function call
@@ -523,6 +549,11 @@ fn perf_from_word(w: &str) -> Option<Performative> {
 
 /// Strip `(...)` pattern and `from <role>` from a handler head:
 /// `request("quote") from buyer` -> (`request`, Some(`"quote"`), Some(`buyer`))
+/// §38.8 helper: char vec of a string (tiny sugar for brace scanning)
+fn cs_of(s: &str) -> Vec<char> {
+    s.chars().collect()
+}
+
 /// §38.3: rewrite bare `$var` capture values inside a `{...}` content
 /// pattern into JSON string values (`"$var"`) so the pattern is valid
 /// JSON — `{"price": $p}` becomes `{"price": "$p"}`.
@@ -966,17 +997,44 @@ pub fn parse(src: &str) -> Result<ProtocolProgram, Vec<IdlError>> {
             // inline block: `on X { act; act; }` — split the block body off
             // BEFORE trigger parsing (a content pattern's braces must not
             // leak into the trigger's from-clause)
-            let mut block_body: Option<String> = None;
-            let head = if !arrow && rest.ends_with('}') && rest.contains('{') {
-                let i = rest.rfind('{').unwrap();
-                block_body = Some(rest[i + 1..rest.len() - 1].to_string());
-                rest[..i].trim()
+            // inline block: `on X { act; act; }` — the final '}' closes
+            // the BLOCK brace; find it by backward brace-matching (a
+            // payload's '{' may appear AFTER the block opener)
+            let block_open = if !arrow && rest.ends_with('}') && rest.contains('{') {
+                let cs: Vec<char> = rest.chars().collect();
+                let mut depth = 0i64;
+                let mut open_at: Option<usize> = None;
+                let mut i = cs.len() - 1;
+                loop {
+                    match cs[i] {
+                        '}' => depth += 1,
+                        '{' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                open_at = Some(i);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    if i == 0 {
+                        break;
+                    }
+                    i -= 1;
+                }
+                open_at
             } else {
-                head
+                None
+            };
+            let mut block_body: Option<String> =
+                block_open.map(|i| cs_of(rest)[i + 1..cs_of(rest).len() - 1].iter().collect());
+            let head: String = match block_open {
+                Some(i) => rest[..i].trim().to_string(),
+                None => head.to_string(),
             };
             // §34: peel `when <guard>` (before from-parsing)
             let (head, guard) = match head.rfind(" when ") {
-                Some(i) => (head[..i].trim(), match parse_guard(head[i + 6..].trim()) {
+                Some(i) => (head[..i].trim().to_string(), match parse_guard(head[i + 6..].trim()) {
                     Ok(g) => Some(g),
                     Err(e) => {
                         errors.push(IdlError { line: line_no, message: format!("bad guard: {e}") });
@@ -1340,6 +1398,25 @@ fn parse_action(stmt: &str) -> Result<ProtocolAction, String> {
     if s == "abort" {
         return Ok(ProtocolAction::Abort);
     }
+    if let Some(rest) = s.strip_prefix("broadcast ") {
+        // §38.8: `broadcast propose {"task": "x"} to bidders;`
+        let (perf_part, target) = match rest.rsplit_once(" to ") {
+            Some((a, b)) => (a.trim(), b.trim().to_string()),
+            None => return Err(format!("bad broadcast: '{s}' (want 'broadcast <perf> [payload] to <list_state>')")),
+        };
+        let (perf_w, fields) = match (perf_part.find('{'), perf_part.ends_with('}')) {
+            (Some(i), true) => {
+                let raw = &perf_part[i..];
+                let map: BTreeMap<String, String> = serde_json::from_str(raw)
+                    .map_err(|e| format!("bad broadcast payload: {e}"))?;
+                (perf_part[..i].trim(), Some(map))
+            }
+            _ => (perf_part, None),
+        };
+        let performative = perf_from_word(perf_w)
+            .ok_or_else(|| format!("unknown performative '{perf_w}'"))?;
+        return Ok(ProtocolAction::Broadcast { performative, fields, to: target });
+    }
     if let Some(rest) = s.strip_prefix("send ") {
         // peel retry clause first: `retry 3 backoff 2s exp`
         let (rest, retry) = match rest.find(" retry ") {
@@ -1611,9 +1688,13 @@ pub fn check(prog: &ProtocolProgram) -> Result<Vec<String>, Vec<IdlError>> {
     // §33: every send must be dialogue-legal for its trigger
     for h in &prog.handlers {
         for a in &h.actions {
-            let ProtocolAction::Send { performative: out, .. } = a else { continue };
+            let out = match a {
+                ProtocolAction::Send { performative: out, .. }
+                | ProtocolAction::Broadcast { performative: out, .. } => *out,
+                _ => continue,
+            };
             let legal = match &h.trigger {
-                OnTrigger::Event { performative: inp, .. } => dialogue_legal(*inp, *out),
+                OnTrigger::Event { performative: inp, .. } => dialogue_legal(*inp, out),
                 // breach/expired/timer happen inside a session opened by some
                 // request-shaped move; the send must be legal after AT
                 // LEAST ONE plausible predecessor
@@ -1623,7 +1704,7 @@ pub fn check(prog: &ProtocolProgram) -> Result<Vec<String>, Vec<IdlError>> {
                     Performative::Delegate,
                 ]
                 .iter()
-                .any(|prev| dialogue_legal(*prev, *out)),
+                .any(|prev| dialogue_legal(*prev, out)),
             };
             if !legal {
                 let mut trig = match &h.trigger {
@@ -2006,6 +2087,12 @@ fn action_word(a: &ProtocolAction) -> String {
         ),
         ProtocolAction::Push { state, expr } => format!("push {}, {}", state, expr_word(expr)),
         ProtocolAction::Put { state, key, expr } => format!("put {}, {}, {}", state, key, expr_word(expr)),
+        ProtocolAction::Broadcast { performative, fields, to } => format!(
+            "broadcast {}{} to {}",
+            perf_word(performative),
+            fields.as_ref().map(|f| format!(" {}", serde_json::to_string(f).unwrap_or_default())).unwrap_or_default(),
+            to
+        ),
         ProtocolAction::For { var, over, actions } => {
             let inner: Vec<String> = actions.iter().map(|a| action_word(a)).collect();
             format!("for {} in {} {{ {} }}", var, over, inner.join("; "))

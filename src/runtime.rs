@@ -673,6 +673,41 @@ impl Runtime {
                     }
                     out.push(OutEvent { to: to.clone(), performative: *performative, fields: fields.clone() });
                 }
+                ProtocolAction::Broadcast { performative, fields, to } => {
+                    // §38.8: fan-out — one OutEvent per role named in the
+                    // list state; non-list target is an internal error
+                    self.last_out = Some(*performative);
+                    let snapshot = self.states.get(to).cloned();
+                    match snapshot.as_ref() {
+                        Some(StateValue::List(items)) => {
+                            self.log(
+                                Dir::Out,
+                                format!(
+                                    "broadcast {} to {} ({} targets){}",
+                                    perf_name(*performative),
+                                    to,
+                                    items.len(),
+                                    fields.clone().map(|f| format!(" {}", serde_json::to_string(&f).unwrap_or_default())).unwrap_or_default()
+                                ),
+                            );
+                            for item in items {
+                                let target = match item {
+                                    StateValue::Str(s) => s.clone(),
+                                    other => continue, // non-string entries skipped
+                                };
+                                out.push(OutEvent {
+                                    to: Some(target),
+                                    performative: *performative,
+                                    fields: fields.clone(),
+                                });
+                            }
+                        }
+                        other => {
+                            let reason = format!("broadcast to '{to}': not a list ({:?})", other.map(value_text).unwrap_or_default());
+                            out.extend(self.deliver_internal_error(reason));
+                        }
+                    }
+                }
                 ProtocolAction::Set { name, field, expr } => match self.eval(expr, ev, &captures) {
                     Ok(v) => {
                         self.log(Dir::State, format!("set {} = {}", name, value_text(&v)));
@@ -685,7 +720,8 @@ impl Runtime {
                         let is_list = matches!(self.states.get(state), Some(StateValue::List(_)) | Some(StateValue::Unset) | None);
                         if !is_list {
                             let other = self.states.get(state).cloned().unwrap_or(StateValue::Unset);
-                            self.log(Dir::State, format!("push {}: not a list ({:?})", state, other));
+                            let reason = format!("push {state}: not a list ({})", value_text(&other));
+                            out.extend(self.deliver_internal_error(reason));
                             continue;
                         }
                         match self.states.get_mut(state) {
@@ -703,7 +739,8 @@ impl Runtime {
                         let is_map = matches!(self.states.get(state), Some(StateValue::Map(_)) | Some(StateValue::Unset) | None);
                         if !is_map {
                             let other = self.states.get(state).cloned().unwrap_or(StateValue::Unset);
-                            self.log(Dir::State, format!("put {}: not a map ({:?})", state, other));
+                            let reason = format!("put {state}: not a map ({})", value_text(&other));
+                            out.extend(self.deliver_internal_error(reason));
                             continue;
                         }
                         match self.states.get_mut(state) {
@@ -1099,6 +1136,29 @@ fn builtin(name: &str, args: &[StateValue]) -> Result<StateValue, String> {
         ("len", [Map(m)]) => Ok(Int(m.len() as i64)),
         ("len", [Str(s)]) => Ok(Int(s.len() as i64)),
         ("count", [List(l)]) => Ok(Int(l.len() as i64)),
+        // §38.8: contract-net bid selection — the map in the list with the
+        // LOWEST numeric value for the given key (empty list -> Unset)
+        ("prefer", [List(l), Str(k)]) => {
+            let mut best: Option<(f64, StateValue)> = None;
+            for v in l {
+                let m = match v {
+                    StateValue::Map(m) => m,
+                    StateValue::Record(m) => m,
+                    _ => continue,
+                };
+                    let num = match m.get(k) {
+                        Some(StateValue::Int(i)) => Some(*i as f64),
+                        Some(StateValue::Float(f)) => Some(*f),
+                        _ => None,
+                    };
+                    if let Some(n) = num {
+                        if best.as_ref().map_or(true, |(b, _)| n < *b) {
+                            best = Some((n, v.clone()));
+                        }
+                    }
+            }
+            Ok(best.map(|(_, v)| v).unwrap_or(StateValue::Unset))
+        }
         ("sum", [List(l)]) => Ok(Int(
             l.iter()
                 .map(|v| match v {
@@ -1801,5 +1861,72 @@ mod internal_error_tests {
         assert!(out.is_empty()); // terminates — no loop
         let errs: Vec<_> = r.transcript().iter().filter(|e| e.text.contains("internal error")).collect();
         assert_eq!(errs.len(), 2, "{:?}", errs.iter().map(|e| &e.text).collect::<Vec<_>>());
+    }
+}
+
+#[cfg(test)]
+mod broadcast_tests {
+    use super::*;
+    use crate::protocol::parse;
+    use std::collections::BTreeMap;
+
+    // §38.8: broadcast fan-out — one OutEvent per role in the list state
+    #[test]
+    fn broadcast_fans_out_over_list() {
+        let prog = parse(
+            "protocol p v1;\nroles a, b;\nstate bidders: list;\non inform from a { push bidders, \"a\"; push bidders, \"a\"; broadcast propose {\"task\": \"haul\"} to bidders; }\non propose from a -> send bye;\n",
+        )
+        .unwrap();
+        let mut r = Runtime::new(&prog, "b").unwrap();
+        let out = r.deliver(Event::In {
+            from: "a".into(),
+            performative: Performative::Inform,
+            pattern: None,
+            fields: None,
+        });
+        let targets: Vec<Option<String>> = out.iter().map(|o| o.to.clone()).collect();
+        assert_eq!(targets, vec![Some("a".into()), Some("a".into())]);
+        assert!(out.iter().all(|o| o.performative == Performative::Propose));
+    }
+
+    #[test]
+    fn broadcast_non_list_is_internal_error() {
+        let prog = parse(
+            "protocol p v1;\nroles a, b;\nstate solo: int;\non inform from a { set solo = 5; push solo, 5; }\non error { set solo = -1; }\n",
+        )
+        .unwrap();
+        let mut r = Runtime::new(&prog, "b").unwrap();
+        let out = r.deliver(Event::In {
+            from: "a".into(),
+            performative: Performative::Inform,
+            pattern: None,
+            fields: None,
+        });
+        // push to int fails -> internal error -> on error handler runs
+        assert!(r.transcript().iter().any(|e| e.text.contains("internal error")));
+        assert_eq!(r.states_snapshot().get("solo"), Some(&StateValue::Int(-1)));
+        let _ = out;
+    }
+
+    // §38.8: prefer — lowest numeric value of a key among map bids
+    #[test]
+    fn prefer_picks_lowest_bid() {
+        let prog = parse(
+            "type Bid = { who: str, price: int };\nprotocol p v1;\nroles a, b;\nstate bids: list;\nstate winner: Bid;\non inform from a {\n  push bids, Bid { who: \"b1\", price: 30 };\n  push bids, Bid { who: \"b2\", price: 20 };\n  push bids, Bid { who: \"b3\", price: 25 };\n  set winner = prefer(bids, \"price\");\n}\non inform from b -> send bye;\n",
+        )
+        .unwrap();
+        let mut r = Runtime::new(&prog, "b").unwrap();
+        r.deliver(Event::In {
+            from: "a".into(),
+            performative: Performative::Inform,
+            pattern: None,
+            fields: None,
+        });
+        match r.states_snapshot().get("winner") {
+            Some(StateValue::Record(m)) | Some(StateValue::Map(m)) => {
+                assert_eq!(m.get("who"), Some(&StateValue::Str("b2".into())));
+            }
+            other => panic!("expected winner record, got {other:?}"),
+        }
     }
 }

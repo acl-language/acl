@@ -46,6 +46,15 @@ fn py_action(a: &ProtocolAction) -> String {
                 None => "None".into(),
             }
         ),
+        ProtocolAction::Broadcast { performative, fields, to } => format!(
+            "{{\"kind\": \"broadcast\", \"performative\": \"{}\", \"to\": \"{}\", \"fields\": {}}}",
+            py_perf(performative),
+            to,
+            match fields {
+                Some(f) => serde_json::to_string(f).unwrap_or_default(),
+                None => "None".into(),
+            }
+        ),
         ProtocolAction::Begin => "{\"kind\": \"begin\"}".into(),
         ProtocolAction::Fulfil => "{\"kind\": \"fulfil\"}".into(),
         ProtocolAction::Retract { target } => {
@@ -323,6 +332,14 @@ pub fn gen_agent_py(prog: &ProtocolProgram, role: &str) -> Result<String, Vec<cr
             if name == "str": return str(args[0])
             if name == "int": return int(args[0])
             if name == "exists": return args[0] is not None
+            if name == "prefer":
+                # §38.8: lowest value of args[1] among maps in args[0]
+                best = None; best_v = None
+                for m in (args[0] or []):
+                    v = (m or {}).get(args[1])
+                    if isinstance(v, (int, float)) and (best_v is None or v < best_v):
+                        best, best_v = m, v
+                return best
             if name == "first": return args[0][0]
             if name == "last": return args[0][-1]
             if name == "fmt":
@@ -356,6 +373,11 @@ pub fn gen_agent_py(prog: &ProtocolProgram, role: &str) -> Result<String, Vec<cr
             elif a["kind"] == "set":
                 self.states[a["name"]] = self._eval(a["expr"])
                 self.transcript.append(("state", "set:" + a["name"]))
+            elif a["kind"] == "broadcast":
+                # §38.8: fan-out — one send per role in the list state
+                for r in (self.states.get(a["to"]) or []):
+                    self.transcript.append(("out", a["performative"]))
+                    out.append({"to": r, "performative": a["performative"], "fields": a["fields"]})
             elif a["kind"] == "push":
                 cur = self.states.get(a["state"])
                 if cur is None:
