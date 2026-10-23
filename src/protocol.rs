@@ -2044,6 +2044,27 @@ fn check_expr_fields(prog: &ProtocolProgram, e: &Expr, src_line: usize, errors: 
     }
 }
 
+/// §48: flatten NESTED actions (for bodies, try bodies and catches) —
+/// compile-time checks must cover them, not only top-level actions
+pub fn all_actions(actions: &[ProtocolAction]) -> Vec<&ProtocolAction> {
+    fn go<'a>(acts: &'a [ProtocolAction], out: &mut Vec<&'a ProtocolAction>) {
+        for a in acts {
+            out.push(a);
+            match a {
+                ProtocolAction::For { actions, .. } => go(actions, out),
+                ProtocolAction::Try { body, catch } => {
+                    go(body, out);
+                    go(catch, out);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    go(actions, &mut out);
+    out
+}
+
 /// Compile-time well-formedness — the dialogue matrix (§16) applied to the
 /// PROGRAM, not the runtime. Returns warnings; errors abort compilation.
 pub fn check(prog: &ProtocolProgram) -> Result<Vec<String>, Vec<IdlError>> {
@@ -2085,9 +2106,9 @@ pub fn check(prog: &ProtocolProgram) -> Result<Vec<String>, Vec<IdlError>> {
         }
     }
 
-    // §33: every send must be dialogue-legal for its trigger
+    // §33/§48: every send (at ANY nesting level) must be dialogue-legal
     for h in &prog.handlers {
-        for a in &h.actions {
+        for a in all_actions(&h.actions) {
             let out = match a {
                 ProtocolAction::Send { performative: out, .. }
                 | ProtocolAction::Broadcast { performative: out, .. } => *out,
@@ -2383,7 +2404,7 @@ pub fn check(prog: &ProtocolProgram) -> Result<Vec<String>, Vec<IdlError>> {
                     ),
                 });
             }
-            for a in &h.actions {
+            for a in all_actions(&h.actions) {
                 if let ProtocolAction::Send { performative, to: None, .. } = a {
                     if *performative == Performative::Bye {
                         continue; // session terminator
@@ -2415,20 +2436,48 @@ pub fn check(prog: &ProtocolProgram) -> Result<Vec<String>, Vec<IdlError>> {
     for h in &prog.handlers {
         // executors of this handler emit its sends
         for exec in handler_executor(prog, h) {
-            for a in &h.actions {
+            for a in all_actions(&h.actions) {
                 let ProtocolAction::Send { performative, to, .. } = a else { continue };
                 if *performative == Performative::Bye {
                     continue; // session terminator: needs no receiver
                 }
                 let target = to.clone().unwrap_or_else(|| counterpart(exec));
-                let answered = prog.handlers.iter().any(|h2| {
-                    // h2 runs in `target` and listens for this performative
-                    handler_executor(prog, h2).contains(&target.as_str())
-                        && match &h2.trigger {
-                            OnTrigger::Event { performative: p2, .. } => p2 == performative,
-                            _ => false,
+                let send_fields = match a {
+                    ProtocolAction::Send { fields, .. } => fields.clone(),
+                    _ => None,
+                };
+                let mut answered = false;
+                let mut payload_mismatch: Option<String> = None;
+                for h2 in &prog.handlers {
+                    if !handler_executor(prog, h2).contains(&target.as_str()) {
+                        continue;
+                    }
+                    let OnTrigger::Event { performative: p2, pattern, .. } = &h2.trigger else {
+                        continue;
+                    };
+                    if p2 != performative {
+                        continue;
+                    }
+                    // §48: a receiving handler with a content pattern must
+                    // be fed the keys it matches — statically verified
+                    if let (Some(pat), Some(f)) = (pattern, &send_fields) {
+                        if let Ok(want_map) =
+                            serde_json::from_str::<BTreeMap<String, String>>(pat)
+                        {
+                            for key in want_map.keys() {
+                                if !f.contains_key(key) {
+                                    payload_mismatch = Some(format!(
+                                        "'{exec}' sends {performative:?} to '{target}' without key '{key}' but the receiving handler matches {{{key}: ...}}"
+                                    ));
+                                }
+                            }
                         }
-                });
+                    }
+                    answered = true;
+                }
+                if let Some(m) = payload_mismatch {
+                    warnings.push(m);
+                }
                 if !answered {
                     errors.push(IdlError {
                         line: h.line,
@@ -2441,9 +2490,9 @@ pub fn check(prog: &ProtocolProgram) -> Result<Vec<String>, Vec<IdlError>> {
         }
     }
 
-    // ---- §35: set/push/put/for targets must be declared states ----
+    // ---- §35/§48: set/push/put/for targets must be declared states
     for h in &prog.handlers {
-        for a in &h.actions {
+        for a in all_actions(&h.actions) {
             match a {
                 ProtocolAction::Set { name, .. } | ProtocolAction::Push { state: name, .. }
                 | ProtocolAction::Put { state: name, .. } => {
@@ -3770,5 +3819,45 @@ mod tooling_tests {
         let (passed, failed) = crate::scenario::run_all(&p);
         assert!(failed.is_empty(), "{failed:?}");
         assert_eq!(passed.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod nested_analysis_tests {
+    use super::*;
+
+    // §48: a send nested inside `for`/`try` is dialogue-checked
+    #[test]
+    fn nested_send_dialogue_violation_caught() {
+        let src = "protocol p v1;\nroles a, b;\non inform from a { try { send request to b; } catch { send bye; } }\n";
+        let p = parse(src).unwrap();
+        let es = check(&p).unwrap_err();
+        assert!(
+            es.iter().any(|e| e.message.contains("dialogue violation")),
+            "nested send escaped the dialogue check: {es:?}"
+        );
+    }
+
+    #[test]
+    fn nested_send_linearity_caught() {
+        let src = "protocol p v1;\nroles a, b;\nstate xs: list;\non inform from a { try { send query to b; } catch { send bye; } }\non query from b -> send bye;\non inform from b -> send bye;\n";
+        let p = parse(src).unwrap();
+        let es = check(&p).unwrap_err();
+        assert!(
+            es.iter().any(|e| e.message.contains("unanswered send") && e.message.contains("Query")),
+            "nested send escaped linearity: {es:?}"
+        );
+    }
+
+    // §48: receiver with a content pattern fed fewer keys warns
+    #[test]
+    fn payload_key_mismatch_warns() {
+        let src = "protocol p v1;\nroles a, b;\non inform {\"task\": $t} from a -> send inform {\"note\": \"ok\"} to b;\non inform {\"pct\": \"*\"} from a -> send bye;\non inform from b -> send bye;\n";
+        let p = parse(src).unwrap();
+        let warnings = check(&p).expect("warnings");
+        assert!(
+            warnings.iter().any(|w| w.contains("without key 'pct'")),
+            "{warnings:?}"
+        );
     }
 }
