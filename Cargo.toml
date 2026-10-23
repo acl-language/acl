@@ -10,7 +10,7 @@ documentation = "https://github.com/acl-language/acl/blob/main/SPEC.md"
 readme = "README.md"
 keywords = ["agents", "ai", "protocol", "messagepack", "ed25519"]
 categories = ["network-programming", "api-bindings"]
-exclude = ["acl-py/*", "acl-ts/*", "target/*", "tests/*", "stdlib/*", "fuzz/*", "*.md", ".github/*"]
+exclude = ["acl-py/*", "acl-ts/*", "target/*", "tests/*", "fuzz/*", "docs/*", "governance/*", "packaging/*", "scripts/*", ".github/*"]
 
 [lib]
 name = "acl_core"

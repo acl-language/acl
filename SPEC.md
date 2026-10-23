@@ -396,12 +396,20 @@ Binaries:
 
 - `acl-peer` — a complete ACL agent over the stdio transport; implements the
   §8 workflow (`request` → `input_required` → `inform` → `result`), serves
-  `agent.card` queries, handles `bye`.
+  `agent.card` queries, **answers CL fact queries, executes CL actions and
+  rejects ill-formed CL bodies (§6.2)**, handles `bye`.
 - `acl-httpd` — HTTP + SSE server (§9.1): `POST /`, `GET /events`,
   `GET /agent-card`; per-event signatures on the SSE stream.
+- `acl-wsd` — WebSocket server (§9.3).
 - `acl-mcp-bridge` — translates between ACL and a real MCP server
   (JSON-RPC over stdio): `tools/call` ↔ `request`/Task, `tools/list` ↔
   signed AgentCard.
+- `acl-a2a-bridge` — translates between ACL and a real A2A server (HTTP):
+  `message/send` ↔ `request`/Task, Agent Card ↔ AgentCard.
+- `aclc` — the language compiler (§18): `check`/`lint`/`fmt`/`gen
+  rust|py|ts|schema`/`names`.
+- `acl-conformance` — the certification suite (§23): 10 checks, 3 levels.
+- `registry_cli` — local agent registry CLI (§13bis).
 
 ## 11.1 Python binding (`acl-py`)
 
@@ -533,6 +541,12 @@ peers. Reference: `acl_core::registry` + `registry_cli`.
 | epistemic facts (§6.4) | modality/provenance/confidence/validity roundtrip + backward-compat defaults |
 | dialogue rules (§16, `src/dialogue.rs`) | full reply-matrix tests incl. bye-closes-session |
 | formal semantics (§17, `src/semantics.rs`) | FP/RE present for all 14 performatives |
+| runtime schema validation (§19, `src/schema.rs`) | 5/5 tests (valid/missing/wrong-type/extra-param/foreign-ns, alias resolve, composition recursion, commitment act) |
+| declarative workflows (§20, IDL) | parse/typecheck/pretty-roundtrip/codegen tests; `do` targets validated against same-file actions |
+| contract-net protocol (§21, `src/cnp.rs`) | full lifecycle (announce→bid→award→report), award-without-bid rejected, off-policy rejected |
+| DID resolution (§22, `src/did.rs`) | 5/5 tests (roundtrip, malformed rejects, envelope-verify via did:key `from` field, did:web URLs) |
+| batch verification (`src/batch.rs`) | 4/4 tests (all-valid, tampered-index, missing-sig, empty) |
+| conformance suite (§23, `acl-conformance`) | 10/10 checks PASS, COMPLIANT level 3 |
 
 Not yet implemented: sealed-envelope key rotation/HD derivation,
 WS client demo in CI, public governance body.

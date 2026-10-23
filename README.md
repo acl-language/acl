@@ -34,18 +34,29 @@ L4  capability descriptors (AgentCard)
 L3  message semantics (performatives)
 L2  envelope (ids, routing, security)
 L1  wire format (MessagePack)
-L0  transport (stdio/pipes · HTTP · SSE · [WebSocket])
+L0  transport (stdio/pipes · HTTP · SSE · WebSocket)
 ```
+
+Above the core: **IDL compiler** (`aclc`: check/lint/fmt/gen rust|py|ts|schema),
+**stdlib vocabularies** (fs/task/time/net), **dialogue rules** (§16),
+**formal semantics** (FP/RE, §17), **runtime schema validation** (§19),
+**declarative workflows** (§20), **contract-net negotiation** (§21),
+**DID resolution** (§22), and a **conformance suite** (§23, 10 checks / 3 levels).
 
 ## What's here
 
 | component | what it proves |
 |-----------|----------------|
-| [`acl-core`](src/) (Rust) | codec, signing, AgentCard, framing, bridges — 11/11 tests |
-| [`acl-peer`](src/bin/peer.rs) | complete agent over stdio; `input_required` workflow live |
+| [`acl-core`](src/) (Rust) | codec, signing, AgentCard, framing, bridges, CL, dialogue, semantics, schema, cnp, did, batch — 56/56 tests |
+| [`acl-peer`](src/bin/peer.rs) | complete agent over stdio: §8 workflow + **speaks the content language** (§6.2) |
 | [`acl-httpd`](src/bin/httpd.rs) | HTTP + SSE transport; per-event signed stream |
+| [`acl-wsd`](src/bin/wsd.rs) | WebSocket transport (RFC 6455) |
 | [`acl-mcp-bridge`](src/bin/mcp_bridge.rs) | ACL ↔ real MCP server, end-to-end |
+| [`acl-a2a-bridge`](src/bin/a2a_bridge.rs) | ACL ↔ real A2A server (HTTP), end-to-end |
+| [`aclc`](src/bin/aclc.rs) | the language compiler: check/lint/fmt/gen (rust, py, ts, schema) |
+| [`acl-conformance`](src/bin/acl_conformance.rs) | certification suite: 10 checks, 3 levels |
 | [`acl-py`](acl-py/) | native Python binding (PyO3, abi3) |
+| [`acl-ts`](acl-ts/) | native TypeScript/Node binding (napi-rs) |
 | [`py_codec.py`](tests/interop/py_codec.py) | independent codec written **from the spec only** |
 
 ## Interop proof
@@ -76,14 +87,17 @@ env.sign(key)
 
 ## Status
 
-v0.2-draft, Apache-2.0 (SPEC-VERSION 1 on the wire — all changes additive).
+v0.4-draft, Apache-2.0 (SPEC-VERSION 1 on the wire — all changes additive).
 
 Validated end-to-end: stdio/pipes, HTTP sync, SSE streaming (per-event
 signatures), WebSocket, Python + TypeScript bindings, sealed envelopes
 (X25519 + ChaCha20-Poly1305), idempotency, local registry, MCP bridge
 (against a real MCP server), A2A bridge (against a real A2A server over
 HTTP), 3-agent delegate-chain demo, content language (facts/actions/
-queries/commitments) spoken by the reference agent.
+queries/commitments with composition, epistemic modality and provenance)
+spoken by the reference agent, runtime schema validation, declarative
+workflows, contract-net negotiation, DID resolution (did:key offline,
+did:web), batch signature verification, conformance suite (level 3).
 
 ### It is a language, not just a protocol
 
