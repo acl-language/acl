@@ -193,6 +193,21 @@ machine for a delegated task:
 `input_required` is terminal for that turn: the client MUST answer with a new
 `inform` referencing the blocked `target_msg_id` before work resumes.
 
+### 8.1 Idempotency and ordering (normative)
+
+- A client retransmitting (timeout, reconnect) MUST reuse the same `msg_id`
+  and the same body. Receivers MUST deduplicate by `msg_id` within the TTL
+  window: a duplicate MUST NOT be re-processed, but SHOULD be answered with
+  the cached response when one exists.
+- The duplicate check is **semantic**: performative + from/to + body. A
+  re-signed retransmission (new `ts`, same semantics) is a clean duplicate;
+  the same `msg_id` with a DIFFERENT semantics is a protocol violation and
+  MUST be rejected and logged.
+- Messages between two peers are processed in arrival order; there is no
+  global ordering. Applications that need ordering use `reply_with`
+  session keys and `in_reply_to` chains.
+- Relays MUST NOT reorder messages of the same session.
+
 Timeouts: a client SHOULD consider a task failed if no message (including
 `progress`) is received within `ttl` of the last received message.
 

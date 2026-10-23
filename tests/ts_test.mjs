@@ -19,5 +19,5 @@ if (readFrame(framed).toString('hex') !== raw.toString('hex')) throw new Error('
 // tamper: wrong key must fail
 const wrong = new AclKey();
 if (back.verify(wrong.publicBytes())) throw new Error('tamper check failed');
-console.log('msg_id:', env.msg_id, '| msgId via new:', newMsgId().length === 32);
+console.log('msg_id:', env.msgId, '| msgId via new:', newMsgId().length === 32);
 console.log('=== ACL-TS BINDING PASS: sign/verify/decode/framing/tamper OK ===');

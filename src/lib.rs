@@ -6,6 +6,7 @@
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 pub mod bridge;
 pub mod sealed;
+pub mod idempotency;
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use std::io::Read;
