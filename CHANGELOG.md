@@ -60,5 +60,6 @@ First public release.
 - Independent spec-only Python codec; interop validated both directions
 - Robustness fuzz-lite corpus test; codec benchmarks
 
-[Unreleased]: https://github.com/mrschneider/acl/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/mrschneider/acl/releases/tag/v0.1.0
+[Unreleased]: https://github.com/acl-language/acl/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/acl-language/acl/releases/tag/v0.2.0
+[0.1.0]: https://github.com/acl-language/acl/releases/tag/v0.1.0

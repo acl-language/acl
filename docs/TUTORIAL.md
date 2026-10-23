@@ -15,7 +15,7 @@ you (Python client)  ──pipes──►  acl-peer (Rust agent)
 ## 1. Build (2 min)
 
 ```bash
-git clone https://github.com/mrschneider/acl && cd acl
+git clone https://github.com/acl-language/acl && cd acl
 cargo test        # 18+ unit tests
 cargo build --bin peer
 ```

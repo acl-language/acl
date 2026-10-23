@@ -1,6 +1,6 @@
 # ACL — Agent Communication Language
 
-[![CI](https://github.com/mrschneider/acl/actions/workflows/ci.yml/badge.svg)](https://github.com/mrschneider/acl/actions/workflows/ci.yml)
+[![CI](https://github.com/acl-language/acl/actions/workflows/ci.yml/badge.svg)](https://github.com/acl-language/acl/actions/workflows/ci.yml)
 
 A compact, binary, platform-agnostic protocol for communication between
 autonomous AI agents. Designed as an open standard: the same signed envelope
