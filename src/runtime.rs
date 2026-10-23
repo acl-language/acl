@@ -213,6 +213,11 @@ pub enum Event {
     /// §38.7: an internal action failure (set/push/put eval error, send
     /// retry exhaustion) — routed to the session's `on error` handler
     InternalError(String),
+    /// §49: a host time advance — journaled so replay reproduces timers,
+    /// awaits and retry deadlines EXACTLY
+    Tick(i64),
+    /// §49: a session close — journaled so replay closes the same sessions
+    SessionClosed,
     /// the deadline passed
     Expired,
 }
@@ -567,6 +572,11 @@ impl Runtime {
             }
             _ => false,
         }
+    }
+
+    /// §49: the runtime clock (absolute, host-injected) — replay equality
+    pub fn now_ms(&self) -> i64 {
+        self.now_ms
     }
 
     /// §35.9: full state snapshot (for replay verification)
@@ -1656,6 +1666,8 @@ fn event_text(ev: &Event) -> String {
         Event::Breach => "breach".into(),
         Event::Expired => "expired".into(),
         Event::InternalError(r) => format!("internal error: {r}"),
+        Event::Tick(ms) => format!("tick {ms}ms"),
+        Event::SessionClosed => "session closed".into(),
     }
 }
 

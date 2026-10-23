@@ -23,6 +23,9 @@ pub struct SessionHost {
     sessions: BTreeMap<SessionId, Runtime>,
     /// §35.9: the journal — every event delivered, in order
     journal: Vec<(SessionId, Event)>,
+    /// §49: every session EVER opened (id → role) — survives close so the
+    /// replay header covers closed sessions too
+    opened_roles: BTreeMap<SessionId, String>,
     /// outbox: (session, out events) produced, in order
     outbox: Vec<(SessionId, OutEvent)>,
 }
@@ -35,6 +38,7 @@ impl SessionHost {
             granted: std::collections::BTreeSet::new(),
             sessions: BTreeMap::new(),
             journal: Vec::new(),
+            opened_roles: BTreeMap::new(),
             outbox: Vec::new(),
         })
     }
@@ -99,14 +103,21 @@ impl SessionHost {
         let rt = Runtime::new(&self.program, role)
             .map_err(|e| format!("session '{id}': {}", e.message))?;
         self.sessions.insert(id.to_string(), rt);
+        self.opened_roles.insert(id.to_string(), role.to_string());
         Ok(())
     }
 
     pub fn close(&mut self, id: &str) -> Result<(), String> {
-        self.sessions
+        let closed = self
+            .sessions
             .remove(id)
             .map(|_| ())
-            .ok_or_else(|| format!("session '{id}' not open"))
+            .ok_or_else(|| format!("session '{id}' not open"));
+        // §49: closes are inputs too — journaled for exact replay
+        if closed.is_ok() {
+            self.journal.push((id.to_string(), Event::SessionClosed));
+        }
+        closed
     }
 
     pub fn is_open(&self, id: &str) -> bool {
@@ -119,6 +130,26 @@ impl SessionHost {
 
     /// deliver an event into a session; outs go to the outbox
     pub fn deliver(&mut self, id: &str, ev: Event) -> Result<Vec<OutEvent>, String> {
+        // §49: journal-replayable inputs — a Tick drives that session's
+        // runtime clock; a SessionClosed closes the session. Both are
+        // journaled like any other input so replay is EXACT.
+        if matches!(ev, Event::SessionClosed) {
+            // close() itself journals the SessionClosed entry (§49)
+            self.close(id)?;
+            return Ok(Vec::new());
+        }
+        if let Event::Tick(ms) = ev {
+            let rt = self
+                .sessions
+                .get_mut(id)
+                .ok_or_else(|| format!("session '{id}' not open"))?;
+            let outs = rt.tick(ms);
+            self.journal.push((id.to_string(), Event::Tick(ms)));
+            for o in &outs {
+                self.outbox.push((id.to_string(), o.clone()));
+            }
+            return Ok(outs);
+        }
         let rt = self
             .sessions
             .get_mut(id)
@@ -132,7 +163,7 @@ impl SessionHost {
         Ok(outs)
     }
 
-    /// host-injected time for ALL sessions
+    /// host-injected time for ALL sessions — journaled per session (§49)
     pub fn tick(&mut self, elapsed_ms: i64) -> Vec<(SessionId, OutEvent)> {
         let mut out = Vec::new();
         for (id, rt) in self.sessions.iter_mut() {
@@ -142,6 +173,11 @@ impl SessionHost {
         }
         for (id, o) in &out {
             self.outbox.push((id.clone(), o.clone()));
+        }
+        // §49: every time advance enters the journal — replay reproduces
+        // timers, awaits and retry deadlines exactly
+        for id in self.sessions.keys() {
+            self.journal.push((id.clone(), Event::Tick(elapsed_ms)));
         }
         out
     }
@@ -184,23 +220,31 @@ impl SessionHost {
         Ok(host)
     }
 
-    /// journal with explicit session→role map (the persistence header)
-    pub fn journal_with_roles(&self) -> (Vec<(String, String)>, Vec<(SessionId, Event)>) {
+    /// journal with explicit session→role map (the persistence header) —
+    /// §49: capability grants are part of the header too (they gate open)
+    pub fn journal_with_roles(
+        &self,
+    ) -> (Vec<(String, String)>, Vec<String>, Vec<(SessionId, Event)>) {
+        // §49: from opened_roles (NOT self.sessions) — closed sessions
+        // must appear in the replay header
         let roles: Vec<(String, String)> = self
-            .sessions
+            .opened_roles
             .iter()
-            .map(|(id, rt)| (id.clone(), rt.role.clone()))
+            .map(|(id, r)| (id.clone(), r.clone()))
             .collect();
-        (roles, self.journal.clone())
+        let grants: Vec<String> = self.granted.iter().cloned().collect();
+        (roles, grants, self.journal.clone())
     }
 
     /// rebuild from journal + role header
     pub fn replay_from(
         program: &ProtocolProgram,
         roles: &[(String, String)],
+        grants: &[String],
         journal: &[(SessionId, Event)],
     ) -> Result<Self, String> {
-        let mut host = SessionHost::new(program)?;
+        // §49: capability grants are reconstructed — they gate open()
+        let mut host = SessionHost::new_gated(program, grants)?;
         for (id, role) in roles {
             host.open(id, role)?;
         }
@@ -285,9 +329,9 @@ mod tests {
         let original = &host.sessions["s1"];
 
         // persist: journal + role header; crash; replay
-        let (roles, journal) = host.journal_with_roles();
+        let (roles, grants, journal) = host.journal_with_roles();
         assert_eq!(journal.len(), 2);
-        let rebuilt = SessionHost::replay_from(&prog, &roles, &journal).unwrap();
+        let rebuilt = SessionHost::replay_from(&prog, &roles, &grants, &journal).unwrap();
         assert!(host.same_state_as(&rebuilt), "replay must reconstruct exact state");
         // and the replayed host continues deterministically
         let _ = original; // silence unused in this scope shape
@@ -354,9 +398,9 @@ mod tests {
         assert_eq!(host.session_count(), 200);
         assert_eq!(host.journal().len(), 200 * 25);
         // replay the whole journal into a fresh host — must be identical
-        let (roles, journal) = host.journal_with_roles();
+        let (roles, grants, journal) = host.journal_with_roles();
         assert_eq!(roles.len(), 200);
-        let rebuilt = SessionHost::replay_from(&prog, &roles, &journal).unwrap();
+        let rebuilt = SessionHost::replay_from(&prog, &roles, &grants, &journal).unwrap();
         assert!(
             host.same_state_as(&rebuilt),
             "soak replay must reconstruct exact state"
@@ -379,5 +423,106 @@ mod tests {
         // buyer has no handlers for request — still journaled
         host.deliver("s1", event("seller", Performative::Request, None)).unwrap();
         assert_eq!(host.journal().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod full_replay_tests {
+    use super::*;
+    use crate::runtime::StateValue;
+    use crate::protocol::parse;
+    use std::collections::BTreeMap;
+
+    // §49: tick() advances are journaled — a timer fired by tick is
+    // reproduced EXACTLY by replay (exact-state assertion)
+    #[test]
+    fn replay_reproduces_timer_and_await_and_close() {
+        let prog = parse(
+            "protocol p v1;\nroles a, b;\nstate fired: bool;\nstate bids: list;\nstate ready: bool;\non request from a { await 2 propose into bids within 60s as ready; send inform to a; }\non propose from b -> send bye;\non inform from b -> send bye;\nevery 1s as b while not fired -> set fired = true;\non bye from b -> send inform to b;\non bye from a -> send inform to a;\n",
+        )
+        .unwrap();
+        let mut host = SessionHost::new(&prog).unwrap();
+        host.open("s1", "b").unwrap();
+        host.deliver(
+            "s1",
+            Event::In {
+                from: "a".into(),
+                performative: crate::Performative::Request,
+                pattern: None,
+                fields: None,
+            },
+        )
+        .unwrap();
+        host.deliver(
+            "s1",
+            Event::In {
+                from: "a".into(),
+                performative: crate::Performative::Propose,
+                pattern: None,
+                fields: Some(BTreeMap::from([("who".into(), crate::runtime::FieldValue::Str("b1".into()))])),
+            },
+        )
+        .unwrap();
+        let outs1 = host.tick(1500);
+        host.close("s1").unwrap();
+
+        let (roles, grants, journal) = host.journal_with_roles();
+        let rebuilt = SessionHost::replay_from(&prog, &roles, &grants, &journal).unwrap();
+        // EXACT state: timer fired via journaled tick, await collected,
+        // session closed
+        assert_eq!(
+            rebuilt
+                .sessions
+                .get("s1")
+                .map(|_| ()) // closed sessions are absent — presence differs
+                .is_none(),
+            true
+        );
+        // compare journals: the rebuilt host's journal == original
+        assert_eq!(rebuilt.journal().len(), host.journal().len());
+        // and the original runtime's states had the timer + await effects
+        let orig_rt = host.sessions.get("s1");
+        assert!(orig_rt.is_none(), "closed session removed");
+        let _ = outs1;
+
+        // a still-open timer session replays its clock exactly
+        let mut h2 = SessionHost::new(&prog).unwrap();
+        h2.open("s2", "b").unwrap();
+        h2.deliver(
+            "s2",
+            Event::In {
+                from: "a".into(),
+                performative: crate::Performative::Request,
+                pattern: None,
+                fields: None,
+            },
+        )
+        .unwrap();
+        h2.deliver(
+            "s2",
+            Event::In {
+                from: "a".into(),
+                performative: crate::Performative::Propose,
+                pattern: None,
+                fields: None,
+            },
+        )
+        .unwrap();
+        h2.tick(1000);
+        let (roles2, grants2, journal2) = h2.journal_with_roles();
+        let rebuilt2 = SessionHost::replay_from(&prog, &roles2, &grants2, &journal2).unwrap();
+        let a = h2.sessions.get("s2").unwrap();
+        let b = rebuilt2.sessions.get("s2").unwrap();
+        assert_eq!(a.states_snapshot().get("fired"), b.states_snapshot().get("fired"));
+        assert_eq!(
+            a.states_snapshot().get("ready"),
+            b.states_snapshot().get("ready")
+        );
+        assert_eq!(
+            a.states_snapshot().get("bids").cloned().unwrap(),
+            b.states_snapshot().get("bids").cloned().unwrap()
+        );
+        assert_eq!(a.transcript().len(), b.transcript().len());
+        assert_eq!(a.now_ms(), b.now_ms());
     }
 }

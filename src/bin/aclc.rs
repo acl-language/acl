@@ -247,7 +247,7 @@ fn main() {
                         },
                     ));
                 }
-                match acl_core::session::SessionHost::replay_from(&prog, &roles, &events) {
+                match acl_core::session::SessionHost::replay_from(&prog, &roles, &[], &events) {
                     Ok(host) => {
                         println!("{f}: replayed {} events across {} sessions", events.len(), host.session_count());
                         for (id, rt) in host.sessions_iter() {
