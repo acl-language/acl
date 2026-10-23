@@ -49,8 +49,11 @@ fn py_action(a: &ProtocolAction) -> String {
         ProtocolAction::Retract { target } => {
             format!("{{\"kind\": \"retract\", \"target\": \"{}\"}}", target)
         }
-        ProtocolAction::Set { name, expr } => format!(
-            "{{\"kind\": \"set\", \"name\": \"{}\", \"expr\": {}}}", name, py_expr(expr)
+        ProtocolAction::Set { name, field, expr } => format!(
+            "{{\"kind\": \"set\", \"name\": \"{}\", \"field\": {}, \"expr\": {}}}",
+            name,
+            match field { Some(f) => format!("\"{f}\""), None => "null".into() },
+            py_expr(expr),
         ),
         ProtocolAction::Push { state, expr } => format!(
             "{{\"kind\": \"push\", \"state\": \"{}\", \"expr\": {}}}", state, py_expr(expr)
@@ -66,6 +69,10 @@ fn py_action(a: &ProtocolAction) -> String {
             )
         }
         ProtocolAction::Abort => "{\"kind\": \"abort\"}".into(),
+        ProtocolAction::Return { expr } => format!(
+            "{{\"kind\": \"return\", \"expr\": {}}}",
+            py_expr(expr)
+        ),
     }
 }
 
@@ -75,6 +82,14 @@ fn py_expr(e: &Expr) -> String {
         Expr::LitStr(s) => format!("{{\"lit\": {}}}", serde_json::to_string(s).unwrap_or_default()),
         Expr::LitBool(b) => format!("{{\"lit\": {}}}", b),
         Expr::State(n) => format!("{{\"state\": \"{}\"}}", n),
+        Expr::Field { base, name } => format!(
+            "{{\"field\": {{\"base\": {}, \"name\": \"{}\"}}}}",
+            py_expr(base), name
+        ),
+        Expr::RecLit { ty, fields } => {
+            let f: Vec<String> = fields.iter().map(|(n, e)| format!("\"{}\": {}", n, py_expr(e))).collect();
+            format!("{{\"rec\": \"{}\", \"fields\": {{{}}}}}", ty, f.join(", "))
+        }
         Expr::Arg(a) => format!("{{\"arg\": \"{}\"}}", a),
         Expr::Bin { op, l, r } => {
             let o = match op {

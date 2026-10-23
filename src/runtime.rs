@@ -167,6 +167,7 @@ pub fn project(prog: &ProtocolProgram, role: &str) -> Result<RoleEndpoint, Vec<I
 /// Session variable value (phase 2: the types the runtime understands).
 #[derive(Debug, Clone, PartialEq)]
 pub enum StateValue {
+    Record(std::collections::BTreeMap<String, StateValue>),
     Bool(bool),
     Int(i64),
     Str(String),
@@ -241,6 +242,8 @@ pub struct Runtime {
     end_when: Option<EndWhen>,
     program_states: BTreeMap<String, String>,
     states: BTreeMap<String, StateValue>,
+    /// §38.1: user-defined functions available to this role
+    functions: BTreeMap<String, crate::protocol::Function>,
     commitment: CommitmentStatus,
     log: Vec<LogEntry>,
     seq: u64,
@@ -263,6 +266,9 @@ pub struct Runtime {
     /// §35.4: abort conditions from the program
     abort_when: Vec<crate::protocol::Guard>,
 }
+
+static EMPTY_SCOPE: std::sync::LazyLock<BTreeMap<String, StateValue>> =
+    std::sync::LazyLock::new(|| BTreeMap::new());
 
 impl Runtime {
     pub fn new(prog: &ProtocolProgram, role: &str) -> Result<Self, IdlError> {
@@ -291,6 +297,11 @@ impl Runtime {
                 .states
                 .iter()
                 .map(|s| (s.name.clone(), StateValue::Unset))
+                .collect(),
+            functions: prog
+                .functions
+                .iter()
+                .map(|f| (f.name.clone(), f.clone()))
                 .collect(),
             commitment: CommitmentStatus::Proposed,
             log: Vec::new(),
@@ -348,28 +359,28 @@ impl Runtime {
     }
 
     /// §35.1: evaluate a pure expression against state + event fields
-    fn eval(&self, e: &Expr, ev: &Event) -> Result<StateValue, String> {
+    fn eval(&self, e: &Expr, ev: &Event, scope: &BTreeMap<String, StateValue>) -> Result<StateValue, String> {
         let arg = match ev {
             Event::In { fields, .. } => fields.clone().unwrap_or_default(),
             _ => BTreeMap::new(),
         };
-        let eval = |e: &Expr, s: &Runtime| -> Result<StateValue, String> { s.eval(e, ev) };
+        let eval = |e: &Expr, s: &Runtime, sc: &BTreeMap<String, StateValue>| -> Result<StateValue, String> { s.eval(e, ev, sc) };
         Ok(match e {
             Expr::LitInt(i) => StateValue::Int(*i),
             Expr::LitStr(s) => StateValue::Str(s.clone()),
             Expr::LitBool(b) => StateValue::Bool(*b),
-            Expr::State(n) => self.states.get(n).cloned().unwrap_or(StateValue::Unset),
+            Expr::State(n) => scope.get(n).cloned().unwrap_or_else(|| self.states.get(n).cloned().unwrap_or(StateValue::Unset)),
             Expr::Arg(a) => match arg.get(a) {
                 Some(s) => StateValue::Str(s.clone()),
                 None => StateValue::Unset,
             },
-            Expr::Not(x) => match eval(x, self)? {
+            Expr::Not(x) => match eval(x, self, scope)? {
                 StateValue::Bool(b) => StateValue::Bool(!b),
                 other => StateValue::Bool(!self.truthy(&other)),
             },
             Expr::Bin { op, l, r } => {
-                let lv = eval(l, self)?;
-                let rv = eval(r, self)?;
+                let lv = eval(l, self, scope)?;
+                let rv = eval(r, self, scope)?;
                 use crate::protocol::BinOp::*;
                 match op {
                     And => StateValue::Bool(self.truthy(&lv) && self.truthy(&rv)),
@@ -381,10 +392,26 @@ impl Runtime {
                     Add | Sub | Mul | Div => arithmetic(&lv, &rv, *op)?,
                 }
             }
+            Expr::Field { base, name } => {
+                let b = eval(base, self, scope)?;
+                match b {
+                    StateValue::Record(m) => m.get(name).cloned().unwrap_or(StateValue::Unset),
+                    StateValue::Map(m) => m.get(name).cloned().unwrap_or(StateValue::Unset),
+                    _ => StateValue::Unset,
+                }
+            }
+            Expr::RecLit { ty, fields } => {
+                let mut m = std::collections::BTreeMap::new();
+                m.insert("__type".to_string(), StateValue::Str(ty.clone()));
+                for (n, e) in fields {
+                    m.insert(n.clone(), eval(e, self, scope)?);
+                }
+                StateValue::Record(m)
+            }
             Expr::Call { name, args } => {
                 let vals: Vec<StateValue> = args
                     .iter()
-                    .map(|a| eval(a, self))
+                    .map(|a| eval(a, self, scope))
                     .collect::<Result<_, _>>()?;
                 if name == "fmt" {
                     // fmt(template_name, args...) — §35.3 user templates
@@ -416,6 +443,7 @@ impl Runtime {
             StateValue::Str(s) => !s.is_empty(),
             StateValue::List(l) => !l.is_empty(),
             StateValue::Map(m) => !m.is_empty(),
+            StateValue::Record(m) => !m.is_empty(),
             StateValue::Unset => false,
         }
     }
@@ -431,6 +459,7 @@ impl Runtime {
                     StateValue::Str(s) => !s.is_empty(),
                     StateValue::List(l) => !l.is_empty(),
                     StateValue::Map(m) => !m.is_empty(),
+                    StateValue::Record(m) => !m.is_empty(),
                     StateValue::Unset => false,
                 };
                 (k.clone(), b)
@@ -483,10 +512,11 @@ impl Runtime {
                 }
             }
         }
-        let mut out = match self.matching_handler(&ev) {
-            Some(hidx) => self.run_handler(hidx, &ev),
-            None => Vec::new(),
+        let (hidx, captures) = match self.matching_handler(&ev) {
+            Some((hidx, caps)) => (hidx, caps),
+            None => return Vec::new(),
         };
+        let mut out = self.run_handler(hidx, &ev, captures);
         // §35.4: abort conditions — checked after every delivery; when a
         // guard holds, compensation handlers run once (latched)
         if !self.aborted {
@@ -503,9 +533,10 @@ impl Runtime {
         out
     }
 
-    fn matching_handler(&self, ev: &Event) -> Option<usize> {
-        self.endpoint.handlers.iter().position(|h| match (&h.trigger, ev) {
+    fn matching_handler(&self, ev: &Event) -> Option<(usize, BTreeMap<String, StateValue>)> {
+        self.endpoint.handlers.iter().enumerate().find_map(|(i, h)| match (&h.trigger, ev) {
             (OnTrigger::Event { performative, pattern, from, .. }, Event::In { from: f, performative: p, pattern: pat, fields }) => {
+                let mut captures: BTreeMap<String, StateValue> = BTreeMap::new();
                 let content_ok = match (pattern.as_ref(), pat.as_ref(), fields) {
                     // no pattern declared: matches anything
                     (None, ..) => true,
@@ -522,6 +553,15 @@ impl Runtime {
                                     Some(got_v) if want_v.ends_with('*') => {
                                         got_v.starts_with(want_v.trim_end_matches('*'))
                                     }
+                                    // §35.5: capture variables `{"k": "$var"}`
+                                    // — the event's value is bound to `var`
+                                    Some(got_v) if want_v.starts_with('$') => {
+                                        captures.insert(
+                                            want_v[1..].to_string(),
+                                            StateValue::Str(got_v.clone()),
+                                        );
+                                        true
+                                    }
                                     Some(got_v) => got_v == want_v,
                                 }
                             }),
@@ -533,18 +573,22 @@ impl Runtime {
                     _ => false,
                 };
                 let guard_ok = h.guard.as_ref().map_or(true, |g| g.eval(&self.bool_view()));
-                content_ok
+                if content_ok
                     && guard_ok
                     && from.as_ref().map_or(true, |want| want == f)
                     && (performative == p)
+                {
+                    return Some((i, captures));
+                }
+                None
             }
-            (OnTrigger::Breach, Event::Breach) => true,
-            (OnTrigger::Expired, Event::Expired) => true,
-            _ => false,
+            (OnTrigger::Breach, Event::Breach) => Some((i, BTreeMap::new())),
+            (OnTrigger::Expired, Event::Expired) => Some((i, BTreeMap::new())),
+            _ => None,
         })
     }
 
-    fn run_handler(&mut self, hidx: usize, ev: &Event) -> Vec<OutEvent> {
+    fn run_handler(&mut self, hidx: usize, ev: &Event, captures: BTreeMap<String, StateValue>) -> Vec<OutEvent> {
         let actions = self.endpoint.handlers[hidx].actions.clone();
         let mut out = Vec::new();
         for a in &actions {
@@ -574,14 +618,14 @@ impl Runtime {
                     }
                     out.push(OutEvent { to: to.clone(), performative: *performative, fields: fields.clone() });
                 }
-                ProtocolAction::Set { name, expr } => match self.eval(expr, ev) {
+                ProtocolAction::Set { name, field, expr } => match self.eval(expr, ev, &captures) {
                     Ok(v) => {
                         self.log(Dir::State, format!("set {} = {}", name, value_text(&v)));
                         self.set_state(name, v);
                     }
                     Err(e) => self.log(Dir::State, format!("set {} failed: {}", name, e)),
                 },
-                ProtocolAction::Push { state, expr } => match self.eval(expr, ev) {
+                ProtocolAction::Push { state, expr } => match self.eval(expr, ev, &captures) {
                     Ok(v) => {
                         let is_list = matches!(self.states.get(state), Some(StateValue::List(_)) | Some(StateValue::Unset) | None);
                         if !is_list {
@@ -599,7 +643,7 @@ impl Runtime {
                     }
                     Err(e) => self.log(Dir::State, format!("push {} failed: {}", state, e)),
                 },
-                ProtocolAction::Put { state, key, expr } => match self.eval(expr, ev) {
+                ProtocolAction::Put { state, key, expr } => match self.eval(expr, ev, &captures) {
                     Ok(v) => {
                         let is_map = matches!(self.states.get(state), Some(StateValue::Map(_)) | Some(StateValue::Unset) | None);
                         if !is_map {
@@ -645,7 +689,11 @@ impl Runtime {
                         }
                     }
                 }
-                ProtocolAction::Abort => {
+                ProtocolAction::Return { expr } => {
+                // Evaluated but not printed in the transcript
+                let _ = self.eval(expr, ev, &captures);
+            }
+            ProtocolAction::Abort => {
                     // §35.4: fire compensation handlers, mark breached
                     self.log(Dir::State, "ABORT: compensation begins".into());
                     self.commitment = CommitmentStatus::Breached;
@@ -658,7 +706,7 @@ impl Runtime {
                         .map(|(i, _)| i)
                         .collect();
                     for i in abort_handlers {
-                        out.extend(self.run_handler(i, &Event::Breach));
+                        out.extend(self.run_handler(i, &Event::Breach, BTreeMap::new()));
                     }
                 }
                 ProtocolAction::Begin => match self.commitment {
@@ -732,7 +780,7 @@ impl Runtime {
                                 .map(|(i, _)| i)
                                 .collect();
                             for i in comp {
-                                out.extend(self.run_handler(i, ev));
+                                out.extend(self.run_handler(i, ev, BTreeMap::new()));
                             }
                         }
                         _ => unreachable!(),
@@ -743,7 +791,7 @@ impl Runtime {
                     let h = Handler { trigger: OnTrigger::Expired, guard: None, actions: vec![other.clone()] };
                     self.endpoint.handlers.push(h);
                     let idx = self.endpoint.handlers.len() - 1;
-                    out.extend(self.run_handler(idx, ev));
+                    out.extend(self.run_handler(idx, ev, BTreeMap::new()));
                     self.endpoint.handlers.pop();
                 }
             }
@@ -778,7 +826,7 @@ impl Runtime {
             while self.timer_due[i] + every_ms <= elapsed_ms {
                 self.timer_due[i] += every_ms;
                 self.log(Dir::In, format!("timer({}ms)", every_ms));
-                out.extend(self.run_handler(i, &Event::Expired));
+                out.extend(self.run_handler(i, &Event::Expired, BTreeMap::new()));
             }
         }
         // §35.5: retry pending sends when due; exhaustion = retry dropped
@@ -1025,6 +1073,7 @@ fn value_text(v: &StateValue) -> String {
         StateValue::Str(s) => s.clone(),
         StateValue::List(_) => "<list>".into(),
         StateValue::Map(_) => "<map>".into(),
+        StateValue::Record(_) => "<record>".into(),
         StateValue::Unset => "<unset>".into(),
     }
 }

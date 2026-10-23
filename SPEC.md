@@ -1,6 +1,6 @@
 # ACL — Agent Communication Language
 
-**Version:** 0.13.0-draft
+**Version:** 0.14.0-draft
 **Status:** Draft specification
 **License:** Apache-2.0 (spec + reference implementation)
 
@@ -1257,3 +1257,25 @@ action file_read(path: Path) -> string;
   push.
 - Generated builders produce CL expressions bound to the declared,
   type-checked names — the vocabulary contract travels with the code.
+
+## 38. Formal grammar (normative)
+
+The complete grammar of the language — lexical tokens, program
+structure, handlers, actions, expressions, guards, scenarios, and
+top-level declarations — is normatively defined in Extended Backus-Naur
+Form (EBNF) in [GRAMMAR.md](GRAMMAR.md). The recursive-descent parser in
+`src/protocol.rs` implements that grammar; when the parser and the
+grammar disagree, the grammar wins (or the grammar has a bug — then fix
+the grammar and cite the evidence).
+
+The grammar also defines:
+
+- **Scopes and resolution** — global (session states), function-local
+  (parameters + locals, shadowing globals), handler (captures shadow
+  states), and loop scope (§38.9 of GRAMMAR.md).
+- **Semantic rules** — dialogue matrix (E014), linearity (E015),
+  liveness (W201), guard types (E020), type checking (E021), function
+  return (E030), capability gate (E040).
+
+Error codes are normative: implementations must use the same codes for
+the same classes of violation, so that diagnostics are portable.

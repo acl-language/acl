@@ -166,7 +166,8 @@ env.encode()   # → msgpack bytes, ready for any transport
 
 ## Documents
 
-- **Spec**: [SPEC.md](SPEC.md) — 37 sections, normative
+- **Spec**: [SPEC.md](SPEC.md) — 38 sections, normative
+- **Grammar**: [GRAMMAR.md](GRAMMAR.md) — formal EBNF definition of the language
 - **For AI agents**: [llms.txt](llms.txt)
 - **Tutorial**: [docs/TUTORIAL.md](docs/TUTORIAL.md) — two agents talking in 10 minutes
 - **Benchmarks**: [BENCH.md](BENCH.md) — codec + ACL-vs-natural-language comparison

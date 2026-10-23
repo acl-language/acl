@@ -58,6 +58,7 @@ fn main() {
                                             acl_core::protocol::ProtocolAction::Begin => "begin".into(),
                                             acl_core::protocol::ProtocolAction::Fulfil => "fulfil".into(),
                                             acl_core::protocol::ProtocolAction::Retract { target } => format!("retract({target})"),
+                                            acl_core::protocol::ProtocolAction::Return { .. } => "return".into(),
                                             acl_core::protocol::ProtocolAction::Set { name, .. } => format!("set {name}"),
                                             acl_core::protocol::ProtocolAction::Push { state, .. } => format!("push {state}"),
                                             acl_core::protocol::ProtocolAction::Put { state, key, .. } => format!("put {state}[{key}]"),

@@ -6,6 +6,19 @@ Format based on Keep a Changelog; versions follow semver for the
 
 ## [Unreleased]
 
+## [0.14.0] — 2026-10-23
+
+### Added
+- **Formal grammar** (`GRAMMAR.md`): complete EBNF definition of the
+  language — lexical tokens, program structure, handlers, actions,
+  expressions, guards, scenarios, scopes, and semantic rules with
+  normative error codes (E014/E015/E020/E021/E030/E040, W201).
+- **Spec §38**: the grammar is now normative — parser and grammar must
+  agree; disagreements are spec bugs.
+- **Language features** (implemented in v0.13.x cycle, now documented):
+  user-defined functions (§38.1), record types with field access and
+  literals (§38.2), pattern matching with variable capture (`$var`).
+
 ## [0.13.0] — 2026-10-23
 
 Hardening and real-world readiness: the security TODOs are closed and

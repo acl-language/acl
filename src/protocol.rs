@@ -47,8 +47,9 @@ pub enum ProtocolAction {
     Fulfil,
     /// `retract(fact_name)` — belief revision as a statement (§32.1)
     Retract { target: String },
-    /// §35.1: `set <state> = <expr>;`
-    Set { name: String, expr: Expr },
+    /// §35.1: `set <state> = <expr>;` — `field` targets a record field
+    /// (`set q.price = 5;`)
+    Set { name: String, field: Option<String>, expr: Expr },
     /// §35.2: `push <state>, <expr>;` — append to a list state
     Push { state: String, expr: Expr },
     /// §35.2: `put <state>, <key>, <expr>;` — set a map entry
@@ -57,6 +58,8 @@ pub enum ProtocolAction {
     For { var: String, over: String, actions: Vec<ProtocolAction> },
     /// §35.4: `abort;` — trigger compensation handlers immediately
     Abort,
+    /// §38.1: `return <expr>;` — only legal inside a function body
+    Return { expr: Expr },
 }
 
 /// §35.5: retry policy on sends — declarative, driven by the runtime's
@@ -157,8 +160,14 @@ pub enum Expr {
     Bin { op: BinOp, l: Box<Expr>, r: Box<Expr> },
     Not(Box<Expr>),
     /// builtin pure functions: add sub mul div min max len sum count
-    /// concat upper lower str int exists abs
+    /// concat upper lower str int exists abs — plus user-defined
+    /// §38.1 functions (resolved after builtins)
     Call { name: String, args: Vec<Expr> },
+    /// §38.2: field access on records: `last_quote.price`
+    Field { base: Box<Expr>, name: String },
+    /// §38.2: record literal: `make(Quote, price: 5, currency: "usd")`
+    /// (parsed via Call when the callee names a declared type)
+    RecLit { ty: String, fields: Vec<(String, Expr)> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -246,6 +255,23 @@ impl Expr {
                         "false" => Ok(Expr::LitBool(false)),
                         "not" => Ok(Expr::Not(Box::new(self.atom_add()?))),
                         _ if w.starts_with("arg.") => Ok(Expr::Arg(w[4..].to_string())),
+                        _ if w.contains('.') && !w.starts_with('.') => {
+                            // §38.2: field access chain `q.price` — the
+                            // head segment is a state name, the rest are
+                            // record fields
+                            let mut segs = w.split('.');
+                            let head = segs.next().unwrap_or_default().to_string();
+                            let mut e = if head == "arg" {
+                                // `arg.x.y` is arg field "x.y"
+                                Expr::Arg(w[4..].to_string())
+                            } else {
+                                Expr::State(head)
+                            };
+                            for f in segs {
+                                e = Expr::Field { base: Box::new(e), name: f.to_string() };
+                            }
+                            Ok(e)
+                        }
                         _ if self.peek().map_or(false, |t| matches!(t, Tok::Op("("))) => {
                             // function call
                             self.next(); // consume (
@@ -386,6 +412,22 @@ pub struct ProtocolProgram {
     pub scenarios: Vec<Scenario>,
     /// §35.3: user-defined message templates `message name = "text";`
     pub templates: Vec<(String, String)>,
+    /// §38.1: user-defined functions `fn f(x: int) -> int { ... }`
+    pub functions: Vec<Function>,
+    /// §38.2: user-defined record types `type Quote = { price: int };`
+    pub types: BTreeMap<String, Vec<(String, String)>>,
+}
+
+/// §38.1: a user-defined function — pure computation over parameters and
+/// session state; parameters and locals are function-scoped.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Function {
+    pub name: String,
+    pub params: Vec<(String, String)>,
+    pub ret: Option<String>,
+    /// body: `set <local> = <expr>;` + one `return <expr>;`
+    pub body: Vec<ProtocolAction>,
+    pub returned: Option<Expr>,
 }
 
 /// §35.6: capability declaration — the ONLY door to external effects.
@@ -525,6 +567,7 @@ pub fn parse(src: &str) -> Result<ProtocolProgram, Vec<IdlError>> {
     let mut seen_protocol = false;
     let mut handler: Option<Handler> = None;
     let mut scenario: Option<Scenario> = None;
+    let mut func: Option<Function> = None;  // §38.1 WIP
 
     for (idx, raw) in src.lines().enumerate() {
         let line_no = idx + 1;
@@ -537,6 +580,96 @@ pub fn parse(src: &str) -> Result<ProtocolProgram, Vec<IdlError>> {
         }
         .trim();
         if line.is_empty() {
+            continue;
+        }
+
+        // §38.1: inside a function body — collect statements until `}`
+        if let Some(f) = func.as_mut() {
+            if line == "}" {
+                let f = func.take().unwrap();
+                if f.returned.is_none() {
+                    errors.push(IdlError {
+                        line: line_no,
+                        message: format!("fn '{}' has no return statement", f.name),
+                    });
+                }
+                prog.functions.push(f);
+                continue;
+            }
+            match parse_action(line) {
+                Ok(ProtocolAction::Set { name, field, expr }) => {
+                    if field.is_some() {
+                        errors.push(IdlError {
+                            line: line_no,
+                            message: format!("field assignment '{}' not allowed inside fn", name),
+                        });
+                        continue;
+                    }
+                    f.body.push(ProtocolAction::Set { name, field, expr });
+                }
+                Ok(ProtocolAction::Return { expr }) => {
+                    f.returned = Some(expr);
+                }
+                Ok(other) => errors.push(IdlError {
+                    line: line_no,
+                    message: format!("only 'set' and 'return' allowed in fn body, got {other:?}"),
+                }),
+                Err(e) => errors.push(IdlError { line: line_no, message: e }),
+            }
+            continue;
+        }
+
+        // §38.1: `fn name(p1: t1, p2: t2) -> ret {`
+        if line.starts_with("fn ") && line.ends_with('{') {
+            let head = &line[3..line.len() - 1];
+            let (sig, ret) = match head.split_once("->") {
+                Some((a, b)) => (a.trim(), Some(b.trim().to_string())),
+                None => (head.trim(), None),
+            };
+            let (name, params_src) = match sig.split_once('(') {
+                Some((n, p)) => (n.trim().to_string(), p.trim_end_matches(')').trim().to_string()),
+                None => {
+                    errors.push(IdlError { line: line_no, message: format!("bad fn decl: '{line}'") });
+                    continue;
+                }
+            };
+            let params: Vec<(String, String)> = if params_src.is_empty() {
+                Vec::new()
+            } else {
+                params_src
+                    .split(',')
+                    .filter_map(|p| {
+                        let p = p.trim();
+                        p.split_once(':').map(|(n, t)| (n.trim().to_string(), t.trim().to_string()))
+                    })
+                    .collect()
+            };
+            func = Some(Function { name, params, ret, body: Vec::new(), returned: None });
+            continue;
+        }
+
+        // §38.2: `type Name = { field: ty, ... };`
+        if let Some(rest) = line.strip_prefix("type ") {
+            let body = rest.trim_end_matches(';').trim();
+            if let Some((name, fields_src)) = body.split_once('=') {
+                let name = name.trim().to_string();
+                let inner = fields_src.trim().trim_start_matches('{').trim_end_matches('}').trim();
+                let fields: Vec<(String, String)> = inner
+                    .split(',')
+                    .filter(|f| !f.trim().is_empty())
+                    .filter_map(|f| {
+                        let f = f.trim();
+                        f.split_once(':').map(|(n, t)| (n.trim().to_string(), t.trim().to_string()))
+                    })
+                    .collect();
+                if fields.is_empty() || name.is_empty() {
+                    errors.push(IdlError { line: line_no, message: format!("bad type decl: '{line}'") });
+                } else {
+                    prog.types.insert(name, fields);
+                }
+            } else {
+                errors.push(IdlError { line: line_no, message: format!("bad type decl: '{line}' (want 'type X = {{ f: ty }};')") });
+            }
             continue;
         }
 
@@ -808,6 +941,9 @@ pub fn parse(src: &str) -> Result<ProtocolProgram, Vec<IdlError>> {
     if scenario.is_some() {
         errors.push(IdlError { line: 0, message: "unterminated scenario block".into() });
     }
+    if func.is_some() {
+        errors.push(IdlError { line: 0, message: "unterminated fn block (missing '}')".into() });
+    }
     if !seen_protocol {
         errors.push(IdlError { line: 0, message: "missing 'protocol <name> v1;' declaration".into() });
     }
@@ -942,7 +1078,19 @@ fn parse_action(stmt: &str) -> Result<ProtocolAction, String> {
             .split_once('=')
             .ok_or_else(|| format!("bad set: '{s}' (want 'set x = expr')"))?;
         let expr = Expr::parse_expr(expr.trim())?;
-        return Ok(ProtocolAction::Set { name: name.trim().to_string(), expr });
+        // `set q.price = ...` targets a record field (§38.2)
+        let (name, field) = match name.trim().split_once('.') {
+            Some((base, f)) => (base.trim().to_string(), Some(f.trim().to_string())),
+            None => (name.trim().to_string(), None),
+        };
+        return Ok(ProtocolAction::Set { name, field, expr });
+    }
+    if let Some(rest) = s.strip_prefix("return ") {
+        let expr = Expr::parse_expr(rest.trim())?;
+        return Ok(ProtocolAction::Return { expr });
+    }
+    if s == "return" {
+        return Ok(ProtocolAction::Return { expr: Expr::LitBool(true) });
     }
     if let Some(rest) = s.strip_prefix("push ") {
         let parts: Vec<&str> = rest.splitn(2, ',').collect();
@@ -1441,7 +1589,12 @@ fn action_word(a: &ProtocolAction) -> String {
         ProtocolAction::Begin => "begin".into(),
         ProtocolAction::Fulfil => "fulfil".into(),
         ProtocolAction::Retract { target } => format!("retract({target})"),
-        ProtocolAction::Set { name, expr } => format!("set {} = {}", name, expr_word(expr)),
+        ProtocolAction::Set { name, field, expr } => format!(
+            "set {}{} = {}",
+            name,
+            match field { Some(f) => format!(".{f}"), None => String::new() },
+            expr_word(expr),
+        ),
         ProtocolAction::Push { state, expr } => format!("push {}, {}", state, expr_word(expr)),
         ProtocolAction::Put { state, key, expr } => format!("put {}, {}, {}", state, key, expr_word(expr)),
         ProtocolAction::For { var, over, actions } => {
@@ -1449,6 +1602,7 @@ fn action_word(a: &ProtocolAction) -> String {
             format!("for {} in {} {{ {} }}", var, over, inner.join("; "))
         }
         ProtocolAction::Abort => "abort".into(),
+        ProtocolAction::Return { expr } => format!("return {}", expr_word(expr)),
     }
 }
 
@@ -1471,6 +1625,11 @@ fn expr_word(e: &Expr) -> String {
         Expr::Call { name, args } => {
             let a: Vec<String> = args.iter().map(expr_word).collect();
             format!("{}({})", name, a.join(", "))
+        }
+        Expr::Field { base, name } => format!("{}.{}", expr_word(base), name),
+        Expr::RecLit { ty, fields } => {
+            let f: Vec<String> = fields.iter().map(|(n, e)| format!("{}: {}", n, expr_word(e))).collect();
+            format!("{} {{ {} }}", ty, f.join(", "))
         }
     }
 }

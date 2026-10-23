@@ -114,7 +114,8 @@ Available vocabularies: `fs`, `task`, `time`, `net`, `proc`, `http`,
 
 ## Links
 
-- [SPEC.md](https://github.com/acl-language/acl/blob/main/SPEC.md): the normative specification (37 sections)
+- [SPEC.md](https://github.com/acl-language/acl/blob/main/SPEC.md): the normative specification (38 sections)
+- [GRAMMAR.md](https://github.com/acl-language/acl/blob/main/GRAMMAR.md): the formal EBNF grammar (lexical tokens, AST, semantic rules)
 - [Tutorial](https://github.com/acl-language/acl/blob/main/docs/TUTORIAL.md): two agents talking in 10 minutes
 - [Playground](https://acl-language.github.io/acl/playground/): watch a real conversation decoded live
 - [BENCH.md](https://github.com/acl-language/acl/blob/main/BENCH.md): codec + ACL-vs-natural-language benchmarks
