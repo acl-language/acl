@@ -14,18 +14,30 @@ type Float = number;
 
 type Map = object;
 
+/// Whether the agent answered its last health probe in time.
 predicate agent_healthy(agent: Aid) -> bool;
+/// Coarse status of an agent (idle|busy|degraded|offline).
 predicate agent_status(agent: Aid, status: Str) -> bool;
+/// Liveness signal with a monotonically increasing sequence number.
 predicate heartbeat(agent: Aid, seq: Int) -> bool;
+/// A tool invocation addressed to a pilot agent.
 predicate tool_call(call_id: Str, tool: Str, args: Map) -> bool;
+/// The outcome of a tool call (ok flag + textual output).
 predicate tool_result(call_id: Str, ok: bool, output: Str) -> bool;
+/// A numeric metric sampled from an agent (cpu, latency, mem).
 predicate telemetry(agent: Aid, metric: Str, value: Float) -> bool;
+/// A delegation relationship currently in effect.
 predicate delegation_active(task_id: Str, from: Aid, to: Aid) -> bool;
 
+/// Orchestrator delegates a task to a pilot agent.
 action delegate_task(task_id: Str, to: Aid, description: Str) -> bool;
+/// Execute a named tool with structured arguments.
 action run_tool(call_id: Str, tool: Str, args: Map) -> bool;
+/// Ask an agent to report its current status.
 action report_status(agent: Aid) -> bool;
+/// Ask an agent to rotate its did:key identity.
 action rotate_identity(old_did: Aid) -> bool;
 
 // commitment: "I will answer this tool call within N ms"
+/// The pilot acknowledged the SLA deadline for a call.
 predicate sla_acknowledged(call_id: Str, deadline_ms: Int) -> bool;
