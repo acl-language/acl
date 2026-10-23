@@ -7,6 +7,7 @@
 //! Usage: acl-peer --name NAME --pub-out FILE [--key FILE]
 
 use acl_core::{
+    cl::{well_formed, ClExpr},
     AgentCard, Aid, Body, Capability, Envelope, Performative, ACL_VERSION,
 };
 use ed25519_dalek::SigningKey;
@@ -180,6 +181,76 @@ fn main() {
                         nonce: vec![],
                     },
                 ))
+            }
+            // §6.2: the peer SPEAKS the content language — answers Cl
+            // queries with facts, executes Cl actions, enforces grammar.
+            (Performative::Query, Body::Cl { expressions }) => {
+                if let Err(e) = well_formed(env.performative, expressions) {
+                    Some(mk(&my_aid, &env, Performative::Error, Body::Error {
+                        code: 422, message: format!("ill-formed CL: {e}"), details: None,
+                    }))
+                } else {
+                    let mut facts: Vec<ClExpr> = Vec::new();
+                    for e in expressions {
+                        if let ClExpr::Query { predicate, args } = e {
+                            match predicate.as_str() {
+                                "file_exists" => {
+                                    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                                    let truth = std::path::Path::new(path).exists();
+                                    facts.push(ClExpr::fact("file_exists", serde_json::json!({"path": path})));
+                                    if let ClExpr::Fact { truth: t, .. } = facts.last_mut().unwrap() { *t = truth; }
+                                }
+                                "task_status" => {
+                                    let id = args.get("msg_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                    let truth = blocked.values().any(|(tid, _)| *tid == id);
+                                    facts.push(ClExpr::fact("task_status", serde_json::json!({"msg_id": id})));
+                                    if let ClExpr::Fact { truth: t, .. } = facts.last_mut().unwrap() { *t = truth; }
+                                }
+                                other => eprintln!("[{name}] unknown predicate '{other}' (skipped — vocabulary is agent-specific)"),
+                            }
+                        }
+                    }
+                    if facts.is_empty() {
+                        Some(mk(&my_aid, &env, Performative::Error, Body::Error {
+                            code: 404, message: "no known predicate in query".into(), details: None,
+                        }))
+                    } else {
+                        Some(mk(&my_aid, &env, Performative::Inform, Body::Cl { expressions: facts }))
+                    }
+                }
+            }
+            (Performative::Request, Body::Cl { expressions }) => {
+                if let Err(e) = well_formed(env.performative, expressions) {
+                    Some(mk(&my_aid, &env, Performative::Error, Body::Error {
+                        code: 422, message: format!("ill-formed CL: {e}"), details: None,
+                    }))
+                } else {
+                    let mut results: Vec<ClExpr> = Vec::new();
+                    let mut unknown: Option<String> = None;
+                    for e in expressions {
+                        if let ClExpr::Action { name, params, .. } = e {
+                            match name.as_str() {
+                                "text.reverse" => {
+                                    let t = params.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                                    let rev: String = t.chars().rev().collect();
+                                    results.push(ClExpr::fact("text_reversed", serde_json::json!({"input": t, "output": rev})));
+                                }
+                                other => { unknown = Some(other.to_string()); break; }
+                            }
+                        }
+                    }
+                    if let Some(u) = unknown {
+                        Some(mk(&my_aid, &env, Performative::Error, Body::Error {
+                            code: 400, message: format!("unknown action '{u}'"), details: None,
+                        }))
+                    } else if results.is_empty() {
+                        Some(mk(&my_aid, &env, Performative::Error, Body::Error {
+                            code: 400, message: "no actions executed".into(), details: None,
+                        }))
+                    } else {
+                        Some(mk(&my_aid, &env, Performative::Inform, Body::Cl { expressions: results }))
+                    }
+                }
             }
             (Performative::Bye, _) => {
                 eprintln!("[{name}] session closed by peer");
