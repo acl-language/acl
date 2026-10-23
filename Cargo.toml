@@ -1,12 +1,26 @@
 [package]
 name = "acl-core"
-version = "0.1.0"
+version = "0.4.0"
 edition = "2024"
+description = "ACL — Agent Communication Language: binary, platform-agnostic protocol for AI agents (envelope, performatives, content language, Ed25519, MessagePack)"
+license = "Apache-2.0"
+repository = "https://github.com/acl-language/acl"
+homepage = "https://github.com/acl-language/acl"
+documentation = "https://github.com/acl-language/acl/blob/main/SPEC.md"
+readme = "README.md"
+keywords = ["agents", "ai", "protocol", "messagepack", "ed25519"]
+categories = ["network-programming", "api-bindings"]
+exclude = ["acl-py/*", "acl-ts/*", "target/*", "tests/*", "stdlib/*", "fuzz/*", "*.md", ".github/*"]
+
+[lib]
+name = "acl_core"
+path = "src/lib.rs"
 
 [dependencies]
 base64 = "0.23.1"
+bs58 = "0.5.1"
 chacha20poly1305 = "0.11.0"
-ed25519-dalek = "3.0.0"
+ed25519-dalek = { version = "3.0.0", features = ["batch"] }
 rand = "0.10.3"
 rmp-serde = "1.3.1"
 serde = { version = "1.0.229", features = ["derive"] }

@@ -45,6 +45,19 @@ impl std::fmt::Display for IdlError {
 
 /// Parse a `.acl` source file.
 pub fn parse(src: &str) -> Result<IdlFile, Vec<IdlError>> {
+    struct WfWip {
+        local: String,
+        #[allow(dead_code)]
+        params: Vec<Param>,
+        ret: Option<String>,
+        steps: Vec<Step>,
+        cur_parallel: Option<Vec<String>>,
+    }
+    let mut wf_wip: Option<WfWip> = None;
+    macro_rules! wf_mut {
+        () => { wf_wip.as_mut().unwrap() };
+    }
+
     let mut errors = Vec::new();
     let mut namespace: Option<(String, u32)> = None;
     let mut decls = Vec::new();
@@ -116,6 +129,104 @@ pub fn parse(src: &str) -> Result<IdlFile, Vec<IdlError>> {
             doc = None;
             continue;
         }
+        // workflow block handling (multi-line)
+        if wf_wip.is_some() {
+            if line == "}" {
+                // close parallel group if open; otherwise close the workflow
+                if let Some(par) = wf_wip.as_mut().unwrap().cur_parallel.take() {
+                    if par.is_empty() {
+                        errors.push(IdlError { line: line_no, message: "empty parallel group".into() });
+                    } else {
+                        wf_wip.as_mut().unwrap().steps.push(Step::Parallel(par));
+                    }
+                } else {
+                    let w = wf_wip.take().unwrap();
+                    decls.push(Decl::Workflow {
+                        local: w.local,
+                        params: w.params,
+                        steps: w.steps,
+                        ret: w.ret,
+                        doc: doc.take(),
+                    });
+                }
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("parallel {") {
+                let _ = rest;
+                if wf_wip.as_mut().unwrap().cur_parallel.is_some() {
+                    errors.push(IdlError { line: line_no, message: "nested parallel not allowed".into() });
+                } else {
+                    wf_wip.as_mut().unwrap().cur_parallel = Some(Vec::new());
+                }
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("do ") {
+                let name = rest.trim_end_matches(';').trim().to_string();
+                if name.is_empty() {
+                    errors.push(IdlError { line: line_no, message: "empty 'do' target".into() });
+                } else if let Some(par) = wf_wip.as_mut().unwrap().cur_parallel.as_mut() {
+                    par.push(name);
+                } else {
+                    wf_wip.as_mut().unwrap().steps.push(Step::Do(name));
+                }
+                continue;
+            }
+            errors.push(IdlError {
+                line: line_no,
+                message: format!("unrecognized line inside workflow: '{line}'"),
+            });
+            continue;
+        }
+        if line.starts_with("workflow ") {
+            let body = line.trim_end_matches('{').trim();
+            let body = body.strip_prefix("workflow ").unwrap_or(body).trim();
+            let (sig, ret) = match body.rsplit_once("->") {
+                Some((h, r)) => (h.trim(), Some(r.trim().to_string())),
+                None => (body, None),
+            };
+            let open = match sig.find('(') {
+                Some(o) => o,
+                None => {
+                    errors.push(IdlError { line: line_no, message: format!("bad workflow decl: '{line}'") });
+                    doc = None;
+                    continue;
+                }
+            };
+            let local = sig[..open].trim().to_string();
+            let inner = sig[open + 1..].trim_end();
+            let inner = inner.strip_suffix(')').unwrap_or(inner).trim();
+            let mut params = Vec::new();
+            let mut bad = false;
+            if !inner.is_empty() {
+                for pr in inner.split(',') {
+                    match pr.trim().split_once(':') {
+                        Some((pn, pt)) => params.push(Param {
+                            name: pn.trim().to_string(),
+                            ty: pt.trim().to_string(),
+                        }),
+                        None => {
+                            errors.push(IdlError {
+                                line: line_no,
+                                message: format!("bad workflow param '{pr}'"),
+                            });
+                            bad = true;
+                        }
+                    }
+                }
+            }
+            if !bad {
+                wf_wip = Some(WfWip {
+                    local,
+                    params,
+                    ret,
+                    steps: Vec::new(),
+                    cur_parallel: None,
+                });
+            } else {
+                doc = None;
+            }
+            continue;
+        }
         let kind = if line.starts_with("predicate ") {
             Some(("predicate", "predicate "))
         } else if line.starts_with("action ") {
@@ -157,12 +268,21 @@ pub fn parse(src: &str) -> Result<IdlFile, Vec<IdlError>> {
     Err(errors)
 }
 
-#[allow(non_exhaustive)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Decl {
     Predicate { local: String, params: Vec<Param>, ret: String, doc: Option<String> },
     Action { local: String, params: Vec<Param>, ret: String, doc: Option<String> },
     Alias { local: String, target: String },
+    /// §20: ordered plan of action groups; groups run in sequence,
+    /// actions inside a group run in parallel.
+    Workflow { local: String, params: Vec<Param>, steps: Vec<Step>, ret: Option<String>, doc: Option<String> },
+}
+
+/// One step of a workflow: a single action, or a parallel group of actions.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Step {
+    Do(String),
+    Parallel(Vec<String>),
 }
 
 fn valid_type_name(s: &str) -> bool {
@@ -223,6 +343,47 @@ pub fn typecheck(file: &IdlFile) -> Result<Vec<String>, Vec<IdlError>> {
             Decl::Predicate { local, params, ret, .. } => (local, params, ret, false),
             Decl::Action { local, params, ret, .. } => (local, params, ret, true),
             Decl::Alias { .. } => continue,
+            Decl::Workflow { local, params, ret, steps, .. } => {
+                let full = format!("{}.{}", file.namespace, local);
+                if let Some(prev_kind) = seen.insert(full.clone(), "workflow") {
+                    errors.push(IdlError {
+                        line: 0,
+                        message: format!("duplicate full name '{full}' (already a {prev_kind})"),
+                    });
+                }
+                for p in params {
+                    if !check_type(&p.ty) {
+                        errors.push(IdlError {
+                            line: 0,
+                            message: format!("{full}: unknown type '{}' for param '{}'", p.ty, p.name),
+                        });
+                    }
+                }
+                if let Some(r) = ret {
+                    if !check_type(r) {
+                        errors.push(IdlError { line: 0, message: format!("{full}: unknown return type '{r}'") });
+                    }
+                }
+                for st in steps {
+                    let targets: Vec<&String> = match st {
+                        Step::Do(n) => vec![n],
+                        Step::Parallel(g) => g.iter().collect(),
+                    };
+                    for t in targets {
+                        let ok = file.decls.iter().any(|d2| {
+                            matches!(d2, Decl::Action { local: l, .. } if format!("{}.{}", file.namespace, l) == *t)
+                        });
+                        if !ok {
+                            errors.push(IdlError {
+                                line: 0,
+                                message: format!("workflow '{full}': 'do {t}' is not a declared action"),
+                            });
+                        }
+                    }
+                }
+                full_names.push(full);
+                continue;
+            }
         };
         let full = format!("{}.{}", file.namespace, local);
         if let Some(prev_kind) = seen.insert(full.clone(), if is_action { "action" } else { "predicate" }) {
@@ -263,6 +424,36 @@ pub fn pretty(file: &IdlFile) -> String {
             Decl::Action { local, params, ret, doc } => ("action", local, params, ret, doc),
             Decl::Alias { local, target } => {
                 out.push_str(&format!("\ntype {local} = {target};\n"));
+                continue;
+            }
+            Decl::Workflow { local, params, steps, ret, doc } => {
+                if doc.is_some() && doc != &current_doc {
+                    out.push('\n');
+                    for l in doc.as_ref().unwrap().lines() {
+                        out.push_str(&format!("/// {l}\n"));
+                    }
+                }
+                current_doc = doc.clone();
+                let ps = params
+                    .iter()
+                    .map(|p| format!("{}: {}", p.name, p.ty))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let ret_s = ret.as_ref().map(|r| format!(" -> {r}")).unwrap_or_default();
+                out.push_str(&format!("\nworkflow {local}({ps}){ret_s} {{\n"));
+                for st in steps {
+                    match st {
+                        Step::Do(n) => out.push_str(&format!("  do {n};\n")),
+                        Step::Parallel(g) => {
+                            out.push_str("  parallel {\n");
+                            for n in g {
+                                out.push_str(&format!("    do {n};\n"));
+                            }
+                            out.push_str("  }\n");
+                        }
+                    }
+                }
+                out.push_str("}\n");
                 continue;
             }
         };
@@ -317,6 +508,22 @@ pub fn gen_rust(file: &IdlFile) -> String {
                 ));
             }
             Decl::Alias { .. } => {}
+            Decl::Workflow { local, steps, .. } => {
+                let groups: Vec<String> = steps
+                    .iter()
+                    .map(|st| match st {
+                        Step::Do(n) => format!("vec![\"{n}\"]"),
+                        Step::Parallel(g) => format!(
+                            "vec![{}]",
+                            g.iter().map(|n| format!("\"{n}\"")).collect::<Vec<_>>().join(", ")
+                        ),
+                    })
+                    .collect();
+                out.push_str(&format!(
+                    "pub fn plan_{local}() -> Vec<Vec<&'static str>> {{ vec![{}] }}\n",
+                    groups.join(", ")
+                ));
+            }
         }
     }
     let _ = CommitmentStatus::Proposed;
@@ -355,10 +562,77 @@ pub fn gen_py(file: &IdlFile) -> String {
                     "def action_{local}({sig}):\n    return {{\"op\": \"action\", \"name\": \"{full}\", \"params\": {{{args}}}}}\n\n"
                 ));
             }
+            Decl::Workflow { local, steps, .. } => {
+                let groups: Vec<String> = steps
+                    .iter()
+                    .map(|st| match st {
+                        Step::Do(n) => format!("[\"{n}\"]"),
+                        Step::Parallel(g) => format!(
+                            "[{}]",
+                            g.iter().map(|n| format!("\"{n}\"")).collect::<Vec<_>>().join(", ")
+                        ),
+                    })
+                    .collect();
+                out.push_str(&format!(
+                    "def plan_{local}():\n    return [{}]\n\n",
+                    groups.join(", ")
+                ));
+            }
             Decl::Alias { .. } => {}
         }
     }
     out
+}
+
+/// Generate a runtime-validation schema (JSON) for `gen schema`.
+pub fn gen_schema(file: &IdlFile) -> String {
+    let mut aliases = BTreeMap::new();
+    let mut predicates = BTreeMap::new();
+    let mut actions = BTreeMap::new();
+    for d in &file.decls {
+        match d {
+            Decl::Alias { local, target } => {
+                aliases.insert(local.clone(), target.clone());
+            }
+            Decl::Predicate { local, params, ret, doc } => {
+                predicates.insert(
+                    local.clone(),
+                    SchemaOpView {
+                        params: params.iter().map(|p| (p.name.clone(), p.ty.clone())).collect(),
+                        ret: ret.clone(),
+                        doc: doc.clone(),
+                    },
+                );
+            }
+            Decl::Action { local, params, ret, doc } => {
+                actions.insert(
+                    local.clone(),
+                    SchemaOpView {
+                        params: params.iter().map(|p| (p.name.clone(), p.ty.clone())).collect(),
+                        ret: ret.clone(),
+                        doc: doc.clone(),
+                    },
+                );
+            }
+            Decl::Workflow { .. } => {}
+        }
+    }
+    let view = serde_json::json!({
+        "namespace": file.namespace,
+        "version": file.version,
+        "aliases": aliases,
+        "predicates": predicates,
+        "actions": actions,
+    });
+    String::from_utf8(serde_json::to_vec_pretty(&view).unwrap_or_default()).unwrap_or_default()
+}
+
+#[derive(serde::Serialize)]
+struct SchemaOpView {
+    params: BTreeMap<String, String>,
+    ret: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    doc: Option<String>,
 }
 
 /// Generate TypeScript builder stubs.
@@ -394,6 +668,22 @@ pub fn gen_ts(file: &IdlFile) -> String {
                 ));
             }
             Decl::Alias { .. } => {}
+            Decl::Workflow { local, steps, .. } => {
+                let groups: Vec<String> = steps
+                    .iter()
+                    .map(|st| match st {
+                        Step::Do(n) => format!("[\"{n}\"]"),
+                        Step::Parallel(g) => format!(
+                            "[{}]",
+                            g.iter().map(|n| format!("\"{n}\"")).collect::<Vec<_>>().join(", ")
+                        ),
+                    })
+                    .collect();
+                out.push_str(&format!(
+                    "export function plan_{local}() {{ return [{}]; }}\n\n",
+                    groups.join(", ")
+                ));
+            }
         }
     }
     out
@@ -455,6 +745,58 @@ action text_reverse(text: string) -> string;
         assert_eq!(f, f2);
         assert_eq!(pretty(&f2), pretty1, "fmt must be idempotent");
         assert!(pretty1.contains("/// Check whether a path exists"));
+    }
+
+    #[test]
+    fn workflow_parse_typecheck_codegen() {
+        let src = r#"
+namespace acl.demo v1;
+action step_a(text: string) -> bool;
+action step_b() -> bool;
+workflow pipeline(text: string) -> bool {
+  do acl.demo.step_a;
+  parallel {
+    do acl.demo.step_b;
+    do acl.demo.step_b;
+  }
+  do acl.demo.step_a;
+}
+"#;
+        let f = parse(src).expect("parse");
+        typecheck(&f).expect("typecheck");
+        match &f.decls[2] {
+            Decl::Workflow { local, steps, ret, .. } => {
+                assert_eq!(local, "pipeline");
+                assert_eq!(steps.len(), 3, "do, parallel, do");
+                assert_eq!(ret.as_deref(), Some("bool"));
+                match &steps[1] {
+                    Step::Parallel(g) => assert_eq!(g.len(), 2),
+                    other => panic!("expected parallel, got {other:?}"),
+                }
+            }
+            other => panic!("expected workflow, got {other:?}"),
+        }
+        // pretty roundtrip
+        let p1 = pretty(&f);
+        assert_eq!(parse(&p1).unwrap(), f);
+        assert!(p1.contains("workflow pipeline(text: string) -> bool {"));
+        assert!(p1.contains("  parallel {"));
+        // codegen: plan preserves order and parallel groups
+        let rust = gen_rust(&f);
+        assert!(rust.contains("pub fn plan_pipeline() -> Vec<Vec<&'static str>>"));
+        let py = gen_py(&f);
+        assert!(py.contains("def plan_pipeline():"));
+    }
+
+    #[test]
+    fn workflow_type_errors() {
+        let src = "namespace a.b v1;
+workflow w() {
+  do a.b.missing;
+}
+";
+        let errs = typecheck(&parse(src).unwrap()).unwrap_err();
+        assert!(errs.iter().any(|e| e.message.contains("'do a.b.missing' is not a declared action")));
     }
 
     #[test]

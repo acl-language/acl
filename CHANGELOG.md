@@ -6,7 +6,31 @@ Format based on Keep a Changelog; versions follow semver for the
 
 ## [Unreleased]
 
-## [0.3.0] — 2026-10-23
+## [0.4.0] — 2026-10-23
+
+Distributed-systems maturity: types enforced on the wire, declarative
+workflows, standard negotiation, real identity, and a conformance suite.
+All changes additive; SPEC-VERSION on the wire remains `1`.
+
+### Added
+- **Runtime schema validation** (spec §19): `aclc gen schema` emits
+  machine-readable schemas; receivers validate CL payloads against them
+  (strict params, alias resolution, composition recursion) before
+  processing.
+- **Declarative workflows** (spec §20): `workflow` blocks in the IDL with
+  sequence and `parallel` groups; `aclc` emits plan builders.
+- **Contract-Net Protocol** (spec §21): announce → bid → award → report
+  built on performatives and commitments; `CnpSession` tracks phases and
+  validates transitions.
+- **DID resolution** (spec §22): `did:key` (ed25519, multicodec 0xed01)
+  resolves offline to verifying keys — envelope verification needs only
+  the `from` field; `did:web` URL construction.
+- **Batch signature verification** (ed25519 batched API with exact
+  per-item fallback).
+- **Conformance suite** (spec §23): `acl-conformance` binary, 10 checks
+  across 3 levels, prints report, exit 0 = compliant.
+- **Packaging**: crates.io metadata for `acl-core` (0.4.0), maturin
+  `pyproject.toml` for PyPI, `package.json` for npm.
 
 The release that makes ACL a **language** rather than a transport protocol
 with conventions. All changes additive; SPEC-VERSION on the wire remains `1`.
@@ -85,7 +109,8 @@ First public release.
 - Independent spec-only Python codec; interop validated both directions
 - Robustness fuzz-lite corpus test; codec benchmarks
 
-[Unreleased]: https://github.com/acl-language/acl/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/acl-language/acl/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/acl-language/acl/releases/tag/v0.4.0
 [0.3.0]: https://github.com/acl-language/acl/releases/tag/v0.3.0
 [0.2.0]: https://github.com/acl-language/acl/releases/tag/v0.2.0
 [0.1.0]: https://github.com/acl-language/acl/releases/tag/v0.1.0

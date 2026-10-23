@@ -6,8 +6,12 @@
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 pub mod bridge;
 pub mod cl;
+pub mod batch;
+pub mod cnp;
+pub mod did;
 pub mod dialogue;
 pub mod idl;
+pub mod schema;
 pub mod semantics;
 pub mod sealed;
 pub mod idempotency;

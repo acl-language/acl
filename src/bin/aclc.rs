@@ -44,13 +44,15 @@ fn main() {
                                 for d in &file.decls {
                                     let doc_missing = match d {
                                         idl::Decl::Predicate { doc, .. }
-                                        | idl::Decl::Action { doc, .. } => doc.is_none(),
+                                        | idl::Decl::Action { doc, .. }
+                                        | idl::Decl::Workflow { doc, .. } => doc.is_none(),
                                         idl::Decl::Alias { .. } => false,
                                     };
                                     if doc_missing {
                                         let local = match d {
                                             idl::Decl::Predicate { local, .. }
                                             | idl::Decl::Action { local, .. } => local.clone(),
+                                        | idl::Decl::Workflow { local, .. } => local.clone(),
                                             idl::Decl::Alias { local, .. } => local.clone(),
                                         };
                                         eprintln!("{f}: lint: decl '{local}' missing doc comment");
@@ -81,7 +83,7 @@ fn main() {
         }
         "gen" => {
             if files.len() != 3 {
-                eprintln!("usage: aclc gen <rust|py|ts> <file.acl> <out_dir>");
+                eprintln!("usage: aclc gen <rust|py|ts|schema> <file.acl> <out_dir>");
                 std::process::exit(2);
             }
             let lang = files[0].as_str();
@@ -95,8 +97,9 @@ fn main() {
                 "rust" => (idl::gen_rust(&file), format!("{ns_file}.rs")),
                 "py" => (idl::gen_py(&file), format!("{ns_file}_gen.py")),
                 "ts" => (idl::gen_ts(&file), format!("{ns_file}_gen.ts")),
+                "schema" => (idl::gen_schema(&file), format!("{ns_file}.schema.json")),
                 other => {
-                    eprintln!("unknown language '{other}' (rust|py|ts)");
+                    eprintln!("unknown language '{other}' (rust|py|ts|schema)");
                     std::process::exit(2);
                 }
             };

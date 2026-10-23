@@ -1,6 +1,6 @@
 # ACL — Agent Communication Language
 
-**Version:** 0.3.0-draft
+**Version:** 0.4.0-draft
 **Status:** Draft specification
 **License:** Apache-2.0 (spec + reference implementation)
 
@@ -535,9 +535,104 @@ peers. Reference: `acl_core::registry` + `registry_cli`.
 | formal semantics (§17, `src/semantics.rs`) | FP/RE present for all 14 performatives |
 
 Not yet implemented: sealed-envelope key rotation/HD derivation,
-batch signature verification, WS client demo in CI, public governance body,
-CL type-checker over message payloads (IDL types are validated at build
-time; runtime payload validation against compiled schemas is future work).
+WS client demo in CI, public governance body.
+
+## 19. Runtime schema validation (normative)
+
+At build time, `aclc gen schema vocab.acl` emits `<ns>.schema.json`:
+`{namespace, version, aliases, predicates, actions}` — aliases resolved to
+primitives, params typed. At runtime, a receiver MAY load one or more
+schemas and validate every `Cl` body BEFORE processing:
+
+- predicate/action must exist in a loaded vocabulary (full name match);
+- every declared param MUST be present and type-conformant
+  (`string`→is_string, `int`→integer, `float`→number, `bool`→boolean,
+  aliases resolved);
+- undeclared params are rejected (strict);
+- `Commitment.act` is validated as an action; composition recurses (§6.3);
+- `ref` is skipped (validated where produced).
+
+A receiver that validates SHOULD reject the message with `error` code 422
+and the first violation as the reason. Reference: `src/schema.rs`.
+
+## 20. Declarative workflows (IDL)
+
+Workflows declare ordered action plans inside a vocabulary:
+
+```text
+workflow pipeline(text: string) -> bool {
+  do acl.std.fs.file_read;
+  parallel {
+    do acl.std.text.a;
+    do acl.std.text.b;
+  }
+  do acl.std.fs.file_write;
+}
+```
+
+- Steps run in sequence; a `parallel { ... }` group's actions may run
+  concurrently; groups nest no deeper than one level.
+- Every `do` target MUST reference an action declared in the same file
+  (full-name match). Unknown targets are type errors.
+- `aclc` emits `plan_<name>()` builders returning the ordered groups,
+  so executors can drive the plan without re-parsing the IDL.
+
+## 21. Contract-Net Protocol (interaction pattern)
+
+The standard negotiation pattern (Smith 1980) is a first-class ACL
+interaction, built entirely on existing performatives and the CL:
+
+| phase | message | content |
+|-------|---------|---------|
+| ANNOUNCE | manager → participants: `request` | `Cl` with the task `action` |
+| BID | participant → manager: `propose` | `Cl` with `commitment{status=proposed}` |
+| AWARD | manager → winner: `accept` | `Cl` with `commitment{status=active}` |
+| AWARD (losers) | manager → others: `reject` | `Ref` |
+| REPORT | winner → manager: `inform` | `Cl` with `fact` (or `failure`) |
+
+Rules:
+- Bids are commitments: awarding activates the winner's, losers' proposals
+  are void.
+- A manager MUST NOT award a contract to an agent that did not bid.
+- The report closes the session: `fact{truth=true}` = fulfilled,
+  `fact{truth=false}` or `failure` = breached/failed.
+- Dialogue legality: `request → propose` is a legal reply (counter-offer);
+  `propose → accept` activates.
+
+Reference: `src/cnp.rs` (`CnpSession` tracks phases and validates
+transitions).
+
+## 22. DID resolution (identity layer)
+
+The AID scheme `did:key` resolves OFFLINE to an Ed25519 verifying key:
+
+```text
+did:key:z<base58btc(0xed 0x01 || pubkey32)>
+```
+
+- `did_key_to_verifying_key` parses and validates the multicodec prefix;
+- `verifying_key_to_did_key` encodes — an agent can derive its own AID
+  from its keypair with no registry;
+- envelope verification then needs ONLY the `from` field: no separate key
+  exchange for did:key agents.
+
+The `did:web` scheme resolves over HTTPS (`did:web:host[:port][:path]` →
+`https://host[:port]/[path/]did.json`); fetching is the caller's transport
+concern. Reference: `src/did.rs`.
+
+## 23. Conformance suite
+
+`acl-conformance` runs the certification checks and prints a report:
+
+| level | checks |
+|-------|--------|
+| L1 | C1 codec roundtrip · C2 signature+tamper · C3 stream framing |
+| L2 | C4 CL grammar · C5 dialogue rules · C6 idempotency |
+| L3 | C7 sealed envelopes · C8 schema validation · C9 DID resolution · C10 batch verification |
+
+Exit 0 = compliant at the highest fully-passing level. External
+implementations MUST pass L1 to claim ACL support; L3 requires the full
+feature set. Reference: `src/bin/acl_conformance.rs`.
 
 ## 16. Dialogue rules (normative)
 
@@ -546,7 +641,7 @@ are legal. `dialogue_legal(prev, reply)` (reference: `src/dialogue.rs`):
 
 | prev | legal replies |
 |------|---------------|
-| `request` / `delegate` | `inform`, `input_required`, `failure`, `reject`, `progress`, `error` |
+| `request` / `delegate` | `inform`, `input_required`, `failure`, `reject`, `propose` (counter-offer, §21), `progress`, `error` |
 | `query` | `inform`, `failure`, `error` |
 | `propose` | `accept`, `reject`, `error` |
 | `accept` | `inform`, `failure`, `error` |

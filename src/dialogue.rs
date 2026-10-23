@@ -12,8 +12,8 @@ use crate::Performative;
 pub fn legal_replies(prev: Performative) -> &'static [Performative] {
     use Performative::*;
     match prev {
-        Request => &[Inform, InputRequired, Failure, Reject, Progress, Error],
-        Delegate => &[Inform, InputRequired, Failure, Reject, Progress, Error],
+        Request => &[Inform, InputRequired, Failure, Reject, Propose, Progress, Error],
+        Delegate => &[Inform, InputRequired, Failure, Reject, Propose, Progress, Error],
         Query => &[Inform, Failure, Error],
         Propose => &[Accept, Reject, Error],
         Accept => &[Inform, Failure, Error],

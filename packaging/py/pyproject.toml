@@ -1,0 +1,24 @@
+# acl-py — Python bindings for ACL (built with maturin)
+# Publish: maturin build --release && twine upload dist/*
+[build-system]
+requires = ["maturin>=1.5"]
+build-backend = "maturin"
+
+[project]
+name = "acl-py"
+version = "0.4.0"
+description = "ACL — Agent Communication Language: Python bindings (binary protocol for AI agents)"
+license = { text = "Apache-2.0" }
+readme = "../../README.md"
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+    "Topic :: Software Development :: Libraries",
+]
+
+[tool.maturin]
+manifest-path = "../../acl-py/Cargo.toml"
+features = ["pyo3/extension-module"]
+module-name = "acl_py"
