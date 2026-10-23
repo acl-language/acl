@@ -872,24 +872,67 @@ pub fn parse(src: &str) -> Result<ProtocolProgram, Vec<IdlError>> {
                 }),
                 None => (head, None),
             };
-            let trigger = match parse_trigger(&head) {
-                Ok(t) => t,
-                Err(e) => {
-                    errors.push(IdlError { line: line_no, message: e });
-                    continue;
+            // §38.4: alternation `on (accept | reject) from a` — expands to
+            // one handler per alternative with identical guard and actions.
+            // Only valid in one-line and inline-block forms.
+            let expanded: Vec<String> = if head.starts_with('(') {
+                match head.find(')') {
+                    Some(close) if close > 1 => {
+                        let alts: Vec<String> = head[1..close]
+                            .split('|')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        let rest = head[close + 1..].trim().to_string();
+                        if alts.len() > 1 {
+                            alts.into_iter()
+                                .map(|a| if rest.is_empty() { a.clone() } else { format!("{a} {rest}") })
+                                .collect()
+                        } else {
+                            vec![head.to_string()]
+                        }
+                    }
+                    _ => vec![head.to_string()],
                 }
+            } else {
+                vec![head.to_string()]
             };
-            let mut h = Handler { trigger, guard, actions: Vec::new() };
+            let inline_block = !arrow && line.contains('{') && line.ends_with('}');
+            if expanded.len() > 1 && !arrow && !inline_block {
+                errors.push(IdlError {
+                    line: line_no,
+                    message: "alternation requires one-line or inline-block form".into(),
+                });
+                continue;
+            }
+            let mut hs: Vec<Handler> = Vec::new();
+            for hhead in &expanded {
+                let trigger = match parse_trigger(hhead) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        errors.push(IdlError { line: line_no, message: e });
+                        continue;
+                    }
+                };
+                hs.push(Handler { trigger, guard: guard.clone(), actions: Vec::new() });
+            }
+            if hs.is_empty() {
+                continue;
+            }
             if arrow {
                 // one-line form: `on X -> send Y;` (no block)
                 let stmt = sends.trim_end_matches(';').trim();
                 match parse_action(stmt) {
-                    Ok(a) => h.actions.push(a),
+                    Ok(a) => {
+                        for h in &mut hs {
+                            h.actions.push(a.clone());
+                        }
+                    }
                     Err(e) => errors.push(IdlError { line: line_no, message: e }),
                 }
-                prog.handlers.push(h);
+                prog.handlers.extend(hs);
             } else if line.ends_with('{') {
-                handler = Some(h);
+                handler = Some(hs.remove(0));
             } else if line.contains('{') && line.ends_with('}') {
                 // inline block: `on X { act; act; }`
                 let body = &line[line.find('{').unwrap() + 1..line.len() - 1];
@@ -898,15 +941,21 @@ pub fn parse(src: &str) -> Result<ProtocolProgram, Vec<IdlError>> {
                         continue;
                     }
                     match parse_action(stmt.trim()) {
-                        Ok(a) => h.actions.push(a),
+                        Ok(a) => {
+                            for hh in &mut hs {
+                                hh.actions.push(a.clone());
+                            }
+                        }
                         Err(e) => {
                             errors.push(IdlError { line: line_no, message: e });
                             break;
                         }
                     }
                 }
-                if !h.actions.is_empty() {
-                    prog.handlers.push(h);
+                for h in hs {
+                    if !h.actions.is_empty() {
+                        prog.handlers.push(h);
+                    }
                 }
             } else {
                 errors.push(IdlError { line: line_no, message: format!("malformed handler: '{line}' (want 'on <event> -> <action>;' or 'on <event> {{')") });
@@ -2101,4 +2150,63 @@ fn regex_replace(text: &str, pattern: &str, replacement: &str) -> String {
     }
     out.push_str(if cur == word { replacement } else { &cur });
     out
+}
+
+#[cfg(test)]
+mod alternation_tests {
+    use super::*;
+
+    // §38.4: alternation expands to one handler per alternative
+    #[test]
+    fn alternation_expands_handlers() {
+        let prog = parse(
+            "protocol p v1;\nroles a, b;\non (accept | reject) from a -> send inform to a;\non inform from b -> send bye;\n",
+        )
+        .unwrap();
+        let alts: Vec<_> = prog
+            .handlers
+            .iter()
+            .filter(|h| match &h.trigger {
+                OnTrigger::Event { performative, from, .. } => {
+                    *from == Some("a".to_string())
+                        && matches!(performative, Performative::Accept | Performative::Reject)
+                }
+                _ => false,
+            })
+            .collect();
+        assert_eq!(alts.len(), 2);
+        // both handlers share the same action
+        assert_eq!(alts[0].actions, alts[1].actions);
+        assert!(check(&prog).is_ok());
+    }
+
+    #[test]
+    fn alternation_with_guard_expands_guard() {
+        let prog = parse(
+            "protocol p v1;\nroles a, b;\non (inform | query) from a when quoted -> send inform to a;\n",
+        )
+        .unwrap();
+        assert_eq!(prog.handlers.len(), 2);
+        assert!(prog.handlers[0].guard.is_some());
+        assert_eq!(prog.handlers[0].guard, prog.handlers[1].guard);
+    }
+
+    #[test]
+    fn literal_paren_pattern_not_alternation() {
+        // `("quote")` is a literal pattern, not an alternation (single alt)
+        let prog = parse(
+            "protocol p v1;\nroles a, b;\non request (\"quote\") from a -> send inform to a;\n",
+        )
+        .unwrap();
+        assert_eq!(prog.handlers.len(), 1);
+    }
+
+    #[test]
+    fn alternation_block_form_rejected() {
+        let errs = parse(
+            "protocol p v1;\nroles a, b;\non (accept | reject) from a {\n  begin;\n}\n",
+        )
+        .unwrap_err();
+        assert!(errs.iter().any(|e| e.message.contains("alternation")));
+    }
 }
