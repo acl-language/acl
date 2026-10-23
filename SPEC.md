@@ -1,6 +1,6 @@
 # ACL — Agent Communication Language
 
-**Version:** 0.17.0-draft
+**Version:** 0.18.0-draft
 **Status:** Draft specification
 **License:** Apache-2.0 (spec + reference implementation)
 
@@ -1500,3 +1500,29 @@ Each session is an independent participant instance. States AND
 conversation phases are instance-scoped: two concurrent conversations of
 the same role never share state, phase transitions, or commitments.
 Capacity (§35.8) bounds the number of concurrent instances.
+
+## 53. Ordered session lifecycle replay (normative)
+
+Session opens are journaled IN ORDER (`Event::SessionOpened` with the
+role). `replay_from` processes the journal's own open events, so
+capacity limits and session-ID reincarnations replay EXACTLY; journals
+that predate open events fall back to the role header. The replayed
+host's journal is identical to the original's.
+
+## 54. Single execution dispatcher and formatter obligations (normative)
+
+Generated agents use ONE action dispatcher for top-level AND nested
+execution; every language feature behaves identically inside nested
+control flow. The formatter emits ALL declarations — including phase
+declarations and `as <role>` executor attribution — and orders send
+payloads before targets; `parse -> format -> parse` is a semantic
+fixpoint and formatting is idempotent. A declared phase that is never
+entered produces a compile warning. The Rust runtime and generated
+agents MUST produce identical observable behavior; the parity harness
+runs in CI.
+
+### 54.1 Out of scope (honesty)
+Cross-participant phase compatibility (proving every message arrives in
+a reachable, compatible phase across ALL participants) requires a global
+protocol analysis and remains future work; declared-phase validation and
+per-phase reachability are implemented.

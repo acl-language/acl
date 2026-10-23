@@ -135,8 +135,9 @@ program; scenario assertions `expect state/commitment/log`.
 - **Concurrent conversations** — every session is an independent
   participant instance: states, phases and commitments never leak across
   conversations of the same role.
-- **Exact replay** — ticks, closes and capability grants are journaled:
-  replay covers the whole execution, not only delivered events.
+- **Exact replay** — session opens (in order), ticks, closes and
+  capability grants are journaled: replay covers the whole execution,
+  including capacity limits and ID reincarnations.
 - **Guaranteed parity** — generated Python agents reproduce the Rust
   runtime's observable behavior for equal inputs (harness: `tests/`).
 

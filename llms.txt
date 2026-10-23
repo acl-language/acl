@@ -81,8 +81,8 @@ bids within 5s as ready;`), local error flow (`try { ... } catch
 payloads), `aclc fmt` canonical formatting, `expect log` scenario
 assertions, conversation phases (`phase x;` / `in x` / `enter x;`),
 named commitments (`begin <id>;` / `fulfil <id>;`), send payload
-interpolation (`send inform {"r": "${y}"};`), exact replay of ticks/
-closes/grants, and guaranteed Rust/Python parity.
+interpolation (`send inform {"r": "${y}"};`), exact replay of opens/
+ticks/closes/grants, and guaranteed Rust/Python parity.
 
 ## Compile and run
 

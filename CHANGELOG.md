@@ -6,6 +6,35 @@ Format based on Keep a Changelog; versions follow semver for the
 
 ## [Unreleased]
 
+## [0.18.0] — 2026-10-23
+
+### Added
+- **Ordered session-open replay (§53)**: opens are journaled in order;
+  replay respects capacity limits and session-ID reincarnations; legacy
+  journals fall back to the role header.
+- **Formatter obligations (§54)**: `pretty` emits phase declarations and
+  `as <role>` attribution; send payloads before targets; new roundtrip
+  test proves parse→pretty→parse is a semantic fixpoint and formatting
+  is idempotent for a program using every feature.
+- **Phase reachability warning**: a declared phase that is never
+  `enter`-ed warns as unreachable.
+
+### Fixed
+- **Python single dispatcher (§54)**: the generated runtime had TWO
+  action dispatchers that drifted — `enter`, `begin <id>` and
+  interpolated sends silently did nothing inside `try`/`catch`. One
+  dispatcher now serves top-level and nested execution.
+- **Formatter payload order**: `action_word` emitted send payloads after
+  the target, so re-parsing swallowed them into the target role.
+- **Python `true`/`false` literals**: generated code emitted Rust
+  lowercase booleans (NameError at load) instead of `True`/`False`.
+- **Phase peel lost the `from` clause**: `on inform in work from b`
+  reparsed with `from: None`.
+
+### CI
+- The Rust/Python parity harness runs explicitly in CI
+  (`cargo test --test py_parity -- --ignored`).
+
 ## [0.17.0] — 2026-10-23
 
 ### Added
