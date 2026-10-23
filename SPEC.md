@@ -418,6 +418,7 @@ an ACL capability.
 | HTTP/SSE transport (`acl-httpd`) | live demo: sync POST, signed SSE stream, card |
 | A2A bridge | unit-tested mapping + end-to-end vs real A2A server (HTTP) |
 | MCP bridge (`acl-mcp-bridge`) | end-to-end against a real MCP server (node) |
+| multi-agent demo (`tests/pilots/`) | 3 Python agents over live pipes: watch, input_required workflow, real delegate chain — all signed |
 
 Not yet implemented: WebSocket transport, sealed envelopes (v0.2),
 TypeScript binding, live-network A2A peer validation, public governance.
