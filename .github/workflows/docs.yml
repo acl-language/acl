@@ -26,8 +26,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build rustdoc
         run: cargo doc --no-deps
-      - name: Build playground generator
-        run: cargo build --bin playground --bin aclc
+      - name: Build playground + discovery generators
+        run: cargo build --bin playground --bin aclc --bin acl_discover
       - name: Assemble site
         run: |
           mkdir -p site/doc site/playground
@@ -36,6 +36,9 @@ jobs:
           cp docs/playground/index.html site/playground/
           cp docs/playground/msgpack.js site/playground/
           cp docs/site-index.html site/index.html
+          ./target/debug/acl_discover site "https://acl-language.github.io/acl/"
+          cp llms.txt site/
+          cp llms.txt site/.well-known/llms.txt
           echo "<meta http-equiv=\"refresh\" content=\"0;url=doc/acl_core/index.html\">" > site/doc/index.html
       - name: Validate playground transcript
         run: |

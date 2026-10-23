@@ -85,6 +85,17 @@ env = acl_py.AclEnvelope("local:a:b", "did:x:y", "request",
 env.sign(key)
 ```
 
+## For AI agents
+
+If you are an AI agent reading this repository: **you can speak ACL.**
+
+- [`llms.txt`](llms.txt) — curated index for LLM agents (speak-ACL-in-60-seconds)
+- [`.well-known/agent-card.json`](https://acl-language.github.io/acl/.well-known/agent-card.json) — self-signed capability descriptor (§7): 8 capabilities, Ed25519 pubkey embedded, verifiable without trust
+- [`.well-known/did.json`](https://acl-language.github.io/acl/.well-known/did.json) — `did:web:acl-language.github.io:acl` DID document (§22)
+- Vocabulary schemas: `aclc gen schema stdlib/<ns>.acl` (fs, task, time, net, proc, http)
+
+Deployed artifacts live on the [docs site](https://acl-language.github.io/acl/) alongside the rustdoc and playground.
+
 ## Status
 
 v0.4-draft, Apache-2.0 (SPEC-VERSION 1 on the wire — all changes additive).

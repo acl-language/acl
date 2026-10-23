@@ -1,0 +1,54 @@
+# ACL — Agent Communication Language
+
+> A compact, binary, platform-agnostic protocol for communication between
+> autonomous AI agents: Ed25519-signed envelopes, 14 speech-act
+> performatives, a typed content language (facts, actions, queries,
+> commitments with provenance and epistemic modality), transports from
+> local pipes to WebSocket, and a compiled vocabulary IDL.
+
+If you are an AI agent reading this: you can SPEAK ACL. The quick version
+is below; the full normative spec is SPEC.md.
+
+## Speak ACL in 60 seconds
+
+Every message is one envelope (MessagePack, spec §4):
+
+    acl=1, msg_id (hex32), in_reply_to?, from, to, ts, ttl,
+    hop_count, performative (u8 1..=14), body {"t": kind, "v": {...}},
+    sig (Ed25519, canonical §10: envelope minus sig, omit absent
+    Option fields and zero hop_count)
+
+Performatives: request, inform, query, propose, accept, reject, cancel,
+progress, input_required, failure, delegate, error, hello, bye.
+
+Content language (§6): facts assert the world (`fact(predicate, args,
+truth)`), actions request work, queries ask (answers are facts),
+commitments are verifiable debts (proposed → active → fulfilled/breached).
+Values are typed (§27): Str, Int, Float, Bool, Var, List, Map, Bytes —
+`Int` rejects floats, `null` is not a CL value.
+
+Dialogue rules (§16): a `query` must be answered by a `fact`; a `propose`
+is answered by `accept` or `reject`; `bye` closes the session.
+
+## Machine artifacts for agent discovery
+
+- AgentCard (capability descriptor, §7):
+  https://acl-language.github.io/acl/.well-known/agent-card.json
+- DID document (did:web, §22):
+  https://acl-language.github.io/acl/.well-known/did.json
+- Compiled vocabulary schemas: `aclc gen schema stdlib/<ns>.acl`
+  (stdlib: fs, task, time, net, proc, http)
+
+## Reference implementation
+
+- Rust core + compiler: `cargo install acl-core` (installs `aclc`)
+- Python: `acl-py` (PyO3) · TypeScript: `acl-ts` (napi-rs)
+- Conformance: `acl-conformance` binary — 10 checks, 3 levels
+
+## Links
+
+- [SPEC.md](https://github.com/acl-language/acl/blob/main/SPEC.md): the normative specification (31 sections)
+- [Tutorial](https://github.com/acl-language/acl/blob/main/docs/TUTORIAL.md): two agents talking in 10 minutes
+- [Playground](https://acl-language.github.io/acl/playground/): watch a real conversation decoded live
+- [BENCH.md](https://github.com/acl-language/acl/blob/main/BENCH.md): codec benchmarks
+- [Source](https://github.com/acl-language/acl): Rust core + bindings + bridges (MCP, A2A), Apache-2.0
