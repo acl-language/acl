@@ -21,8 +21,9 @@ pub struct StateDecl {
 /// What fires a handler.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OnTrigger {
-    /// `on request("quote")` — incoming speech act (optionally patterned)
-    Event { performative: Performative, pattern: Option<String> },
+    /// `on request("quote") from buyer` — incoming speech act (optionally
+    /// patterned, optionally attributed to a sender role)
+    Event { performative: Performative, pattern: Option<String>, from: Option<String> },
     /// `on breach` — a commitment this role owes was broken
     Breach,
     /// `on expired` — the session/commitment deadline passed
@@ -32,8 +33,9 @@ pub enum OnTrigger {
 /// What a handler does. Phase 1: the speech-act statement set.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProtocolAction {
-    /// `send propose { ... }` — MUST be dialogue-legal for the trigger
-    Send { performative: Performative },
+    /// `send propose to seller` — MUST be dialogue-legal for the trigger;
+    /// `to` names the receiving role (defaults to the counterpart)
+    Send { performative: Performative, to: Option<String> },
     /// `begin` — activate the pending commitment (proposed -> active)
     Begin,
     /// `fulfil` — mark the commitment fulfilled (active -> fulfilled)
@@ -97,15 +99,20 @@ fn perf_from_word(w: &str) -> Option<Performative> {
     })
 }
 
-/// Strip `(...)` pattern/suffix from a handler head: `request("quote")` ->
-/// (`request`, Some(`"quote"`)). Quote content is opaque in phase 1.
-fn split_trigger(head: &str) -> (String, Option<String>) {
-    match head.find('(') {
+/// Strip `(...)` pattern and `from <role>` from a handler head:
+/// `request("quote") from buyer` -> (`request`, Some(`"quote"`), Some(`buyer`))
+fn split_trigger(head: &str) -> (String, Option<String>, Option<String>) {
+    let (head, from) = match head.rfind(" from ") {
+        Some(i) => (head[..i].trim().to_string(), Some(head[i + 6..].trim().to_string())),
+        None => (head.trim().to_string(), None),
+    };
+    let (word, pattern) = match head.find('(') {
         Some(i) if head.ends_with(')') => {
             (head[..i].trim().to_string(), Some(head[i..].to_string()))
         }
         _ => (head.trim().to_string(), None),
-    }
+    };
+    (word, pattern, from)
 }
 
 pub fn parse(src: &str) -> Result<ProtocolProgram, Vec<IdlError>> {
@@ -247,12 +254,15 @@ pub fn parse(src: &str) -> Result<ProtocolProgram, Vec<IdlError>> {
 }
 
 fn parse_trigger(head: &str) -> Result<OnTrigger, String> {
-    let (word, pattern) = split_trigger(head);
+    let (word, pattern, from) = split_trigger(head);
     match word.as_str() {
+        "breach" | "expired" if from.is_some() => {
+            Err(format!("'{word}' cannot have a 'from' role"))
+        }
         "breach" => Ok(OnTrigger::Breach),
         "expired" => Ok(OnTrigger::Expired),
         w => match perf_from_word(w) {
-            Some(p) => Ok(OnTrigger::Event { performative: p, pattern }),
+            Some(p) => Ok(OnTrigger::Event { performative: p, pattern, from }),
             None => Err(format!("unknown trigger '{word}'")),
         },
     }
@@ -274,9 +284,13 @@ fn parse_action(stmt: &str) -> Result<ProtocolAction, String> {
         return Ok(ProtocolAction::Retract { target: target.trim_matches('"').to_string() });
     }
     if let Some(rest) = s.strip_prefix("send ") {
+        let (rest, to) = match rest.find(" to ") {
+            Some(i) => (rest[..i].trim(), Some(rest[i + 4..].trim().to_string())),
+            None => (rest, None),
+        };
         let word = rest.split(|c: char| c == '(' || c == ' ' || c == '{').next().unwrap_or(rest);
         return match perf_from_word(word.trim()) {
-            Some(p) => Ok(ProtocolAction::Send { performative: p }),
+            Some(p) => Ok(ProtocolAction::Send { performative: p, to }),
             None => Err(format!("unknown performative in send: '{word}'")),
         };
     }
@@ -309,8 +323,8 @@ pub fn check(prog: &ProtocolProgram) -> Result<Vec<String>, Vec<IdlError>> {
     let mut sigs: BTreeMap<String, ()> = BTreeMap::new();
     for h in &prog.handlers {
         let sig = match &h.trigger {
-            OnTrigger::Event { performative, pattern } => {
-                format!("event:{performative:?}:{pattern:?}")
+            OnTrigger::Event { performative, pattern, from } => {
+                format!("event:{performative:?}:{pattern:?}:{from:?}")
             }
             OnTrigger::Breach => "breach".into(),
             OnTrigger::Expired => "expired".into(),
@@ -323,7 +337,7 @@ pub fn check(prog: &ProtocolProgram) -> Result<Vec<String>, Vec<IdlError>> {
     // §33: every send must be dialogue-legal for its trigger
     for h in &prog.handlers {
         for a in &h.actions {
-            let ProtocolAction::Send { performative: out } = a else { continue };
+            let ProtocolAction::Send { performative: out, .. } = a else { continue };
             let legal = match &h.trigger {
                 OnTrigger::Event { performative: inp, .. } => dialogue_legal(*inp, *out),
                 // breach/expired happen inside a session opened by some
@@ -391,10 +405,16 @@ pub fn pretty(prog: &ProtocolProgram) -> String {
     }
     for h in &prog.handlers {
         let trig = match &h.trigger {
-            OnTrigger::Event { performative, pattern } => match pattern {
-                Some(p) => format!("{}{}", perf_word(performative), p),
-                None => perf_word(performative).to_string(),
-            },
+            OnTrigger::Event { performative, pattern, from } => {
+                let mut t = match pattern {
+                    Some(p) => format!("{}{}", perf_word(performative), p),
+                    None => perf_word(performative).to_string(),
+                };
+                if let Some(f) = from {
+                    t.push_str(&format!(" from {f}"));
+                }
+                t
+            }
             OnTrigger::Breach => "breach".into(),
             OnTrigger::Expired => "expired".into(),
         };
@@ -441,7 +461,10 @@ fn perf_word(p: &Performative) -> &'static str {
 
 fn action_word(a: &ProtocolAction) -> String {
     match a {
-        ProtocolAction::Send { performative } => format!("send {}", perf_word(performative)),
+        ProtocolAction::Send { performative, to } => match to {
+            Some(r) => format!("send {} to {}", perf_word(performative), r),
+            None => format!("send {}", perf_word(performative)),
+        },
         ProtocolAction::Begin => "begin".into(),
         ProtocolAction::Fulfil => "fulfil".into(),
         ProtocolAction::Retract { target } => format!("retract({target})"),

@@ -891,6 +891,43 @@ session state (§5); `begin`/`fulfil` transition the commitment lifecycle
 (§6.2). Compile-time checking (§33.2) plus signed envelopes means the
 execution log is an auditable transcript by construction.
 
+### 33.4 Runtime (normative)
+
+`Runtime(role)` executes a role's endpoint as a live agent:
+
+- Input: `Event::In { from, performative, pattern? }`, `Event::Breach`,
+  `Event::Expired`. Output: `OutEvent { to, performative }`.
+- Handler selection: FIRST handler whose trigger matches (performative,
+  pattern when both present, `from` when declared).
+- Actions execute in declaration order: `send` emits, `begin` moves
+  Proposed → Active, `fulfil` moves Active → Fulfilled, mis-sequenced
+  transitions are logged and IGNORED (never fatal), `retract(t)` sets
+  state `t` false (§32.1 semantics).
+- **Auditability**: EVERY received event enters the transcript, handled
+  or not; every emission and every state transition is logged with a
+  sequence number. The transcript is the proof of protocol conformance.
+- Session end: `end when` evaluates builtins (`fulfilled` → commitment
+  is Fulfilled; `breached` → Breached) or a declared state being true.
+- The runtime is a pure function of (program, delivered events) — no
+  I/O, no clock: deterministic and replayable.
+
+### 33.5 Multiparty projection (normative)
+
+A global protocol COMPILES into per-role endpoints:
+
+- A handler executes in the role that RECEIVES its trigger: `from R`
+  ⇒ every role ≠ R; `breach`/`expired` execute in the role that is NOT
+  the handler's send target (the debtor reports to the creditor).
+- `send X to R2` emits in the executor's endpoint; omitted `to` defaults
+  to the counterpart (two-role protocols).
+- Projection requires exactly 2 roles in phase 3; roles must be declared;
+  sends may not target the sender role.
+- A role whose triggers are all attributed to itself gets an EMPTY
+  endpoint — initiators act, they do not react.
+- Two projected runtimes, driven through a wire, reproduce the global
+  conversation: their combined transcripts contain every in/out event
+  of the protocol, and the commitment lifecycle completes once.
+
 ## 16. Dialogue rules (normative)
 
 A conversation has policy: after a given performative, only certain replies

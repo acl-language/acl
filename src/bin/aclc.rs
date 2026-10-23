@@ -18,6 +18,53 @@ fn main() {
     let files = &args[2..];
 
     match cmd {
+        "endpoints" => {
+            // §33.5: project the global protocol onto each role's endpoint
+            let mut failed = false;
+            for f in files {
+                let src = std::fs::read_to_string(f).unwrap_or_else(|e| {
+                    eprintln!("aclc: cannot read {f}: {e}");
+                    std::process::exit(2);
+                });
+                match acl_core::protocol::parse(&src) {
+                    Err(errors) => {
+                        failed = true;
+                        for e in errors { eprintln!("{f}:{e}"); }
+                    }
+                    Ok(prog) => {
+                        for role in &prog.roles {
+                            match acl_core::runtime::project(&prog, role) {
+                                Err(errors) => {
+                                    failed = true;
+                                    for e in errors { eprintln!("{f}:{e}"); }
+                                }
+                                Ok(ep) => {
+                                    println!("{f}: endpoint '{}' — {} handlers", ep.role, ep.handlers.len());
+                                    for h in &ep.handlers {
+                                        let t = match &h.trigger {
+                                            acl_core::protocol::OnTrigger::Event { performative, pattern, from } => {
+                                                format!("{:?}{} from {:?}", performative, pattern.clone().unwrap_or_default(), from)
+                                            }
+                                            acl_core::protocol::OnTrigger::Breach => "Breach".into(),
+                                            acl_core::protocol::OnTrigger::Expired => "Expired".into(),
+                                        };
+                                        let a: Vec<String> = h.actions.iter().map(|x| match x {
+                                            acl_core::protocol::ProtocolAction::Send { performative, to } =>
+                                                format!("send {:?} to {:?}", performative, to),
+                                            acl_core::protocol::ProtocolAction::Begin => "begin".into(),
+                                            acl_core::protocol::ProtocolAction::Fulfil => "fulfil".into(),
+                                            acl_core::protocol::ProtocolAction::Retract { target } => format!("retract({target})"),
+                                        }).collect();
+                                        println!("    on {} -> {}", t, a.join("; "));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            std::process::exit(if failed { 1 } else { 0 });
+        }
         "protocol" => {
             // §33: compile .aclp protocol programs — parse + §16 dialogue
             // matrix enforced at COMPILE time

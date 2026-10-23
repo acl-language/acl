@@ -6,6 +6,28 @@ Format based on Keep a Changelog; versions follow semver for the
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-10-23
+
+Phases 2 and 3 of the protocol-program stack: the runtime that EXECUTES
+`.aclp` programs and multiparty projection that compiles a global
+protocol into per-role endpoints.
+
+### Added
+- **Runtime** (§33.4): `src/runtime.rs` — `Runtime(role)` delivers
+  events, executes handlers in order, tracks the commitment lifecycle
+  (mis-sequenced transitions logged and ignored, never fatal) and keeps
+  an auditable transcript: every received event is logged handled or
+  not. Pure function of (program, events) — deterministic, replayable.
+- **Multiparty projection** (§33.5): `project(prog, role)` compiles the
+  global protocol into a per-role endpoint — each role sees only its
+  handlers; `from`/`to` attribution grammar added (`on request("quote")
+  from buyer -> send propose to buyer`); breach/expired handlers execute
+  in the debtor role (≠ send target). Initiators get empty endpoints.
+- **`aclc endpoints`**: prints each role's projected endpoint.
+- 8 new tests (88/88): projection sides, n>2 rejection, handler order,
+  commitment lifecycle, breach firing, unhandled-event audit, full
+  two-runtime conversation reproduction, retract statement.
+
 ## [0.8.0] — 2026-10-23
 
 ACL becomes a programming language whose primitives are speech acts:
