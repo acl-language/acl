@@ -14,6 +14,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Unit tests (acl-core + bridges)
         run: cargo test
+      - name: Build aclc compiler
+        run: cargo build --bin aclc
+      - name: IDL stdlib check + lint + gen smoke
+        run: |
+          target/debug/aclc check stdlib/*.acl
+          target/debug/aclc lint stdlib/*.acl
+          target/debug/aclc gen py stdlib/task.acl /tmp/acl-gen
+          target/debug/aclc gen rust stdlib/fs.acl /tmp/acl-gen
       - name: Build binaries
         run: cargo build --bin peer --bin httpd --bin interop --bin mcp_bridge
       - name: Build acl-py binding
