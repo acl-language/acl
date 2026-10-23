@@ -4,6 +4,7 @@
 //! body variants, Ed25519 signing, AgentCard, stream framing.
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+pub mod bridge;
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use std::io::Read;
