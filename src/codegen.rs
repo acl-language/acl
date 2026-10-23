@@ -42,7 +42,31 @@ fn py_action(a: &ProtocolAction) -> String {
                 None => "None".to_string(),
             },
             match fields {
-                Some(f) => serde_json::to_string(f).unwrap_or_default(),
+                Some(f) => {
+                    // §53: values with ${expr} become pre-parsed
+                    // interpolation segments (python has no expr parser)
+                    let entries: Vec<String> = f
+                        .iter()
+                        .map(|(k, v)| {
+                            let val = if v.contains("${") {
+                                let segs: Vec<String> = fmt_segments(v)
+                                    .into_iter()
+                                    .map(|seg| match seg {
+                                        FmtSeg::Text(t) => serde_json::json!({ "s": t }).to_string(),
+                                        FmtSeg::Expr(e) => serde_json::json!({
+                                            "e": serde_json::from_str::<serde_json::Value>(&py_expr(&e)).unwrap_or_default()
+                                        }).to_string(),
+                                    })
+                                    .collect();
+                                format!("{{\"interp\": [{}]}}", segs.join(", "))
+                            } else {
+                                serde_json::to_string(v).unwrap_or_default()
+                            };
+                            format!("\"{k}\": {val}")
+                        })
+                        .collect();
+                    format!("{{{}}}", entries.join(", "))
+                }
                 None => "None".into(),
             }
         ),
@@ -356,6 +380,16 @@ pub fn gen_agent_py(prog: &ProtocolProgram, role: &str) -> Result<String, Vec<cr
             return v != 0
         return len(v) > 0
 
+    def _eval_interp(self, node):
+        # §53: interpolation segments
+        out = ""
+        for seg in node["interp"]:
+            if "s" in seg:
+                out += seg["s"]
+            else:
+                out += self._text(self._eval(seg["e"]))
+        return out
+
     def _text(self, v):
         if v is True:
             return "true"
@@ -524,7 +558,10 @@ pub fn gen_agent_py(prog: &ProtocolProgram, role: &str) -> Result<String, Vec<cr
         for a in h["actions"]:
             if a["kind"] == "send":
                 self.transcript.append(("out", a["performative"]))
-                out.append({"to": a["to"], "performative": a["performative"], "fields": a["fields"]})
+                fields = a["fields"]
+                if isinstance(fields, dict):
+                    fields = {k: (self._eval_interp(v) if isinstance(v, dict) and "interp" in v else v) for k, v in fields.items()}
+                out.append({"to": a["to"], "performative": a["performative"], "fields": fields})
             elif a["kind"] == "begin":
                 if self.commitment == "proposed":
                     self.commitment = "active"

@@ -857,7 +857,7 @@ impl Runtime {
             for g in guards {
                 if g.eval(&self.bool_view()) {
                     self.log(Dir::State, "abort condition met".into());
-                    out.extend(self.run_actions(&[ProtocolAction::Abort], &ev));
+                    out.extend(self.run_actions(&[ProtocolAction::Abort], &ev, &BTreeMap::new()));
                     self.aborted = true;
                     break;
                 }
@@ -953,6 +953,23 @@ impl Runtime {
         for a in &actions {
             match a {
                 ProtocolAction::Send { performative, to, fields, retry } => {
+                    // §53: payload values may interpolate `${expr}` —
+                    // correlation between the conversation and the wire
+                    let fields = fields.clone().map(|m| {
+                        m.into_iter()
+                            .map(|(k, v)| {
+                                let v2 = if v.contains("${") {
+                                    self.interp(&v, ev, &captures).unwrap_or_else(|e| {
+                                        self.log(Dir::State, format!("send {k}: interpolation failed: {e}"));
+                                        v
+                                    })
+                                } else {
+                                    v
+                                };
+                                (k, v2)
+                            })
+                            .collect::<BTreeMap<_, _>>()
+                    });
                     self.last_out = Some(*performative);
                     self.log(
                         Dir::Out,
@@ -1016,7 +1033,7 @@ impl Runtime {
                         }
                         other => {
                             let reason = format!("broadcast to '{to}': not a list ({:?})", other.map(value_text).unwrap_or_default());
-                            self.action_failed(reason, &mut out);
+                            self.action_failed(reason, &mut out, &captures);
                         }
                     }
                 }
@@ -1058,7 +1075,7 @@ impl Runtime {
                 ProtocolAction::Try { body, catch } => {
                     // §45: handler-local error flow
                     self.catch_stack.push(catch.clone());
-                    let inner = self.run_actions(body, ev);
+                    let inner = self.run_actions(body, ev, &captures);
                     self.catch_stack.pop();
                     out.extend(inner);
                 }
@@ -1083,12 +1100,12 @@ impl Runtime {
                 ProtocolAction::Set { name, field, expr } => match self.eval(expr, ev, &captures) {
                     Ok(v) => {
                         if let Err(e) = self.set_state(name, v.clone()) {
-                            self.action_failed(format!("set {name}: {e}"), &mut out);
+                            self.action_failed(format!("set {name}: {e}"), &mut out, &captures);
                         } else {
                             self.log(Dir::State, format!("set {} = {}", name, value_text(&v)));
                         }
                     }
-                    Err(e) => self.action_failed(format!("set {name}: {e}"), &mut out),
+                    Err(e) => self.action_failed(format!("set {name}: {e}"), &mut out, &captures),
                 },
                 ProtocolAction::Push { state, expr } => match self.eval(expr, ev, &captures) {
                     Ok(v) => {
@@ -1103,6 +1120,7 @@ impl Runtime {
                                             "push {state}: element {} does not match '{ty}'",
                                             value_text(&v)),
                                             &mut out,
+                                            &captures,
                                         );
                                         continue;
                                     }
@@ -1112,7 +1130,7 @@ impl Runtime {
                         if !is_list {
                             let other = self.states.get(state).cloned().unwrap_or(StateValue::Unset);
                             let reason = format!("push {state}: not a list ({})", value_text(&other));
-                            self.action_failed(reason, &mut out);
+                            self.action_failed(reason, &mut out, &captures);
                             continue;
                         }
                         match self.states.get_mut(state) {
@@ -1123,7 +1141,7 @@ impl Runtime {
                         }
                         self.log(Dir::State, format!("push {}", state));
                     }
-                    Err(e) => self.action_failed(format!("push {state}: {e}"), &mut out),
+                    Err(e) => self.action_failed(format!("push {state}: {e}"), &mut out, &captures),
                 },
                 ProtocolAction::Put { state, key, expr } => match self.eval(expr, ev, &captures) {
                     Ok(v) => {
@@ -1137,10 +1155,11 @@ impl Runtime {
                                         let kv = StateValue::Str(key.clone());
                                         if !self.value_matches_type(kt, &kv) || !self.value_matches_type(vt, &v) {
                                             self.action_failed(
-                                                format!(
+format!(
                                                 "put {state}[{key}]: key/value does not match '{ty}'"),
-                                                &mut out,
-                                            );
+&mut out,
+&captures,
+);
                                             continue;
                                             continue;
                                         }
@@ -1151,7 +1170,7 @@ impl Runtime {
                         if !is_map {
                             let other = self.states.get(state).cloned().unwrap_or(StateValue::Unset);
                             let reason = format!("put {state}: not a map ({})", value_text(&other));
-                            self.action_failed(reason, &mut out);
+                            self.action_failed(reason, &mut out, &captures);
                             continue;
                         }
                         match self.states.get_mut(state) {
@@ -1164,7 +1183,7 @@ impl Runtime {
                         }
                         self.log(Dir::State, format!("put {}[{}]", state, key));
                     }
-                    Err(e) => self.action_failed(format!("put {state}: {e}"), &mut out),
+                    Err(e) => self.action_failed(format!("put {state}: {e}"), &mut out, &captures),
                 },
                 ProtocolAction::For { var, over, actions } => {
                     // iterate a SNAPSHOT (the body may mutate the list);
@@ -1181,7 +1200,7 @@ impl Runtime {
                     self.log(Dir::State, format!("for {} in {} ({} items)", var, over, snapshot.len()));
                     for item in snapshot {
                         self.states.insert(var.clone(), item.clone());
-                        out.extend(self.run_actions(actions, ev));
+                        out.extend(self.run_actions(actions, ev, &captures));
                     }
                     match saved {
                         Some(v) => {
@@ -1244,10 +1263,50 @@ impl Runtime {
     }
 
     /// run a list of actions (used by `for` bodies)
+    /// §53: interpolate `${expr}` in a template string with the session
+    /// scope — shared by fmt() and send/broadcast payloads
+    fn interp(&self, template: &str, ev: &Event, scope: &BTreeMap<String, StateValue>) -> Result<String, String> {
+        let esc = "\u{1}";
+        let mut out = String::new();
+        let cs: Vec<char> = template.replace("$${", esc).chars().collect();
+        let mut i = 0;
+        while i < cs.len() {
+            if cs[i] == '$' && i + 1 < cs.len() && cs[i + 1] == '{' {
+                let mut depth = 1i64;
+                let mut j = i + 2;
+                while j < cs.len() && depth > 0 {
+                    match cs[j] {
+                        '{' => depth += 1,
+                        '}' => depth -= 1,
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                if depth != 0 {
+                    return Err("unterminated ${ in template".into());
+                }
+                let src: String = cs[i + 2..j - 1].iter().collect();
+                let e = crate::protocol::Expr::parse_expr(src.trim())?;
+                let v = self.eval(&e, ev, scope)?;
+                out.push_str(&value_text(&v));
+                i = j;
+            } else {
+                out.push(cs[i]);
+                i += 1;
+            }
+        }
+        Ok(out.replace(esc, "${"))
+    }
+
     /// §45: route an action failure — inside a `try` the catch actions
     /// run and the remaining body is cut; otherwise the session's
     /// `on error` handler fires (§38.7)
-    fn action_failed(&mut self, reason: String, out: &mut Vec<OutEvent>) {
+    fn action_failed(
+        &mut self,
+        reason: String,
+        out: &mut Vec<OutEvent>,
+        captures: &BTreeMap<String, StateValue>,
+    ) {
         if !self.in_catch {
             if let Some(catch) = self.catch_stack.last().cloned() {
                 // §45: run the catch with catch suppression (a failure
@@ -1255,7 +1314,7 @@ impl Runtime {
                 // only THEN latch the body cut
                 self.in_catch = true;
                 self.log(Dir::State, format!("caught: {reason}"));
-                out.extend(self.run_actions(&catch, &Event::InternalError(reason)));
+                out.extend(self.run_actions(&catch, &Event::InternalError(reason), captures));
                 self.in_catch = false;
                 self.catch_jump = true;
                 return;
@@ -1267,7 +1326,12 @@ impl Runtime {
 
 
 
-    fn run_actions(&mut self, actions: &[ProtocolAction], ev: &Event) -> Vec<OutEvent> {
+    fn run_actions(
+        &mut self,
+        actions: &[ProtocolAction],
+        ev: &Event,
+        captures: &BTreeMap<String, StateValue>,
+    ) -> Vec<OutEvent> {
         let mut out = Vec::new();
         for a in actions {
             // §45: a caught failure cuts the remaining body short
@@ -1288,7 +1352,7 @@ impl Runtime {
                             let saved = self.states.get(var).cloned();
                             for item in snapshot {
                                 self.states.insert(var.clone(), item.clone());
-                                out.extend(self.run_actions(actions, ev));
+                                out.extend(self.run_actions(actions, ev, &captures));
                             }
                             match saved {
                                 Some(v) => {
@@ -1322,7 +1386,7 @@ impl Runtime {
                     let h = Handler { trigger: OnTrigger::Expired, guard: None, actions: vec![other.clone()], line: 0 };
                     self.endpoint.handlers.push(h);
                     let idx = self.endpoint.handlers.len() - 1;
-                    out.extend(self.run_handler(idx, ev, BTreeMap::new()));
+                    out.extend(self.run_handler(idx, ev, captures.clone()));
                     self.endpoint.handlers.pop();
                 }
             }
