@@ -41,6 +41,18 @@ impl CommitmentStatus {
     }
 }
 
+/// Epistemic modality of a fact (spec §6.4): how the sender holds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Epistemic {
+    /// Sender asserts this as its own observation/authority.
+    Asserted,
+    /// Sender believes it (second-hand, not verified).
+    Believed,
+    /// Sender verified it directly.
+    Known,
+}
+
 /// An action expression: `name(params) -> result_schema?`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ClAction {
@@ -63,7 +75,31 @@ pub enum ClExpr {
         args: BTreeMap<String, serde_json::Value>,
         #[serde(default = "default_true")]
         truth: bool,
+        /// §6.4 epistemic modality (default: Asserted).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        modality: Option<Epistemic>,
+        /// §6.4 provenance chain: AIDs of who asserted/forwarded, oldest first.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provenance: Option<Vec<String>>,
+        /// §6.4 confidence in [0,1].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        confidence: Option<f32>,
+        /// §6.4 temporal validity: fact expires at this unix ms.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        valid_until_ms: Option<i64>,
     },
+    /// §6.3 conjunction — all leaves must hold.
+    #[serde(rename = "and")]
+    And { exprs: Vec<ClExpr> },
+    /// §6.3 disjunction — at least one leaf must hold.
+    #[serde(rename = "or")]
+    Or { exprs: Vec<ClExpr> },
+    /// §6.3 negation (fact leaves only).
+    #[serde(rename = "not")]
+    Not { expr: Box<ClExpr> },
+    /// §6.3 reference to an expression produced in another message.
+    #[serde(rename = "ref")]
+    RefExpr { msg_id: String },
     /// Express an action to be performed.
     #[serde(rename = "action")]
     Action {
@@ -102,6 +138,10 @@ impl ClExpr {
             predicate: predicate.into(),
             args: json_object_to_btree(args),
             truth: true,
+            modality: None,
+            provenance: None,
+            confidence: None,
+            valid_until_ms: None,
         }
     }
 
@@ -110,6 +150,10 @@ impl ClExpr {
             predicate: predicate.into(),
             args: json_object_to_btree(args),
             truth: false,
+            modality: None,
+            provenance: None,
+            confidence: None,
+            valid_until_ms: None,
         }
     }
 
@@ -119,6 +163,18 @@ impl ClExpr {
             params,
             result_schema: None,
         }
+    }
+
+    pub fn and(exprs: Vec<ClExpr>) -> Self {
+        ClExpr::And { exprs }
+    }
+
+    pub fn not(expr: ClExpr) -> Self {
+        ClExpr::Not { expr: Box::new(expr) }
+    }
+
+    pub fn ref_to(msg_id: &str) -> Self {
+        ClExpr::RefExpr { msg_id: msg_id.into() }
     }
 
     pub fn query(predicate: &str, args: serde_json::Value) -> Self {
@@ -173,32 +229,73 @@ pub fn well_formed(performative: Performative, exprs: &[ClExpr]) -> Result<(), S
         }
     };
     for e in exprs {
-        let op = match e {
-            ClExpr::Fact { .. } => "fact",
-            ClExpr::Action { .. } => "action",
-            ClExpr::Query { .. } => "query",
-            ClExpr::Commitment { status, .. } => {
-                // commitments: performative must agree with status
-                let ok = match performative {
-                    Performative::Propose => *status == CommitmentStatus::Proposed,
-                    Performative::Accept => *status == CommitmentStatus::Active,
-                    _ => false,
-                };
-                if !ok {
-                    return Err(format!(
-                        "performative {performative:?} cannot carry commitment with status {status:?}"
-                    ));
-                }
-                continue;
-            }
-        };
-        if op != allowed {
-            return Err(format!(
-                "performative {performative:?} carries CL op '{op}' but allows only '{allowed}'"
-            ));
-        }
+        check_leaf(performative, allowed, e)?;
     }
     Ok(())
+}
+
+/// Recursively validate one expression (§6.3: composition composes
+/// the constraint down to leaves; `not` wraps fact leaves; `ref` is
+/// neutral — it binds to another message whose grammar was checked there).
+fn check_leaf(performative: Performative, allowed: &str, e: &ClExpr) -> Result<(), String> {
+    match e {
+        ClExpr::And { exprs } | ClExpr::Or { exprs } => {
+            if exprs.is_empty() {
+                return Err("empty composition".into());
+            }
+            for sub in exprs {
+                check_leaf(performative, allowed, sub)?;
+            }
+            Ok(())
+        }
+        ClExpr::Not { expr } => match expr.as_ref() {
+            ClExpr::Fact { .. } => Ok(()),
+            other => Err(format!("'not' may only wrap a fact, got {other:?}")),
+        },
+        ClExpr::RefExpr { msg_id } => {
+            if msg_id.is_empty() {
+                return Err("ref with empty msg_id".into());
+            }
+            Ok(())
+        }
+        ClExpr::Fact { .. } => {
+            if allowed != "fact" {
+                return Err(format!(
+                    "performative {performative:?} carries CL op 'fact' but allows only '{allowed}'"
+                ));
+            }
+            Ok(())
+        }
+        ClExpr::Action { .. } => {
+            if allowed != "action" {
+                return Err(format!(
+                    "performative {performative:?} carries CL op 'action' but allows only '{allowed}'"
+                ));
+            }
+            Ok(())
+        }
+        ClExpr::Query { .. } => {
+            if allowed != "query" {
+                return Err(format!(
+                    "performative {performative:?} carries CL op 'query' but allows only '{allowed}'"
+                ));
+            }
+            Ok(())
+        }
+        ClExpr::Commitment { status, .. } => {
+            let ok = match performative {
+                Performative::Propose => *status == CommitmentStatus::Proposed,
+                Performative::Accept => *status == CommitmentStatus::Active,
+                _ => false,
+            };
+            if !ok {
+                return Err(format!(
+                    "performative {performative:?} cannot carry commitment with status {status:?}"
+                ));
+            }
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -249,11 +346,19 @@ mod tests {
             predicate: "f".into(),
             args: BTreeMap::from([("a".into(), serde_json::json!(1)), ("b".into(), serde_json::json!(2))]),
             truth: true,
+            modality: None,
+            provenance: None,
+            confidence: None,
+            valid_until_ms: None,
         }]));
         let mut e2 = env(Performative::Inform, cl_body(vec![ClExpr::Fact {
             predicate: "f".into(),
             args: BTreeMap::from([("b".into(), serde_json::json!(2)), ("a".into(), serde_json::json!(1))]),
             truth: true,
+            modality: None,
+            provenance: None,
+            confidence: None,
+            valid_until_ms: None,
         }]));
         // pin msg_id so the only difference under test is arg ordering
         e1.msg_id = "canonical-test-id-0001".into();
@@ -310,6 +415,80 @@ mod tests {
         assert!(!Breached.can_transition(Active));
         assert!(!Cancelled.can_transition(Active));
         assert!(!Fulfilled.can_transition(Fulfilled)); // terminal
+    }
+
+    #[test]
+    fn composition_and_epistemic() {
+        use Epistemic::*;
+        // and/or of facts under inform: well-formed
+        assert!(well_formed(
+            Performative::Inform,
+            &[ClExpr::and(vec![
+                ClExpr::fact("a", serde_json::json!({})),
+                ClExpr::fact("b", serde_json::json!({})),
+            ])]
+        ).is_ok());
+        // nested composition
+        assert!(well_formed(
+            Performative::Inform,
+            &[ClExpr::Or { exprs: vec![
+                ClExpr::and(vec![ClExpr::fact("a", serde_json::json!({}))]),
+                ClExpr::not(ClExpr::fact("b", serde_json::json!({}))),
+            ]}]
+        ).is_ok());
+        // composition must still respect the matrix: and(action) under inform
+        assert!(well_formed(
+            Performative::Inform,
+            &[ClExpr::and(vec![ClExpr::action("t", serde_json::json!({}))])]
+        ).is_err());
+        // not() only wraps facts
+        assert!(well_formed(
+            Performative::Inform,
+            &[ClExpr::not(ClExpr::action("t", serde_json::json!({})))]
+        ).is_err());
+        // ref is neutral, even under request... no: ref allowed as leaf
+        assert!(well_formed(
+            Performative::Inform,
+            &[ClExpr::ref_to("msg123"), ClExpr::fact("f", serde_json::json!({}))]
+        ).is_ok());
+        assert!(well_formed(
+            Performative::Inform,
+            &[ClExpr::ref_to("")]
+        ).is_err());
+
+        // epistemic fact roundtrip
+        let f = ClExpr::Fact {
+            predicate: "file_exists".into(),
+            args: BTreeMap::from([("path".into(), serde_json::json!("/tmp/x"))]),
+            truth: true,
+            modality: Some(Believed),
+            provenance: Some(vec!["did:example:a".into(), "did:example:b".into()]),
+            confidence: Some(0.8),
+            valid_until_ms: Some(1_700_000_000_000),
+        };
+        let fenv = env(Performative::Inform, cl_body(vec![f]));
+        let back = Envelope::decode(&fenv.encode().unwrap()).unwrap();
+        match &back.body {
+            Body::Cl { expressions } => match &expressions[0] {
+                ClExpr::Fact { modality, provenance, confidence, valid_until_ms, .. } => {
+                    assert_eq!(*modality, Some(Believed));
+                    assert_eq!(provenance.as_ref().unwrap().len(), 2);
+                    assert_eq!(*confidence, Some(0.8));
+                    assert_eq!(*valid_until_ms, Some(1_700_000_000_000));
+                }
+                other => panic!("expected Fact, got {other:?}"),
+            },
+            other => panic!("expected Cl, got {other:?}"),
+        }
+        // absent fields decode as None (backward compatible with v0.2 facts)
+        let plain = env(Performative::Inform, cl_body(vec![ClExpr::fact("f", serde_json::json!({}))]));
+        match Envelope::decode(&plain.encode().unwrap()).unwrap().body {
+            Body::Cl { expressions } => match expressions[0] {
+                ClExpr::Fact { modality: None, provenance: None, confidence: None, valid_until_ms: None, .. } => {}
+                _ => panic!("defaults must be None"),
+            },
+            _ => panic!(),
+        }
     }
 
     #[test]

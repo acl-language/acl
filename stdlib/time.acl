@@ -1,0 +1,17 @@
+namespace acl.std.time v1;
+
+type UnixMs = int;
+
+type Duration = int;
+
+/// Current wall-clock time on the agent's host.
+predicate now(ts: UnixMs) -> bool;
+
+/// A timestamp lies within the given window [from, to].
+predicate within(ts: UnixMs, from: UnixMs, to: UnixMs) -> bool;
+
+/// A duration is longer than the given number of milliseconds.
+predicate elapsed_longer(started: UnixMs, now_ts: UnixMs, min_ms: Duration) -> bool;
+
+/// Action: sleep for the given duration (cooperative).
+action sleep(ms: Duration) -> bool;

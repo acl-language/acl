@@ -1,0 +1,14 @@
+namespace acl.std.net v1;
+
+type Host = string;
+
+type Port = int;
+
+/// A TCP port is reachable on the host.
+predicate port_open(host: Host, port: Port) -> bool;
+
+/// An HTTP(S) endpoint answered successfully recently.
+predicate http_healthy(url: string) -> bool;
+
+/// DNS resolution works for the host.
+predicate resolvable(host: Host) -> bool;

@@ -1,0 +1,26 @@
+namespace acl.std.fs v1;
+
+type Path = string;
+
+type Bytes = int;
+
+/// Check whether a path exists on the agent's filesystem.
+predicate file_exists(path: Path) -> bool;
+
+/// Size of a file in bytes; fails if the path is not a readable file.
+predicate file_size(path: Path) -> Bytes;
+
+/// Predicate is true while a path is readable.
+predicate file_readable(path: Path) -> bool;
+
+/// List entries of a directory (returns names, not paths).
+predicate dir_entries(path: Path) -> any;
+
+/// Action: read a text file (UTF-8).
+action file_read(path: Path) -> string;
+
+/// Action: write text to a file (creates or overwrites).
+action file_write(path: Path, content: string) -> bool;
+
+/// Action: delete a file.
+action file_delete(path: Path) -> bool;

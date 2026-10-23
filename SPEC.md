@@ -213,6 +213,41 @@ the argument object.
 ]}}
 ```
 
+### 6.3 Compositional operators
+
+CL expressions compose:
+
+```text
+And  = { op:"and", exprs: [ClExpr...] }   // all leaves hold
+Or   = { op:"or",  exprs: [ClExpr...] }   // at least one holds
+Not  = { op:"not", expr: ClExpr }         // negates; wraps ONLY fact leaves
+Ref  = { op:"ref", msg_id }               // binds to an expression produced in another message
+```
+
+- Composition nests arbitrarily; the §6.2 grammar matrix applies **down to
+  leaves** (e.g. an `and` under `inform` may contain only fact leaves).
+- `not` wraps fact leaves only (`not(fact(...))`); negating actions or
+  commitments is ill-formed.
+- `ref` is grammar-neutral: it binds to an expression produced in the
+  referenced message, whose well-formedness was checked there. An empty
+  `msg_id` is ill-formed.
+- Empty `and`/`or` are ill-formed.
+
+### 6.4 Epistemic modality and provenance
+
+Facts are not absolute. Every `fact` MAY carry:
+
+| field | type | meaning |
+|-------|------|---------|
+| `modality` | `asserted` (default) / `believed` / `known` | how the sender holds the fact: own assertion, second-hand belief, or direct verification |
+| `provenance` | [AID...] | who asserted/forwarded the fact, oldest first |
+| `confidence` | float [0,1] | sender's confidence |
+| `valid_until_ms` | unix ms | temporal validity; after this the fact MUST NOT be treated as holding |
+
+Receivers SHOULD weigh `believed` facts below `known`/`asserted` ones and
+MUST discard facts past `valid_until_ms`. Absent fields keep v0.1/v0.2
+backward compatibility (defaults: `asserted`, no provenance, no expiry).
+
 ## 7. AgentCard (L4)
 
 A signed capability descriptor, analogous to A2A's Agent Card but binary and
@@ -497,3 +532,78 @@ peers. Reference: `acl_core::registry` + `registry_cli`.
 Not yet implemented: sealed-envelope key rotation/HD derivation,
 batch signature verification, WS client demo in CI (server-side validated),
 public governance body.
+
+## 16. Dialogue rules (normative)
+
+A conversation has policy: after a given performative, only certain replies
+are legal. `dialogue_legal(prev, reply)` (reference: `src/dialogue.rs`):
+
+| prev | legal replies |
+|------|---------------|
+| `request` / `delegate` | `inform`, `input_required`, `failure`, `reject`, `progress`, `error` |
+| `query` | `inform`, `failure`, `error` |
+| `propose` | `accept`, `reject`, `error` |
+| `accept` | `inform`, `failure`, `error` |
+| `cancel` | `inform`, `error` |
+| `inform` | `inform`, `error` |
+| `hello` | `hello`, `error` |
+| `input_required` | `inform`, `cancel`, `error` |
+| `progress` | `progress`, `inform`, `failure`, `input_required`, `error` |
+| `failure` / `reject` | `inform`, `error` |
+| `bye` | (none — session closed) |
+| `error` | `inform`, `error` |
+
+Receivers SHOULD reject off-policy replies; strict sessions MAY close the
+session on violation. A `query` MUST eventually be answered by a `fact`
+(possibly negated) — never by `accept` or `progress`.
+
+## 17. Formal semantics per performative
+
+Every performative carries machine-readable **feasibility preconditions**
+(FP: what must hold of the sender's mental state) and **rational effects**
+(RE: the intended effect on the receiver), FIPA-ACL style. Reference:
+`src/semantics.rs`. Examples:
+
+```text
+FP(inform): sender believes proposition(p) is true; sender intends receiver to believe it
+RE(inform): receiver believes proposition(p)
+
+FP(accept): a prior commitment exists with status=proposed and sender is its creditor
+RE(accept): commitment becomes active; debtor owes the act
+
+FP(failure): receiver attempted act(a) and could not complete it; failure is terminal
+RE(failure): sender knows act(a) failed (and why); no result will come
+```
+
+All 14 performatives have FP/RE annotations; agents and verifiers SHOULD
+process them rather than prose. Sincerity: a sender violating an FP is
+insincere — receivers MAY downgrade trust in the sender's future `believed`
+facts.
+
+## 18. IDL and toolchain
+
+Vocabularies are declared in `.acl` IDL files and compiled by `aclc`:
+
+```text
+namespace acl.std.fs v1;
+
+type Path = string;
+
+/// doc comment attached to the next declaration
+predicate file_exists(path: Path) -> bool;
+action file_read(path: Path) -> string;
+```
+
+- Full name = `<namespace>.<local>` (e.g. `acl.std.fs.file_exists`) —
+  namespaces disambiguate vendor vocabularies.
+- Primitives: `string int float bool bytes timestamp any`; aliases via
+  `type X = primitive;`.
+- **aclc** subcommands: `check` (parse+typecheck), `lint` (+ doc-comment
+  policy), `fmt` (canonical pretty-print; idempotent; the human-readable
+  surface syntax), `gen rust|py|ts` (typed builder stubs for ClExpr),
+  `names` (list fully-qualified names).
+- The **standard library** ships in `stdlib/`: `fs.acl`, `task.acl`,
+  `time.acl`, `net.acl` (namespace `acl.std.*`). CI compiles them on every
+  push.
+- Generated builders produce CL expressions bound to the declared,
+  type-checked names — the vocabulary contract travels with the code.

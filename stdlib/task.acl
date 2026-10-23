@@ -1,0 +1,25 @@
+namespace acl.std.task v1;
+
+type MsgId = string;
+
+type AgentId = string;
+
+type Percent = int;
+
+/// Task status of a tracked message.
+predicate task_status(msg_id: MsgId) -> bool;
+
+/// Task is in progress with a completion estimate.
+predicate task_progress(msg_id: MsgId, percent: Percent) -> bool;
+
+/// Agent holds an active commitment (debtor owes creditor an act).
+predicate commitment_active(debtor: AgentId, creditor: AgentId) -> bool;
+
+/// Agent breached a commitment (deadline passed without fulfilment).
+predicate commitment_breached(debtor: AgentId, creditor: AgentId) -> bool;
+
+/// Action: accept and start a delegated task.
+action task_accept(msg_id: MsgId) -> bool;
+
+/// Action: report progress for a task.
+action task_report(msg_id: MsgId, percent: Percent) -> bool;
