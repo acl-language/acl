@@ -7,19 +7,50 @@ on:
 
 permissions:
   contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
 
 jobs:
   docs:
     runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Build docs
-        run: cargo doc --no-deps --document-private-items
-      - name: Upload docs artifact
-        uses: actions/upload-artifact@v4
+      - name: Build rustdoc
+        run: cargo doc --no-deps
+      - name: Build playground generator
+        run: cargo build --bin playground --bin aclc
+      - name: Assemble site
+        run: |
+          mkdir -p site/doc site/playground
+          cp -r target/doc/* site/doc/
+          ./target/debug/playground site/playground/transcript.json
+          cp docs/playground/index.html site/playground/
+          cp docs/playground/msgpack.js site/playground/
+          cp docs/site-index.html site/index.html
+          echo "<meta http-equiv=\"refresh\" content=\"0;url=doc/acl_core/index.html\">" > site/doc/index.html
+      - name: Validate playground transcript
+        run: |
+          python3 -c "
+          import json
+          t = json.load(open('site/playground/transcript.json'))
+          assert len(t['messages']) == 8
+          assert all(m['sig_verified'] for m in t['messages'])
+          print('transcript ok:', len(t['messages']), 'messages, all verified')"
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+      - name: Upload pages artifact
+        uses: actions/upload-pages-artifact@v3
         with:
-          name: acl-docs
-          path: target/doc
-          retention-days: 30
+          path: site
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

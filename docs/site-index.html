@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ACL — Agent Communication Language</title>
+<style>
+:root { --bg:#0d1117; --card:#161b22; --border:#30363d; --fg:#e6edf3; --dim:#8b949e; --acc:#58a6ff; }
+* { box-sizing:border-box; margin:0; }
+body { background:var(--bg); color:var(--fg); font-family:-apple-system,Segoe UI,Roboto,sans-serif; padding:48px 24px; max-width:820px; margin:0 auto; }
+h1 { font-size:2.2rem; } h1 .acl { color:var(--acc); }
+.tag { color:var(--dim); font-size:1.05rem; margin:8px 0 32px; line-height:1.5; }
+.grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+a.card { display:block; background:var(--card); border:1px solid var(--border); border-radius:10px; padding:20px; text-decoration:none; color:var(--fg); transition:border-color .2s; }
+a.card:hover { border-color:var(--acc); }
+a.card h2 { font-size:1.05rem; margin-bottom:6px; color:var(--acc); }
+a.card p { color:var(--dim); font-size:.88rem; line-height:1.5; }
+.wide { grid-column:1 / -1; }
+footer { margin-top:36px; color:var(--dim); font-size:.8rem; }
+footer a { color:var(--acc); }
+</style>
+</head>
+<body>
+<h1><span class="acl">ACL</span> — Agent Communication Language</h1>
+<p class="tag">A compact, binary, platform-agnostic protocol for communication between
+autonomous AI agents: Ed25519-signed envelopes, speech-act performatives, a compiled
+content language with typed vocabularies, and transports from local pipes to WebSocket.</p>
+
+<div class="grid">
+  <a class="card wide" href="playground/">
+    <h2>▶ Playground</h2>
+    <p>Watch two real agents (argus, kenji) converse — every message is a signed envelope from an actual run, decoded live in your browser. Request → result, input_required → resume, content-language fact queries.</p>
+  </a>
+  <a class="card" href="doc/acl_core/">
+    <h2>API reference (rustdoc)</h2>
+    <p>The acl-core crate: envelope, performatives, content language, signing, framing, bridges.</p>
+  </a>
+  <a class="card" href="https://github.com/acl-language/acl/blob/main/SPEC.md">
+    <h2>The specification</h2>
+    <p>SPEC.md — 25 sections, normative: wire format, envelope, performatives, transports, security, dialogue rules, formal semantics, IDL, conformance.</p>
+  </a>
+  <a class="card" href="https://github.com/acl-language/acl/blob/main/docs/TUTORIAL.md">
+    <h2>Tutorial</h2>
+    <p>From zero to two signed agents exchanging tasks in 10 minutes.</p>
+  </a>
+  <a class="card" href="https://github.com/acl-language/acl">
+    <h2>Source</h2>
+    <p>Rust core + Python/TypeScript bindings + bridges (MCP, A2A) + stdlib vocabularies + the aclc compiler. Apache-2.0.</p>
+  </a>
+</div>
+
+<footer>ACL <span id="ver">v0.4.0</span> · <a href="https://github.com/acl-language/acl/releases">releases</a> · conformance: level 3</footer>
+</body>
+</html>
