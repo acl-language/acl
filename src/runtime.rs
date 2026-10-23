@@ -151,7 +151,7 @@ pub fn project(prog: &ProtocolProgram, role: &str) -> Result<RoleEndpoint, Vec<I
             }
         }
         if !actions.is_empty() || matches!(h.trigger, OnTrigger::Event { .. }) {
-            handlers.push(Handler { trigger: h.trigger.clone(), guard: h.guard.clone(), actions });
+            handlers.push(Handler { trigger: h.trigger.clone(), guard: h.guard.clone(), actions, line: 0 });
         }
     }
 
@@ -265,6 +265,8 @@ pub struct Runtime {
     now_ms: i64,
     /// §35.3: message templates for fmt()
     templates: Vec<(String, String)>,
+    /// §41: declared record types (for list<T>/map<K,V> element checks)
+    program_types: std::collections::BTreeMap<String, Vec<(String, String)>>,
     /// abort latch: compensation runs once
     aborted: bool,
     /// §16 enforcement: reject off-policy replies (opt-in)
@@ -327,6 +329,7 @@ impl Runtime {
             enforce_dialogue: false,
             last_out: None,
             templates: prog.templates.clone(),
+            program_types: prog.types.clone(),
             abort_when: prog.abort_when.clone(),
             session: None,
         })
@@ -336,7 +339,7 @@ impl Runtime {
         self.states.get(name)
     }
 
-    pub fn set_state(&mut self, name: &str, v: StateValue) {
+    pub fn set_state(&mut self, name: &str, v: StateValue) -> Result<(), String> {
         // §34: typed session states — assignments are checked against the
         // declared type; mismatches are logged, never fatal
         if let Some(decl) = self.states.keys().find(|k| *k == name) {
@@ -348,18 +351,94 @@ impl Runtime {
             let d: &str = &declared;
             let mismatch = match (d, &v) {
                 ("bool", StateValue::Bool(_)) | ("int", StateValue::Int(_)) | ("str", StateValue::Str(_)) => false,
+                ("float", StateValue::Float(_)) | ("float", StateValue::Int(_)) => false,
                 ("list", StateValue::List(_)) | ("map", StateValue::Map(_)) => false,
-                ("bool", _) | ("int", _) | ("str", _) | ("list", _) | ("map", _) => v != StateValue::Unset,
+                ("bool", _) | ("int", _) | ("str", _) | ("float", _) | ("list", _) | ("map", _) => {
+                    v != StateValue::Unset
+                }
+                // §41: generic containers `list<T>` / `map<K,V>` — the
+                // container kind AND every element must match
+                (t, StateValue::List(items)) if t.starts_with("list<") => {
+                    let elem = &t[5..t.len() - 1];
+                    !items.iter().all(|it| self.value_matches_type(elem, it))
+                }
+                (t, StateValue::Map(entries)) if t.starts_with("map<") => {
+                    let inner = &t[4..t.len() - 1];
+                    let (kt, vt) = inner.split_once(',').unwrap_or(("str", inner));
+                    let (kt, vt) = (kt.trim(), vt.trim());
+                    !entries.iter().all(|(k, val)| {
+                        self.value_matches_type(kt, &StateValue::Str(k.clone()))
+                            && self.value_matches_type(vt, val)
+                    })
+                }
+                // §41: record-typed states — a Record with matching __type
+                (t, StateValue::Record(m)) => {
+                    !m.get("__type").map_or(false, |tv| {
+                        matches!(tv, StateValue::Str(s) if s == t)
+                    })
+                }
+                (t, StateValue::Map(m)) if !t.starts_with("map<") => {
+                    // a record literal assigned to a record-typed state is a
+                    // Map only from JSON roundtrips — accept maps with __type
+                    !m.get("__type").map_or(false, |tv| {
+                        matches!(tv, StateValue::Str(s) if s == t)
+                    })
+                }
+                (t, StateValue::List(_)) if t.starts_with("list<") => false,
+                (t, _) if self.is_declared_record(t) => {
+                    // record-typed state assigned a non-record value
+                    v != StateValue::Unset
+                }
                 _ => false, // vocabulary types: untyped
             };
             if mismatch {
-                self.log(
-                    Dir::State,
-                    format!("type mismatch: state '{name}' is '{declared}' but assigned {v:?}"),
-                );
+                return Err(format!(
+                    "type mismatch: state '{name}' is '{declared}' but assigned {}",
+                    value_text(&v)
+                ));
             }
         }
         self.states.insert(name.to_string(), v);
+        Ok(())
+    }
+
+    fn is_declared_record(&self, ty: &str) -> bool {
+        self.program_types.contains_key(ty)
+    }
+
+    /// §41: does a value conform to a declared element/state type?
+    fn value_matches_type(&self, ty: &str, v: &StateValue) -> bool {
+        match (ty, v) {
+            (_, StateValue::Unset) => true,
+            ("bool", StateValue::Bool(_)) | ("int", StateValue::Int(_))
+            | ("str", StateValue::Str(_)) | ("float", StateValue::Float(_)) => true,
+            ("float", StateValue::Int(_)) => true,
+            ("list", StateValue::List(_)) | ("map", StateValue::Map(_)) => true,
+            (t, StateValue::Record(m)) => {
+                m.get("__type").map_or(false, |tv| {
+                    matches!(tv, StateValue::Str(s) if s == t)
+                })
+            }
+            (t, StateValue::Map(m)) if self.is_declared_record(t) => {
+                m.get("__type").map_or(false, |tv| {
+                    matches!(tv, StateValue::Str(s) if s == t)
+                })
+            }
+            (t, StateValue::List(items)) if t.starts_with("list<") => {
+                let elem = &t[5..t.len() - 1];
+                items.iter().all(|it| self.value_matches_type(elem, it))
+            }
+            (t, StateValue::Map(entries)) if t.starts_with("map<") => {
+                let inner = &t[4..t.len() - 1];
+                let (kt, vt) = inner.split_once(',').unwrap_or(("str", inner));
+                let (kt, vt) = (kt.trim(), vt.trim());
+                entries.iter().all(|(k, val)| {
+                    self.value_matches_type(kt, &StateValue::Str(k.clone()))
+                        && self.value_matches_type(vt, val)
+                })
+            }
+            _ => false,
+        }
     }
 
     /// §35.9: full state snapshot (for replay verification)
@@ -743,14 +822,31 @@ impl Runtime {
                 }
                 ProtocolAction::Set { name, field, expr } => match self.eval(expr, ev, &captures) {
                     Ok(v) => {
-                        self.log(Dir::State, format!("set {} = {}", name, value_text(&v)));
-                        self.set_state(name, v);
+                        if let Err(e) = self.set_state(name, v.clone()) {
+                            out.extend(self.deliver_internal_error(format!("set {name}: {e}")));
+                        } else {
+                            self.log(Dir::State, format!("set {} = {}", name, value_text(&v)));
+                        }
                     }
                     Err(e) => out.extend(self.deliver_internal_error(format!("set {name}: {e}"))),
                 },
                 ProtocolAction::Push { state, expr } => match self.eval(expr, ev, &captures) {
                     Ok(v) => {
                         let is_list = matches!(self.states.get(state), Some(StateValue::List(_)) | Some(StateValue::Unset) | None);
+                        // §41: element must match a `list<T>` declaration
+                        if is_list {
+                            if let Some(ty) = self.program_states.get(state) {
+                                if let Some(elem) = ty.strip_prefix("list<").map(|t| t.strip_suffix('>').unwrap_or(t)) {
+                                    if ty.starts_with("list<") && !self.value_matches_type(elem, &v) {
+                                        out.extend(self.deliver_internal_error(format!(
+                                            "push {state}: element {} does not match '{ty}'",
+                                            value_text(&v)
+                                        )));
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
                         if !is_list {
                             let other = self.states.get(state).cloned().unwrap_or(StateValue::Unset);
                             let reason = format!("push {state}: not a list ({})", value_text(&other));
@@ -770,6 +866,23 @@ impl Runtime {
                 ProtocolAction::Put { state, key, expr } => match self.eval(expr, ev, &captures) {
                     Ok(v) => {
                         let is_map = matches!(self.states.get(state), Some(StateValue::Map(_)) | Some(StateValue::Unset) | None);
+                        // §41: key/value must match a `map<K,V>` declaration
+                        if is_map {
+                            if let Some(ty) = self.program_states.get(state) {
+                                if let Some(inner) = ty.strip_prefix("map<").map(|t| t.strip_suffix('>').unwrap_or(t)) {
+                                    if ty.starts_with("map<") {
+                                        let (kt, vt) = inner.split_once(',').map(|(a, b)| (a.trim(), b.trim())).unwrap_or(("str", inner));
+                                        let kv = StateValue::Str(key.clone());
+                                        if !self.value_matches_type(kt, &kv) || !self.value_matches_type(vt, &v) {
+                                            out.extend(self.deliver_internal_error(format!(
+                                                "put {state}[{key}]: key/value does not match '{ty}'"
+                                            )));
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         if !is_map {
                             let other = self.states.get(state).cloned().unwrap_or(StateValue::Unset);
                             let reason = format!("put {state}: not a map ({})", value_text(&other));
@@ -857,7 +970,7 @@ impl Runtime {
                 ProtocolAction::Retract { target } => {
                     // §32.1 as a statement: the fact becomes retracted in
                     // this role's view; the transcript keeps the history
-                    self.set_state(target, StateValue::Bool(false));
+                    let _ = self.set_state(target, StateValue::Bool(false));
                     self.log(Dir::State, format!("retract({target})"));
                 }
             }
@@ -913,7 +1026,7 @@ impl Runtime {
                 }
                 other => {
                     // reuse run_handler's single-action logic by wrapping
-                    let h = Handler { trigger: OnTrigger::Expired, guard: None, actions: vec![other.clone()] };
+                    let h = Handler { trigger: OnTrigger::Expired, guard: None, actions: vec![other.clone()], line: 0 };
                     self.endpoint.handlers.push(h);
                     let idx = self.endpoint.handlers.len() - 1;
                     out.extend(self.run_handler(idx, ev, BTreeMap::new()));
@@ -1826,7 +1939,7 @@ mod internal_error_tests {
     #[test]
     fn set_failure_fires_on_error() {
         let prog = parse(
-            "protocol p v1;\nroles a, b;\nstate x: int;\non inform from a { set x = 1 / 0; }\non error { set x = $reason; }\n",
+            "protocol p v1;\nroles a, b;\nstate x: str;\non inform from a { set x = 1 / 0; }\non error { set x = $reason; }\n",
         )
         .unwrap();
         let mut r = Runtime::new(&prog, "b").unwrap();
@@ -2027,5 +2140,60 @@ mod rich_template_tests {
             r.states_snapshot().get("msg"),
             Some(&StateValue::Str("cost ${total}".into()))
         );
+    }
+}
+
+#[cfg(test)]
+mod generic_state_tests {
+    use super::*;
+    use crate::protocol::parse;
+
+    // §41: list<T> rejects wrong-typed elements (internal error flow)
+    #[test]
+    fn list_of_record_rejects_non_record() {
+        let prog = parse(
+            "type Bid = { price: int };\nprotocol p v1;\nroles a, b;\nstate bids: list<Bid>;\non inform from a { push bids, 5; }\non error { set bad = true; }\non inform from b -> send bye;\n",
+        )
+        .unwrap();
+        let mut r = Runtime::new(&prog, "b").unwrap();
+        r.deliver(Event::In { from: "a".into(), performative: Performative::Inform, pattern: None, fields: None });
+        assert!(r.transcript().iter().any(|e| e.text.contains("does not match 'list<Bid>'")));
+    }
+
+    #[test]
+    fn list_of_record_accepts_record() {
+        let prog = parse(
+            "type Bid = { price: int };\nprotocol p v1;\nroles a, b;\nstate bids: list<Bid>;\non inform from a { push bids, Bid { price: 30 }; }\non inform from b -> send bye;\n",
+        )
+        .unwrap();
+        let mut r = Runtime::new(&prog, "b").unwrap();
+        r.deliver(Event::In { from: "a".into(), performative: Performative::Inform, pattern: None, fields: None });
+        match r.states_snapshot().get("bids") {
+            Some(StateValue::List(l)) => assert_eq!(l.len(), 1),
+            other => panic!("expected list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_kv_rejects_bad_value_type() {
+        let prog = parse(
+            "protocol p v1;\nroles a, b;\nstate tally: map<str, int>;\non inform from a { put tally, \"x\", \"not_a_number\"; }\non error { set flagged = true; }\non inform from b -> send bye;\n",
+        )
+        .unwrap();
+        let mut r = Runtime::new(&prog, "b").unwrap();
+        r.deliver(Event::In { from: "a".into(), performative: Performative::Inform, pattern: None, fields: None });
+        assert!(r.transcript().iter().any(|e| e.text.contains("does not match 'map<str, int>'")));
+    }
+
+    // §41: typed set mismatch is now an internal error (routes to on error)
+    #[test]
+    fn typed_set_mismatch_routes_to_error_handler() {
+        let prog = parse(
+            "protocol p v1;\nroles a, b;\nstate n: int;\non inform from a { set n = \"oops\"; }\non error { set caught = true; }\non inform from b -> send bye;\n",
+        )
+        .unwrap();
+        let mut r = Runtime::new(&prog, "b").unwrap();
+        r.deliver(Event::In { from: "a".into(), performative: Performative::Inform, pattern: None, fields: None });
+        assert_eq!(r.states_snapshot().get("caught"), Some(&StateValue::Bool(true)));
     }
 }

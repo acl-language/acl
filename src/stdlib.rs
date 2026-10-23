@@ -24,6 +24,7 @@ pub fn deadline_escalation(warn_ms: i64) -> Handler {
             )])),
             retry: None,
         }],
+        line: 0,
     }
 }
 
@@ -39,6 +40,7 @@ pub fn double_confirmation() -> Handler {
         },
         guard: Some(Guard::Atom { name: "confirmed".into(), neg: false }),
         actions: vec![ProtocolAction::Begin],
+        line: 0,
     }
 }
 

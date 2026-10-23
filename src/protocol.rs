@@ -19,6 +19,16 @@ pub struct StateDecl {
     pub ty: Option<String>,
 }
 
+impl PartialEq for Handler {
+    /// equality ignores `line` — source position is provenance, not
+    /// semantics (pretty-roundtrip equality relies on this)
+    fn eq(&self, other: &Self) -> bool {
+        self.trigger == other.trigger
+            && self.guard == other.guard
+            && self.actions == other.actions
+    }
+}
+
 /// What fires a handler.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OnTrigger {
@@ -158,11 +168,15 @@ pub fn parse_guard(src: &str) -> Result<Guard, String> {
     Ok(g)
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct Handler {
     pub trigger: OnTrigger,
     pub guard: Option<Guard>,
     pub actions: Vec<ProtocolAction>,
+    /// source line of the `on` declaration — 0 for synthetic handlers
+    /// (stdlib fragments, runtime-synthesized) — used by check() so that
+    /// diagnostics point at the handler
+    pub line: usize,
 }
 /// §35: expression language for `set` — pure functions over session
 /// state and the triggering event's fields. No I/O, no clock: the only
@@ -1021,7 +1035,7 @@ pub fn parse(src: &str) -> Result<ProtocolProgram, Vec<IdlError>> {
                 }
                 None => None,
             };
-            let h = Handler { trigger: OnTrigger::Timer { every_ms, guard, as_role }, guard: None, actions: Vec::new() };
+            let h = Handler { trigger: OnTrigger::Timer { every_ms, guard, as_role }, guard: None, actions: Vec::new(), line: line_no };
             if arrow {
                 let stmt = sends.trim_end_matches(';').trim();
                 match parse_action(stmt) {
@@ -1133,7 +1147,7 @@ pub fn parse(src: &str) -> Result<ProtocolProgram, Vec<IdlError>> {
                         continue;
                     }
                 };
-                hs.push(Handler { trigger, guard: guard.clone(), actions: Vec::new() });
+                hs.push(Handler { trigger, guard: guard.clone(), actions: Vec::new(), line: line_no });
             }
             if hs.is_empty() {
                 continue;
@@ -1583,6 +1597,7 @@ fn ty_assign_ok(declared: &str, got: &str) -> bool {
 fn check_action_types(
     prog: &ProtocolProgram,
     actions: &[ProtocolAction],
+    src_line: usize,
     errors: &mut Vec<IdlError>,
 ) {
     for a in actions {
@@ -1601,7 +1616,7 @@ fn check_action_types(
                             Some(fields) => {
                                 if !fields.iter().any(|(fname, _)| fname == f) {
                                     errors.push(IdlError {
-                                        line: 0,
+                                        line: src_line,
                                         message: format!(
                                             "record '{dt}' has no field '{f}' (set {name}.{f})"
                                         ),
@@ -1609,7 +1624,7 @@ fn check_action_types(
                                 }
                             }
                             None => errors.push(IdlError {
-                                line: 0,
+                                line: src_line,
                                 message: format!(
                                     "'{dt}' is not a declared record type (set {name}.{f})"
                                 ),
@@ -1625,7 +1640,7 @@ fn check_action_types(
                     if let Some(gt) = static_ty(expr, prog) {
                         if !ty_assign_ok(&dt, &gt) {
                             errors.push(IdlError {
-                                line: 0,
+                                line: src_line,
                                 message: format!(
                                     "type mismatch: state '{name}' is '{dt}' but expression is '{gt}'"
                                 ),
@@ -1633,13 +1648,13 @@ fn check_action_types(
                         }
                     }
                 }
-                check_expr_fields(prog, expr, errors);
+                check_expr_fields(prog, expr, src_line, errors);
             }
             ProtocolAction::Push { expr, .. } | ProtocolAction::Put { expr, .. } => {
-                check_expr_fields(prog, expr, errors);
+                check_expr_fields(prog, expr, src_line, errors);
             }
             ProtocolAction::For { actions, .. } => {
-                check_action_types(prog, actions, errors)
+                check_action_types(prog, actions, src_line, errors)
             }
             _ => {}
         }
@@ -1647,7 +1662,7 @@ fn check_action_types(
 }
 
 /// §38.6: recursively check record field access/literals inside an expr.
-fn check_expr_fields(prog: &ProtocolProgram, e: &Expr, errors: &mut Vec<IdlError>) {
+fn check_expr_fields(prog: &ProtocolProgram, e: &Expr, src_line: usize, errors: &mut Vec<IdlError>) {
     match e {
         Expr::Field { base, name } => {
             if let Some(bt) = static_ty(base, prog) {
@@ -1655,7 +1670,7 @@ fn check_expr_fields(prog: &ProtocolProgram, e: &Expr, errors: &mut Vec<IdlError
                     Some(fields) => {
                         if !fields.iter().any(|(f, _)| f == name) {
                             errors.push(IdlError {
-                                line: 0,
+                                line: src_line,
                                 message: format!("record '{bt}' has no field '{name}'"),
                             });
                         }
@@ -1663,23 +1678,23 @@ fn check_expr_fields(prog: &ProtocolProgram, e: &Expr, errors: &mut Vec<IdlError
                     None => {
                         if matches!(bt.as_str(), "int" | "str" | "bool" | "float") {
                             errors.push(IdlError {
-                                line: 0,
+                                line: src_line,
                                 message: format!("'{bt}' is not a record — no field '{name}'"),
                             });
                         }
                     }
                 }
             }
-            check_expr_fields(prog, base, errors);
+            check_expr_fields(prog, base, src_line, errors);
         }
         Expr::Bin { l, r, .. } => {
-            check_expr_fields(prog, l, errors);
-            check_expr_fields(prog, r, errors);
+            check_expr_fields(prog, l, src_line, errors);
+            check_expr_fields(prog, r, src_line, errors);
         }
-        Expr::Not(x) => check_expr_fields(prog, x, errors),
+        Expr::Not(x) => check_expr_fields(prog, x, src_line, errors),
         Expr::Call { args, .. } => {
             for a in args {
-                check_expr_fields(prog, a, errors);
+                check_expr_fields(prog, a, src_line, errors);
             }
         }
         Expr::RecLit { ty, fields } => {
@@ -1687,14 +1702,14 @@ fn check_expr_fields(prog: &ProtocolProgram, e: &Expr, errors: &mut Vec<IdlError
                 for (f, _) in fields {
                     if !decl.iter().any(|(df, _)| df == f) {
                         errors.push(IdlError {
-                            line: 0,
+                            line: src_line,
                             message: format!("record '{ty}' has no field '{f}'"),
                         });
                     }
                 }
             }
             for (_, fe) in fields {
-                check_expr_fields(prog, fe, errors);
+                check_expr_fields(prog, fe, src_line, errors);
             }
         }
         _ => {}
@@ -1738,7 +1753,7 @@ pub fn check(prog: &ProtocolProgram) -> Result<Vec<String>, Vec<IdlError>> {
             OnTrigger::Expired => "expired".into(),
         };
         if sigs.insert(sig.clone(), ()).is_some() {
-            errors.push(IdlError { line: 0, message: format!("duplicate handler for {sig}") });
+            errors.push(IdlError { line: h.line, message: format!("duplicate handler for {sig}") });
         }
     }
 
@@ -1771,7 +1786,7 @@ pub fn check(prog: &ProtocolProgram) -> Result<Vec<String>, Vec<IdlError>> {
                     OnTrigger::Timer { .. } => "Timer".into(),
                 };
                 errors.push(IdlError {
-                    line: 0,
+                    line: h.line,
                     message: format!(
                         "dialogue violation: handler on {trig} cannot send {out:?} (§16 matrix)"
                     ),
@@ -1792,6 +1807,40 @@ pub fn check(prog: &ProtocolProgram) -> Result<Vec<String>, Vec<IdlError>> {
         }
     }
 
+    // ---- §41: state type lattice — bool|int|str|float|list|map,
+    // list<T> / map<K,V> with valid element types, or declared records
+    let valid_ty = |ty: &str| -> bool {
+        match ty {
+            "bool" | "int" | "str" | "float" | "list" | "map" => true,
+            t if t.starts_with("list<") && t.ends_with('>') => {
+                let e = &t[5..t.len() - 1];
+                matches!(e, "bool" | "int" | "str" | "float") || prog.types.contains_key(e)
+            }
+            t if t.starts_with("map<") && t.ends_with('>') => {
+                let inner = &t[4..t.len() - 1];
+                let (k, v) = inner.split_once(',').unwrap_or(("str", inner));
+                let (k, v) = (k.trim(), v.trim());
+                (matches!(k, "str" | "int") || prog.types.contains_key(k))
+                    && (matches!(v, "bool" | "int" | "str" | "float" | "list" | "map")
+                        || prog.types.contains_key(v))
+            }
+            t => prog.types.contains_key(t),
+        }
+    };
+    for st in &prog.states {
+        if let Some(ty) = &st.ty {
+            if !valid_ty(ty) {
+                errors.push(IdlError {
+                    line: 0,
+                    message: format!(
+                        "state '{}' has unknown type '{}' (want bool|int|str|float|list|map|list<T>|map<K,V>|declared record)",
+                        st.name, ty
+                    ),
+                });
+            }
+        }
+    }
+
     // begin/fulfil without any Event handler is meaningless
     let has_event = prog
         .handlers
@@ -1807,15 +1856,15 @@ pub fn check(prog: &ProtocolProgram) -> Result<Vec<String>, Vec<IdlError>> {
         .iter()
         .map(|s| (s.name.as_str(), s.ty.as_deref().unwrap_or("bool")))
         .collect();
-    let mut guard_ok = |g: &Guard, what: &str, errors: &mut Vec<IdlError>| {
+    let mut guard_ok = |g: &Guard, what: &str, src_line: usize, errors: &mut Vec<IdlError>| {
         for n in g.names() {
             match state_ty.get(n) {
                 None => errors.push(IdlError {
-                    line: 0,
+                    line: src_line,
                     message: format!("{what} references undeclared state '{n}'"),
                 }),
                 Some(t) if *t != "bool" => errors.push(IdlError {
-                    line: 0,
+                    line: src_line,
                     message: format!("{what} requires bool state '{n}', declared '{t}'"),
                 }),
                 _ => {}
@@ -1824,18 +1873,79 @@ pub fn check(prog: &ProtocolProgram) -> Result<Vec<String>, Vec<IdlError>> {
     };
     for h in &prog.handlers {
         if let Some(g) = &h.guard {
-            guard_ok(g, "handler guard", &mut errors);
+            guard_ok(g, "handler guard", h.line, &mut errors);
         }
         if let OnTrigger::Timer { guard: Some(g), as_role, .. } = &h.trigger {
-            guard_ok(g, "timer guard", &mut errors);
+            guard_ok(g, "timer guard", h.line, &mut errors);
             if let Some(r) = as_role {
                 if !prog.roles.iter().any(|x| x == r) {
                     errors.push(IdlError {
-                        line: 0,
+                        line: h.line,
                         message: format!("timer 'as {r}': undeclared role"),
                     });
                 }
             }
+        }
+        // §41: expression guards are statically validated — undeclared
+        // states and statically incompatible comparisons are compile errors
+        let mut check_guard_expr = |e: &Expr, src_line: usize, errors: &mut Vec<IdlError>| {
+            fn walk(
+                prog: &ProtocolProgram,
+                e: &Expr,
+                src_line: usize,
+                what: &str,
+                errors: &mut Vec<IdlError>,
+            ) {
+                match e {
+                    Expr::State(n) => {
+                        if !prog.state_names().contains(&n.as_str()) {
+                            errors.push(IdlError {
+                                line: src_line,
+                                message: format!("{what} references undeclared state '{n}'"),
+                            });
+                        }
+                    }
+                    Expr::Bin { op, l, r } => {
+                        if matches!(
+                            op,
+                            BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne
+                        ) {
+                            let lt = static_ty(l, prog);
+                            let rt = static_ty(r, prog);
+                            if let (Some(a), Some(b)) = (&lt, &rt) {
+                                let compat = a == b
+                                    || (a == "float" && b == "int")
+                                    || (a == "int" && b == "float");
+                                if !compat {
+                                    errors.push(IdlError {
+                                        line: src_line,
+                                        message: format!(
+                                            "{what}: comparing '{a}' with '{b}'"
+                                        ),
+                                    });
+                                }
+                            }
+                        }
+                        walk(prog, l, src_line, what, errors);
+                        walk(prog, r, src_line, what, errors);
+                    }
+                    Expr::Not(x) => walk(prog, x, src_line, what, errors),
+                    Expr::Call { args, .. } => {
+                        for a in args {
+                            walk(prog, a, src_line, what, errors);
+                        }
+                    }
+                    Expr::Field { base, .. } => walk(prog, base, src_line, what, errors),
+                    _ => {}
+                }
+            }
+            walk(prog, e, src_line, "expression guard", errors);
+        };
+        if let Some(Guard::ExprGuard(e)) = &h.guard {
+            check_guard_expr(e, h.line, &mut errors);
+        }
+        if let OnTrigger::Timer { guard: Some(Guard::ExprGuard(e)), .. } = &h.trigger {
+            check_guard_expr(e, h.line, &mut errors);
         }
     }
     if let Some(EndWhen::State(sname)) = &prog.end_when {
@@ -1855,7 +1965,7 @@ pub fn check(prog: &ProtocolProgram) -> Result<Vec<String>, Vec<IdlError>> {
         for h in &prog.handlers {
             if let OnTrigger::Event { from: None, .. } = &h.trigger {
                 errors.push(IdlError {
-                    line: 0,
+                    line: h.line,
                     message: format!(
                         "{n_roles}-role protocol: trigger 'on {}' needs 'from <role>'",
                         match &h.trigger {
@@ -1871,7 +1981,7 @@ pub fn check(prog: &ProtocolProgram) -> Result<Vec<String>, Vec<IdlError>> {
                         continue; // session terminator
                     }
                     errors.push(IdlError {
-                        line: 0,
+                        line: h.line,
                         message: format!(
                             "{n_roles}-role protocol: 'send {}' needs 'to <role>'",
                             format!("{performative:?}")
@@ -1913,7 +2023,7 @@ pub fn check(prog: &ProtocolProgram) -> Result<Vec<String>, Vec<IdlError>> {
                 });
                 if !answered {
                     errors.push(IdlError {
-                        line: 0,
+                        line: h.line,
                         message: format!(
                             "unanswered send: '{exec}' sends {performative:?} to '{target}' but no handler 'on {performative:?}' exists there (§34 linearity)"
                         ),
@@ -1931,7 +2041,7 @@ pub fn check(prog: &ProtocolProgram) -> Result<Vec<String>, Vec<IdlError>> {
                 | ProtocolAction::Put { state: name, .. } => {
                     if !prog.states.iter().any(|st| &st.name == name) {
                         errors.push(IdlError {
-                            line: 0,
+                            line: h.line,
                             message: format!("'{name}' is not a declared state (set/push/put)"),
                         });
                     }
@@ -1939,7 +2049,7 @@ pub fn check(prog: &ProtocolProgram) -> Result<Vec<String>, Vec<IdlError>> {
                 ProtocolAction::For { var, over, .. } => {
                     if !prog.states.iter().any(|st| &st.name == over) {
                         errors.push(IdlError {
-                            line: 0,
+                            line: h.line,
                             message: format!("for over '{over}': not a declared state"),
                         });
                     }
@@ -1956,7 +2066,7 @@ pub fn check(prog: &ProtocolProgram) -> Result<Vec<String>, Vec<IdlError>> {
 
     // ---- §38.6: static type checks — assignments & record field access ----
     for h in &prog.handlers {
-        check_action_types(prog, &h.actions, &mut errors);
+        check_action_types(prog, &h.actions, h.line, &mut errors);
     }
 
     // ---- §34: LIVENESS — every handler can reach a terminal action ----
@@ -2909,5 +3019,70 @@ mod module_tests {
         )
         .unwrap_err();
         assert!(errs.iter().any(|e| e.message.contains("no such handler set")));
+    }
+}
+
+#[cfg(test)]
+mod static_validation_tests {
+    use super::*;
+
+    fn errs(src: &str) -> Vec<String> {
+        check(&parse(src).unwrap())
+            .unwrap_err()
+            .into_iter()
+            .map(|e| e.message)
+            .collect()
+    }
+
+    // §41: expression guards are statically validated
+    #[test]
+    fn expr_guard_undeclared_state_caught() {
+        let es = errs(
+            "protocol p v1;\nroles a, b;\non inform from a when $p > unknow -> send bye;\non inform from b -> send bye;\n",
+        );
+        assert!(es.iter().any(|m| m.contains("undeclared state 'unknow'")), "{es:?}");
+    }
+
+    #[test]
+    fn expr_guard_type_mismatch_caught() {
+        let es = errs(
+            "protocol p v1;\nroles a, b;\nstate n: int;\non inform from a when n > \"x\" -> send bye;\non inform from b -> send bye;\n",
+        );
+        assert!(es.iter().any(|m| m.contains("comparing 'int' with 'str'")), "{es:?}");
+    }
+
+    #[test]
+    fn expr_guard_with_capture_ok() {
+        let p = parse(
+            "protocol p v1;\nroles a, b;\nstate n: int;\non inform {\"price\": $p} from a when $p > n -> send bye;\non inform from b -> send bye;\n",
+        )
+        .unwrap();
+        assert!(check(&p).is_ok());
+    }
+
+    // §41: state type lattice — generics and unknown types
+    #[test]
+    fn generic_state_types_validated() {
+        let p = parse(
+            "type Bid = { price: int };\nprotocol p v1;\nroles a, b;\nstate bids: list<Bid>;\nstate tally: map<str, int>;\non inform from a -> send bye;\non inform from b -> send bye;\n",
+        )
+        .unwrap();
+        assert!(check(&p).is_ok());
+        let es = errs(
+            "protocol p v1;\nroles a, b;\nstate bids: list<Nope>;\non inform from a -> send bye;\non inform from b -> send bye;\n",
+        );
+        assert!(es.iter().any(|m| m.contains("unknown type 'list<Nope>'")), "{es:?}");
+    }
+
+    // §41: diagnostics carry the handler's source line
+    #[test]
+    fn errors_carry_handler_line() {
+        let p = parse(
+            "protocol p v1;\nroles a, b;\non inform from a -> send inform to b;\non inform from b -> send request to a;\n",
+        )
+        .unwrap();
+        let es = check(&p).unwrap_err();
+        let dlg = es.iter().find(|e| e.message.contains("dialogue violation")).unwrap();
+        assert_eq!(dlg.line, 4, "{es:?}");
     }
 }
