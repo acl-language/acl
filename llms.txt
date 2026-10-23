@@ -5,7 +5,8 @@
 > state and handlers keyed on speech acts; the compiler turns them into
 > agents that speak the protocol, with conversation rules enforced at
 > build time. The wire format is compact MessagePack with Ed25519-signed
-> envelopes. Everything below is implemented and tested (130/130).
+> envelopes. Everything below is implemented and tested (210 tests,
+> including the Rust/Python semantic-parity harness, which runs in CI).
 
 If you are an AI agent reading this: you can SPEAK ACL, and you can also
 be DEFINED by it. Both paths are below.
@@ -67,7 +68,7 @@ Expressions are pure (19 builtins, incl. `prefer(list, key)` for
 contract-net bid selection); time is host-injected (`tick()`), never a
 hidden clock.
 
-Language extras (spec §39-§53): guards over typed pattern captures
+Language extras (spec §39-§55): guards over typed pattern captures
 (`when $p > 100`), trigger alternation (`on (accept | reject)`),
 static assignment typing, `on error { ... }` for internal failures
 (with `$reason`), rich templates (`fmt("x ${expr}")`, `$${` = literal),
@@ -82,7 +83,16 @@ payloads), `aclc fmt` canonical formatting, `expect log` scenario
 assertions, conversation phases (`phase x;` / `in x` / `enter x;`),
 named commitments (`begin <id>;` / `fulfil <id>;`), send payload
 interpolation (`send inform {"r": "${y}"};`), exact replay of opens/
-ticks/closes/grants, and guaranteed Rust/Python parity.
+ticks/closes/grants (opens journaled IN ORDER — capacity limits and
+session-ID reincarnations replay exactly; `replay_from()` is the
+faithful reconstruction path), conversation-phase reachability
+warnings (a declared phase that is never `enter`-ed warns), one
+execution dispatcher for top-level AND nested actions in generated
+agents (enter/begin/fulfil/interp-send behave identically inside
+try/for), formatter obligations (`parse -> format -> parse` is a
+semantic fixpoint and formatting is idempotent), and guaranteed
+Rust/Python parity (out-sequences, states and commitment lifecycles
+compared; the harness runs in CI).
 
 ## Compile and run
 
@@ -94,7 +104,9 @@ ticks/closes/grants, and guaranteed Rust/Python parity.
 
 The runtime is deterministic — a pure function of (program, events).
 Every received event enters an auditable transcript, handled or not.
-Replaying a journal reconstructs exact state (event sourcing).
+Replaying a journal reconstructs exact state (event sourcing) —
+session lifecycle is part of the journal, so replay is exact even
+across capacity limits and ID reuse.
 
 ## Typed vocabularies
 
@@ -133,7 +145,7 @@ Available vocabularies: `fs`, `task`, `time`, `net`, `proc`, `http`,
 
 ## Links
 
-- [SPEC.md](https://github.com/acl-language/acl/blob/main/SPEC.md): the normative specification (38 sections)
+- [SPEC.md](https://github.com/acl-language/acl/blob/main/SPEC.md): the normative specification (55 sections)
 - [GRAMMAR.md](https://github.com/acl-language/acl/blob/main/GRAMMAR.md): the formal EBNF grammar (lexical tokens, AST, semantic rules)
 - [Tutorial](https://github.com/acl-language/acl/blob/main/docs/TUTORIAL.md): two agents talking in 10 minutes
 - [Playground](https://acl-language.github.io/acl/playground/): watch a real conversation decoded live

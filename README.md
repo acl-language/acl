@@ -9,9 +9,10 @@ agents that speak the protocol, with the conversation rules enforced at
 build time. An agent compiled from a protocol program cannot deviate from
 the protocol it declares.
 
-Everything below is **implemented and tested**: 130/130 unit tests, plus
-an independent implementation written from the spec alone proving
-byte-exact wire interoperability.
+Everything below is **implemented and tested**: 210 tests (unit,
+integration and the Rust/Python semantic-parity harness, which runs in
+CI), plus an independent implementation written from the spec alone
+proving byte-exact wire interoperability.
 
 ## A protocol program
 
@@ -123,7 +124,7 @@ assignments, record fields, and function recursion.
 **Toolchain** — `aclc fmt` canonical (idempotent) formatting of any
 program; scenario assertions `expect state/commitment/log`.
 
-### Conversation structure and lifecycle (§49-§53)
+### Conversation structure and lifecycle (§49-§55)
 - **Conversation phases** — `phase quoted;` … `enter accepted;` with
   handlers gated by `on inform ... in quoted`: the same speech act is
   only valid in the phase where the protocol says it is.
@@ -139,7 +140,24 @@ program; scenario assertions `expect state/commitment/log`.
   capability grants are journaled: replay covers the whole execution,
   including capacity limits and ID reincarnations.
 - **Guaranteed parity** — generated Python agents reproduce the Rust
-  runtime's observable behavior for equal inputs (harness: `tests/`).
+  runtime's observable behavior for equal inputs, compared over
+  out-sequences, states and named-commitment lifecycles — including
+  nested actions (`enter`/`begin`/`fulfil` inside `try`), exercised
+  catch paths and `for` loops with interpolated sends. The harness runs
+  explicitly in CI.
+- **Single execution dispatcher (§54)** — one action dispatcher serves
+  top-level and nested execution in generated agents; every language
+  feature behaves identically inside nested control flow.
+- **Formatter obligations (§54)** — `aclc fmt` emits every declaration
+  (phases, `as <role>` attribution, payloads before targets);
+  `parse -> format -> parse` is a semantic fixpoint and formatting is
+  idempotent, proven by test over a program using every feature.
+- **Phase reachability (§54)** — a declared phase that is never
+  `enter`-ed warns as unreachable (syntactic check; cross-participant
+  phase compatibility is documented future work).
+- **Faithful replay API (§55)** — `replay_from()` is the reconstruction
+  path; the legacy `replay()` helper is deprecated and rejects journals
+  it cannot reconstruct faithfully.
 
 ### Inheritance and modules (§41, §39.8)
 `protocol supply_v2 v1 extends supply_v1;` inherits everything and may
@@ -167,7 +185,9 @@ Deterministic — a pure function of (program, delivered events):
 
 - every received event enters an **auditable transcript**, handled or not
 - **event sourcing**: replaying a journal reconstructs exact state
-  (soak-verified: 200 concurrent sessions × 25 events, exact-state replay)
+  (soak-verified: 200 concurrent sessions × 25 events, exact-state
+  replay; session opens are journaled in order, so capacity limits and
+  session-ID reincarnations replay exactly)
 - **multi-session host** with declared capacity and isolated session state
 - **capability enforcement, default-on**: a program with `use`
   declarations cannot open sessions until the environment grants them
@@ -213,7 +233,8 @@ Deterministic — a pure function of (program, delivered events):
 
 ```bash
 cargo install --path .           # installs aclc + the binaries
-cargo test                       # 130/130
+cargo test                                 # 210 tests
+cargo test --test py_parity -- --ignored   # Rust/Python semantic parity
 python3 tests/interop/stdio_demo.py /tmp/acl target/debug/peer
 ```
 
@@ -231,7 +252,7 @@ env.encode()   # → msgpack bytes, ready for any transport
 
 ## Documents
 
-- **Spec**: [SPEC.md](SPEC.md) — 38 sections, normative
+- **Spec**: [SPEC.md](SPEC.md) — 55 sections, normative
 - **Grammar**: [GRAMMAR.md](GRAMMAR.md) — formal EBNF definition of the language
 - **For AI agents**: [llms.txt](llms.txt)
 - **Tutorial**: [docs/TUTORIAL.md](docs/TUTORIAL.md) — two agents talking in 10 minutes
