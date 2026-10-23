@@ -485,6 +485,13 @@ pub struct ProtocolProgram {
     /// §38.10: sets made importable by `export handler_set name;` —
     /// everything else stays private to the module file
     pub exported_sets: Vec<String>,
+    /// §42: `protocol v2 extends v1;` — the base protocol declared
+    /// earlier in the same file (states/types/fns/handlers inherited,
+    /// handlers overridable by matching trigger+guard signature)
+    pub extends: Option<String>,
+    /// §42: `export type X;` / `export fn name;` — importable vocabulary
+    pub exported_types: Vec<String>,
+    pub exported_fns: Vec<String>,
 }
 
 /// §38.1: a user-defined function — pure computation over parameters and
@@ -705,6 +712,153 @@ fn parse_with_includes_depth(
 }
 
 pub fn parse(src: &str) -> Result<ProtocolProgram, Vec<IdlError>> {
+    // §42: multiple `protocol` declarations in one file are only legal as
+    // an inheritance chain (`protocol v2 extends v1;`); with a single
+    // declaration the file parses exactly as before
+    let segs = split_protocol_segments(src);
+    if segs.len() <= 1 {
+        return parse_single(src);
+    }
+    let progs: Vec<ProtocolProgram> = segs
+        .iter()
+        .map(|seg| parse_single(seg))
+        .collect::<Result<_, _>>()?;
+    merge_programs(progs)
+}
+
+/// §42: split a source file into protocol segments — lines before the
+/// first `protocol` declaration join the first segment (handler_set
+/// declarations are file-level).
+fn split_protocol_segments(src: &str) -> Vec<String> {
+    let mut segs: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut seen_proto = false;
+    for raw in src.lines() {
+        let t = raw.trim();
+        if t.starts_with("protocol ") {
+            if seen_proto {
+                segs.push(std::mem::take(&mut cur));
+            }
+            seen_proto = true;
+        }
+        cur.push_str(raw);
+        cur.push('\n');
+    }
+    if !cur.trim().is_empty() {
+        segs.push(cur);
+    }
+    segs
+}
+
+/// §42: merge a base program into a derived one — inheritance by
+/// `extends`: states, types, functions, templates and handlers are
+/// inherited; a derived handler with the SAME trigger+guard signature
+/// overrides the base handler; handler_sets/exported sets are file-level
+/// (union across the chain).
+fn merge_programs(mut progs: Vec<ProtocolProgram>) -> Result<ProtocolProgram, Vec<IdlError>> {
+    let main = progs.pop().expect("at least one");
+    let base = match &main.extends {
+        Some(name) => match progs.iter().find(|p| &p.name == name) {
+            Some(b) => b.clone(),
+            None => {
+                return Err(vec![IdlError {
+                    line: 0,
+                    message: format!("protocol '{}' extends unknown protocol '{name}'", main.name),
+                }])
+            }
+        },
+        None if !progs.is_empty() => {
+            let prev = progs.last().unwrap();
+            return Err(vec![IdlError {
+                line: 0,
+                message: format!(
+                    "protocol '{}' follows '{}' without 'extends' (multiple protocols per file form an inheritance chain)",
+                    main.name, prev.name
+                ),
+            }]);
+        }
+        None => return Ok(main),
+    };
+    let mut out = main;
+    // roles not redeclared
+    for r in &base.roles {
+        if !out.roles.contains(r) {
+            out.roles.push(r.clone());
+        }
+    }
+    // states not redeclared
+    let have: Vec<String> = out.states.iter().map(|s| s.name.clone()).collect();
+    for st in &base.states {
+        if !have.contains(&st.name) {
+            out.states.push(st.clone());
+        }
+    }
+    // single-valued decls inherited when the derived one omits them
+    if out.end_when.is_none() {
+        out.end_when = base.end_when.clone();
+    }
+    if out.transport.is_none() {
+        out.transport = base.transport.clone();
+    }
+    if out.capacity.is_none() {
+        out.capacity = base.capacity;
+    }
+    out.abort_when.extend(base.abort_when.clone());
+    out.scenarios.extend(base.scenarios.clone());
+    // types not redeclared
+    for (k, v) in &base.types {
+        out.types.entry(k.clone()).or_insert_with(|| v.clone());
+    }
+    // functions not redeclared
+    let have_fns: Vec<String> = out.functions.iter().map(|f| f.name.clone()).collect();
+    for f in &base.functions {
+        if !have_fns.contains(&f.name) {
+            out.functions.push(f.clone());
+        }
+    }
+    // templates not redeclared
+    let have_tm: Vec<String> = out.templates.iter().map(|(n, _)| n.clone()).collect();
+    for (n, t) in &base.templates {
+        if !have_tm.contains(n) {
+            out.templates.push((n.clone(), t.clone()));
+        }
+    }
+    // handlers: base handlers first, minus overridden (same trigger+guard sig)
+    let override_sigs: Vec<String> = out.handlers.iter().map(handler_sig).collect();
+    let inherited: Vec<Handler> = base
+        .handlers
+        .iter()
+        .filter(|h| !override_sigs.contains(&handler_sig(h)))
+        .cloned()
+        .collect();
+    let n_inherited = inherited.len();
+    out.handlers = inherited.into_iter().chain(out.handlers).collect();
+    out.extends = None; // resolved
+    let _ = n_inherited;
+    Ok(out)
+}
+
+/// §42: a handler's override signature — trigger word + pattern + from + guard
+pub fn handler_sig(h: &Handler) -> String {
+    let trig = match &h.trigger {
+        OnTrigger::Event { performative, pattern, from } => format!(
+            "{}|{:?}|{:?}",
+            perf_word(performative),
+            pattern,
+            from
+        ),
+        OnTrigger::Breach => "breach".into(),
+        OnTrigger::Expired => "expired".into(),
+        OnTrigger::Timer { every_ms, guard, as_role } => format!(
+            "timer|{every_ms}|{:?}|{:?}",
+            guard.as_ref().map(guard_word),
+            as_role
+        ),
+    };
+    format!("{trig}|{:?}", h.guard.as_ref().map(guard_word))
+}
+
+fn parse_single(src: &str) -> Result<ProtocolProgram, Vec<IdlError>> {
     let mut errors = Vec::new();
     let mut prog = ProtocolProgram::default();
     let mut seen_protocol = false;
@@ -737,7 +891,7 @@ pub fn parse(src: &str) -> Result<ProtocolProgram, Vec<IdlError>> {
             *depth = depth.saturating_sub(closes);
             if line.trim() == "}" && *depth <= 0 {
                 let (name, body, ln, _) = open_set.take().unwrap();
-                let mini = parse(&format!(
+                let mini = parse_single(&format!(
                     "protocol __frag_{name} v1;\nroles __dummy;\n{}",
                     body.join("\n")
                 ));
@@ -761,7 +915,7 @@ pub fn parse(src: &str) -> Result<ProtocolProgram, Vec<IdlError>> {
                 if *depth <= 0 {
                     // same-line close — finalize without the brace
                     let (name, body, ln, _) = open_set.take().unwrap();
-                    let mini = parse(&format!(
+                    let mini = parse_single(&format!(
                         "protocol __frag_{name} v1;\nroles __dummy;\n{}",
                         body.join("\n")
                     ));
@@ -791,7 +945,7 @@ pub fn parse(src: &str) -> Result<ProtocolProgram, Vec<IdlError>> {
                 errors.push(IdlError { line: line_no, message: "handler_set needs a name".into() });
             } else if line.contains('{') && line.ends_with('}') {
                 let inner = &line[line.find('{').unwrap() + 1..line.len() - 1];
-                let mini = parse(&format!(
+                let mini = parse_single(&format!(
                     "protocol __frag_{name} v1;\nroles __dummy;\n{inner}"
                 ));
                 match mini {
@@ -813,6 +967,25 @@ pub fn parse(src: &str) -> Result<ProtocolProgram, Vec<IdlError>> {
                 open_set = Some((name, Vec::new(), line_no, 1));
             } else {
                 errors.push(IdlError { line: line_no, message: "malformed handler_set (want 'handler_set name {')".into() });
+            }
+            continue;
+        }
+        // §42: export type / export fn — importable vocabulary
+        if let Some(rest) = line.strip_prefix("export type ") {
+            let name = rest.trim_end_matches(';').trim().to_string();
+            if name.is_empty() {
+                errors.push(IdlError { line: line_no, message: "export type needs a name".into() });
+            } else {
+                prog.exported_types.push(name);
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("export fn ") {
+            let name = rest.trim_end_matches(';').trim().to_string();
+            if name.is_empty() {
+                errors.push(IdlError { line: line_no, message: "export fn needs a name".into() });
+            } else {
+                prog.exported_fns.push(name);
             }
             continue;
         }
@@ -851,7 +1024,14 @@ pub fn parse(src: &str) -> Result<ProtocolProgram, Vec<IdlError>> {
                         message: format!("fn '{}' has no return statement", f.name),
                     });
                 }
-                prog.functions.push(f);
+                if prog.functions.iter().any(|g| g.name == f.name) {
+                    errors.push(IdlError {
+                        line: line_no,
+                        message: format!("duplicate function '{}'", f.name),
+                    });
+                } else {
+                    prog.functions.push(f);
+                }
                 continue;
             }
             match parse_action(line) {
@@ -922,8 +1102,11 @@ pub fn parse(src: &str) -> Result<ProtocolProgram, Vec<IdlError>> {
                     .collect();
                 if fields.is_empty() || name.is_empty() {
                     errors.push(IdlError { line: line_no, message: format!("bad type decl: '{line}'") });
-                } else {
-                    prog.types.insert(name, fields);
+                } else if prog.types.insert(name.clone(), fields).is_some() {
+                    errors.push(IdlError {
+                        line: line_no,
+                        message: format!("duplicate type declaration '{name}'"),
+                    });
                 }
             } else {
                 errors.push(IdlError { line: line_no, message: format!("bad type decl: '{line}' (want 'type X = {{ f: ty }};')") });
@@ -961,7 +1144,12 @@ pub fn parse(src: &str) -> Result<ProtocolProgram, Vec<IdlError>> {
 
         if let Some(rest) = line.strip_prefix("protocol ") {
             let body = rest.trim_end_matches(';').trim();
-            let mut parts = body.split_whitespace();
+            // §42: `protocol name vN [extends base];`
+            let (head, extends) = match body.split_once(" extends ") {
+                Some((h, b)) => (h.trim(), Some(b.trim().to_string())),
+                None => (body, None),
+            };
+            let mut parts = head.split_whitespace();
             let name = parts.next().unwrap_or_default().to_string();
             let ver = parts
                 .next()
@@ -970,7 +1158,7 @@ pub fn parse(src: &str) -> Result<ProtocolProgram, Vec<IdlError>> {
             if name.is_empty() || ver.is_none() || parts.next().is_some() {
                 errors.push(IdlError {
                     line: line_no,
-                    message: format!("bad protocol decl: '{line}' (want 'protocol name v1;')"),
+                    message: format!("bad protocol decl: '{line}' (want 'protocol name v1 [extends base];')"),
                 });
                 continue;
             }
@@ -981,6 +1169,7 @@ pub fn parse(src: &str) -> Result<ProtocolProgram, Vec<IdlError>> {
             seen_protocol = true;
             prog.name = name;
             prog.version = ver.unwrap();
+            prog.extends = extends;
             continue;
         }
         if let Some(rest) = line.strip_prefix("roles ") {
@@ -1292,12 +1481,28 @@ pub fn parse(src: &str) -> Result<ProtocolProgram, Vec<IdlError>> {
     if !seen_protocol {
         errors.push(IdlError { line: 0, message: "missing 'protocol <name> v1;' declaration".into() });
     }
-    // §38.10: every exported name must name a declared handler set
+    // §38.10/§42: every exported name must name a declared item
     for name in prog.exported_sets.clone() {
         if !prog.handler_sets.contains_key(&name) {
             errors.push(IdlError {
                 line: 0,
                 message: format!("export handler_set '{name}': no such handler set"),
+            });
+        }
+    }
+    for name in prog.exported_types.clone() {
+        if !prog.types.contains_key(&name) {
+            errors.push(IdlError {
+                line: 0,
+                message: format!("export type '{name}': no such type"),
+            });
+        }
+    }
+    for name in prog.exported_fns.clone() {
+        if !prog.functions.iter().any(|f| f.name == name) {
+            errors.push(IdlError {
+                line: 0,
+                message: format!("export fn '{name}': no such function"),
             });
         }
     }
@@ -2707,6 +2912,44 @@ fn import_module(
             )
         })?;
     let mut out = Vec::new();
+    // §42: exported types and functions splice under their OWN names —
+    // they are referenced from expressions and state decls, where a
+    // namespace prefix would not parse. Collisions are compile errors
+    // (duplicate type/function detection in the importing file).
+    for name in &mod_prog.exported_types {
+        if let Some(fields) = mod_prog.types.get(name) {
+            let fs: Vec<String> = fields
+                .iter()
+                .map(|(f, t)| format!("{f}: {t}"))
+                .collect();
+            out.push(format!("type {name} = {{ {} }};", fs.join(", ")));
+        }
+    }
+    for name in &mod_prog.exported_fns {
+        if let Some(f) = mod_prog.functions.iter().find(|f| &f.name == name) {
+            let params: Vec<String> = f
+                .params
+                .iter()
+                .map(|(n, t)| format!("{n}: {t}"))
+                .collect();
+            let ret = f.ret.as_ref().map(|r| format!(" -> {r}")).unwrap_or_default();
+            let mut body = String::new();
+            for a in &f.body {
+                body.push_str(&format!(" {};", action_word(a)));
+            }
+            if let Some(e) = &f.returned {
+                body.push_str(&format!(" return {};", expr_word(e)));
+            }
+            out.push(format!("fn {}({}){} {{", f.name, params.join(", "), ret));
+            for a in &f.body {
+                out.push(format!("  {};", action_word(a)));
+            }
+            if let Some(e) = &f.returned {
+                out.push(format!("  return {};", expr_word(e)));
+            }
+            out.push("}".into());
+        }
+    }
     for name in &mod_prog.exported_sets {
         let Some(hs) = mod_prog.handler_sets.get(name) else { continue };
         let full_name = match ns {
@@ -3084,5 +3327,81 @@ mod static_validation_tests {
         let es = check(&p).unwrap_err();
         let dlg = es.iter().find(|e| e.message.contains("dialogue violation")).unwrap();
         assert_eq!(dlg.line, 4, "{es:?}");
+    }
+}
+
+#[cfg(test)]
+mod inheritance_tests {
+    use super::*;
+
+    // §42: extends inherits states/handlers; same-sig handler overrides
+    #[test]
+    fn extends_inherits_and_overrides() {
+        let src = r#"
+protocol supply_v1 v1;
+roles buyer, seller;
+state quoted: bool;
+on request("quote") from buyer -> send propose to buyer;
+on accept from buyer -> begin;
+on breach -> send failure to buyer;
+
+protocol supply_v2 v1 extends supply_v1;
+on accept from buyer -> send inform to buyer;
+on breach -> send error to buyer;
+on propose from seller -> send accept to seller;
+on inform from seller -> send bye;
+on error from seller -> send bye;
+"#;
+        let p = parse(src).unwrap();
+        assert_eq!(p.name, "supply_v2");
+        assert_eq!(p.states.len(), 1); // inherited quoted
+        assert_eq!(p.handlers.len(), 6); // request (inherited) + 2 overrides + 3 new
+        // the v2 accept handler OVERRODE the base's `begin`
+        let acc: Vec<_> = p.handlers.iter().filter(|h| matches!(h.trigger, OnTrigger::Event { performative: Performative::Accept, .. })).collect();
+        assert_eq!(acc.len(), 1);
+        assert!(matches!(acc[0].actions[0], ProtocolAction::Send { performative: Performative::Inform, .. }));
+        assert!(!p.handlers.iter().any(|h| h.actions.iter().any(|a| matches!(a, ProtocolAction::Begin))));
+        assert!(check(&p).is_ok(), "{:?}", check(&p).unwrap_err());
+    }
+
+    #[test]
+    fn extends_requires_base_in_file() {
+        let src = "protocol b v1;\nroles a, b;\non inform from a -> send inform to b;\non inform from b -> send bye;\n\nprotocol c v1 extends nosuch;\non inform from a -> send inform to b;\n";
+        let es = parse(src).unwrap_err();
+        assert!(es.iter().any(|e| e.message.contains("extends unknown protocol")), "{es:?}");
+    }
+
+    #[test]
+    fn second_protocol_without_extends_is_error() {
+        let src = "protocol a v1;\nroles x, y;\non inform from x -> send inform to y;\non inform from y -> send bye;\nprotocol b v1;\nroles x, y;\non inform from x -> send inform to y;\n";
+        let es = parse(src).unwrap_err();
+        assert!(es.iter().any(|e| e.message.contains("without 'extends'")), "{es:?}");
+    }
+
+    // §42: exported types and functions splice via import
+    #[test]
+    fn import_splices_exported_types_and_fns() {
+        let mod_path = std::env::temp_dir().join("acl_voc_mod.aclp");
+        std::fs::write(&mod_path, r#"
+type Quote = { price: int, cur: str };
+fn with_fee(p: int) -> int {
+  set fee = p + 5;
+  return fee;
+}
+export type Quote;
+export fn with_fee;
+protocol _voc v1;
+roles x, y;
+on inform from x -> send inform to y;
+on inform from y -> send bye;
+"#).unwrap();
+        let main = format!(
+            "import \"{}\";\nprotocol p v1;\nroles a, b;\nstate q: Quote;\non inform from a {{ set q = Quote {{ price: with_fee(10), cur: \"usd\" }}; }}\non inform from b -> send bye;\n",
+            mod_path.to_string_lossy()
+        );
+        let p = parse_with_includes(&main, None).unwrap();
+        assert!(p.types.contains_key("Quote"), "{:?}", p.types.keys());
+        assert!(p.functions.iter().any(|f| f.name == "with_fee"));
+        assert!(check(&p).is_ok(), "{:?}", check(&p).unwrap_err());
     }
 }
