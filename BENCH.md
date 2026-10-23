@@ -31,3 +31,54 @@ Reads:
 | JSON       | 532 (**−43%** with msgpack) |
 
 Cross-checked by `compactness` unit test (asserts msgpack < JSON).
+
+## ACL vs natural language (same communicative act)
+
+Measured with `scratch` script: the SAME message (request: quarterly
+report from s3, PDF, 3 sections, 24h deadline) rendered both as an ACL
+envelope (encoded by the **independent spec-only codec**, `py_codec.py`)
+and as the natural-language paragraph an agent would have to generate
+and another agent's LLM would have to parse. Tokens via tiktoken
+o200k_base.
+
+| metric            | ACL (msgpack)       | natural language        |
+|-------------------|---------------------|-------------------------|
+| wire bytes        | 372                 | 431 (only 1.2×)         |
+| LLM tokens        | **0**               | 100 per message         |
+| interpretation    | 6 µs (deterministic decode, python) | 22 µs tokenize **+ 1 full LLM round-trip** |
+| LLM calls / msg   | **0**               | 2 (generate + parse)    |
+
+8-message contract-net negotiation (1 announce, 5 bids, 1 award, 1 report):
+
+| resource         | ACL              | natural language                 |
+|------------------|------------------|----------------------------------|
+| bytes            | 2,976            | 3,448                            |
+| LLM calls        | **0**            | 16                               |
+| LLM tokens       | 0                | 800 out + 800 in                 |
+| wall-clock       | ~ms (network-bound) | ~10–18 s serialized †         |
+| cost (gpt-4o-mini)† | $0            | ~$0.0006 (800×$0.60/M + 800×$0.15/M) |
+| cost (frontier, $2.5/$10)† | $0     | ~$0.012                          |
+| determinism      | exact (byte-comparable, signed) | probabilistic — same input can parse differently |
+
+† CITED, not measured: OpenAI gpt-4o-mini list pricing $0.15/M input,
+$0.60/M output; P50 latency ~0.6 s, E2E ~1.1–3.5 s per call
+(openrouter.ai, infron.ai — Oct 2025). Token/byte figures ARE measured.
+
+**Honest reading:** bytes are NOT the story (1.2×). The real costs of
+natural language are (a) 2 LLM calls per message — latency in seconds,
+cost linear in message volume, (b) non-determinism: "within 24 hours"
+must be re-parsed and re-pinned by an LLM every time, while
+`deadline_ms=86400000` is pinned once, signed, and machine-checkable,
+and (c) auditability: commitments, deadlines and provenance are fields
+you can verify, not prose you must re-interpret.
+
+At personal scale the dollar difference is negligible; at agent-fleet
+scale (10k msgs/day = 20k LLM calls) NL adds ~hours of cumulative
+latency and $0.75–$8+/day purely for encoding/decoding meaning. ACL
+makes the *social* layer (who promised what, by when) deterministic and
+free of inference; natural language stays inside payloads where it
+belongs.
+
+Method note: reproduce with tiktoken o200k_base + `tests/interop/
+py_codec.py`; NL text is the minimal faithful rendering of the same
+task fields — longer politeness strategies only increase the NL column.
