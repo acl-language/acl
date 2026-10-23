@@ -12,23 +12,23 @@ use crate::Performative;
 pub fn legal_replies(prev: Performative) -> &'static [Performative] {
     use Performative::*;
     match prev {
-        Request => &[Inform, InputRequired, Failure, Reject, Propose, Progress, Error],
-        Delegate => &[Inform, InputRequired, Failure, Reject, Propose, Progress, Error],
-        Query => &[Inform, Failure, Error],
-        Propose => &[Accept, Reject, Error],
-        Accept => &[Inform, Failure, Error],
-        Cancel => &[Inform, Error],
-        Inform => &[Inform, Error, Retract],
-        Hello => &[Hello, Error],
-        InputRequired => &[Inform, Cancel, Error],
-        Progress => &[Progress, Inform, Failure, InputRequired, Error],
-        Failure => &[Inform, Error],
-        Reject => &[Inform, Error],
+        Request => &[Inform, InputRequired, Failure, Reject, Propose, Progress, Error, Bye],
+        Delegate => &[Inform, InputRequired, Failure, Reject, Propose, Progress, Error, Bye],
+        Query => &[Inform, Failure, Error, Bye],
+        Propose => &[Accept, Reject, Error, Bye],
+        Accept => &[Inform, Failure, Error, Bye],
+        Cancel => &[Inform, Error, Bye],
+        Inform => &[Inform, Error, Retract, Bye],
+        Hello => &[Hello, Error, Bye],
+        InputRequired => &[Inform, Cancel, Error, Bye],
+        Progress => &[Progress, Inform, Failure, InputRequired, Error, Bye],
+        Failure => &[Inform, Error, Bye],
+        Reject => &[Inform, Error, Bye],
         Bye => &[],
-        Error => &[Inform, Error],
-        Retract => &[Inform, Error],
-        Subscribe => &[Inform, Failure, Error],
-        Unsubscribe => &[Inform, Error],
+        Error => &[Inform, Error, Bye],
+        Retract => &[Inform, Error, Bye],
+        Subscribe => &[Inform, Failure, Error, Bye],
+        Unsubscribe => &[Inform, Error, Bye],
     }
 }
 
@@ -51,8 +51,10 @@ mod tests {
         assert!(dialogue_legal(Request, Reject));
         assert!(dialogue_legal(Request, Progress));
         assert!(!dialogue_legal(Request, Hello));
-        assert!(!dialogue_legal(Request, Bye));
         assert!(!dialogue_legal(Request, Accept));
+        // §34: any participant may close the session — Bye is legal
+        // after anything except after Bye itself
+        assert!(dialogue_legal(Request, Bye));
 
         // query must be answered with information or failure — never Accept
         assert!(dialogue_legal(Query, Inform));
@@ -72,6 +74,10 @@ mod tests {
         // bye closes: nothing may follow
         assert!(legal_replies(Bye).is_empty());
         assert!(!dialogue_legal(Bye, Inform));
+        // session termination is always available (except after bye)
+        for p in [Request, Inform, Propose, Accept, Failure, Error, Query] {
+            assert!(dialogue_legal(p, Bye), "Bye must be legal after {p:?}");
+        }
 
         // error: the peer may recover with inform
         assert!(dialogue_legal(Error, Inform));

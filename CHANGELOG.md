@@ -6,6 +6,36 @@ Format based on Keep a Changelog; versions follow semver for the
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-10-23
+
+The programming-language layer completes: `.aclp` programs now branch on
+session state, match message content, run on host-injected time, and are
+checked for deadlock at COMPILE time — plus runnable codegen and
+transcript verification.
+
+### Added
+- **Guards** (§34.1): `on accept when quoted` — dispatch gated on bool
+  session states (`not/and/or`, compile-checked).
+- **Typed session states** (§34.2): `bool|int|str` with runtime-checked
+  assignments; guards/end-when require bool states.
+- **Content patterns** (§34.3): `on request {"task": "deploy*"}` — JSON
+  subset matching with prefix wildcards, alongside literal patterns.
+- **Time-driven handlers** (§34.4): `every 60s while active as seller`
+  — deterministic `tick()` injection, no clock in the runtime.
+- **Linearity** (§34.5): every send must have a receiver — orphan sends
+  are COMPILE ERRORS (deadlock prevention).
+- **Liveness** (§34.6): static reachability to terminal actions;
+  unreachable handlers warn as possible deadlocks.
+- **Endpoint codegen** (§34.7): `aclc gen agent py` — runnable Python
+  agent skeletons per role, validated end-to-end (generated agents
+  complete the commitment lifecycle).
+- **Transcript verification** (§34.8): `verify_transcript` replays
+  recorded exchanges through projected runtimes — off-policy messages
+  and orphan destinations are errors; unhandled deliveries are warnings.
+- Dialogue matrix: `bye` is now legal after every performative except
+  after `bye` itself (any participant may close the session).
+- 13 new tests (101/101).
+
 ## [0.9.0] — 2026-10-23
 
 Phases 2 and 3 of the protocol-program stack: the runtime that EXECUTES

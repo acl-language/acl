@@ -928,6 +928,71 @@ A global protocol COMPILES into per-role endpoints:
   conversation: their combined transcripts contain every in/out event
   of the protocol, and the commitment lifecycle completes once.
 
+## 34. Programming-language layer (normative)
+
+Eight additions that complete `.aclp` as a programming language.
+
+### 34.1 Guards
+
+`on <trigger> when <guard>` — dispatch requires the guard to hold.
+Grammar: `not` > `and` > `or`, atoms are BOOL session states. Compile
+check: every referenced state must be declared with type `bool`
+(non-bool or undeclared state = compile error). Unset states evaluate
+false. Guards also gate timers.
+
+### 34.2 Typed session states
+
+`state <name>: bool|int|str;` — assignments are type-checked at runtime
+(mismatches logged, never fatal); guards and `end when` require bool
+states (compile time). Vocabulary types (e.g. `Money`) are accepted and
+behave as `str` until typed vocabularies bind.
+
+### 34.3 Content patterns
+
+Handler patterns come in two forms: the literal `("quote")` (equality
+with the event's pattern string) and the content pattern
+`{"task": "deploy*"}` — a JSON object that must be a SUBSET of the
+event's structured fields, with `*`-suffixed values matching by prefix.
+An event without fields never matches a content pattern.
+
+### 34.4 Time-driven handlers
+
+`every <N>s|ms|m while <guard> as <role>` — fires periodically while
+the guard holds, attributed to one role (unattributed = every role).
+The runtime stays clock-free: the host calls `tick(elapsed_ms)`, due
+timers fire deterministically, re-ticking the same elapsed never
+double-fires.
+
+### 34.5 Linearity (deadlock prevention at compile time)
+
+EVERY send must have a receiver: the targeted role's projection must
+contain a handler for the sent performative (bye excepted — it
+terminates the session). Orphan send = compile error. In n>2 protocols,
+triggers require `from` and sends require `to` (fully attributed).
+
+### 34.6 Liveness (static deadlock warning)
+
+Over the handler graph (edges: send → handlers listening for that
+performative in the target role), every handler must reach a TERMINAL
+action: `fulfil`, or a send of `bye`/`reject`/`error`. Unreachable =
+warning (not error — external intervention may exist).
+
+### 34.7 Endpoint codegen
+
+`aclc gen agent py <file.aclp> <out_dir>` emits a RUNNABLE Python
+skeleton per role: the projected handlers as data, guard evaluation,
+content matching, commitment lifecycle, and timer ticking — a compiled
+agent with zero ACL dependencies, wired to any transport by feeding
+`deliver()`/`tick()`.
+
+### 34.8 Transcript verification
+
+`verify_transcript(prog, events)` replays a recorded exchange through
+the projected runtimes: every emitted message must be dialogue-legal
+for the receiving role's previous turn (§16), target a declared role,
+and have a destination. Unhandled deliveries are warnings (logged,
+visible) — never silent. Replay is deterministic and bounded.
+
 ## 16. Dialogue rules (normative)
 
 A conversation has policy: after a given performative, only certain replies

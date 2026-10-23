@@ -47,9 +47,12 @@ fn main() {
                                             }
                                             acl_core::protocol::OnTrigger::Breach => "Breach".into(),
                                             acl_core::protocol::OnTrigger::Expired => "Expired".into(),
+                                            acl_core::protocol::OnTrigger::Timer { every_ms, guard, .. } => {
+                                                format!("Timer({}ms, guard:{guard:?})", every_ms)
+                                            }
                                         };
                                         let a: Vec<String> = h.actions.iter().map(|x| match x {
-                                            acl_core::protocol::ProtocolAction::Send { performative, to } =>
+                                            acl_core::protocol::ProtocolAction::Send { performative, to, .. } =>
                                                 format!("send {:?} to {:?}", performative, to),
                                             acl_core::protocol::ProtocolAction::Begin => "begin".into(),
                                             acl_core::protocol::ProtocolAction::Fulfil => "fulfil".into(),
@@ -169,6 +172,55 @@ fn main() {
                 std::process::exit(2);
             }
             let lang = files[0].as_str();
+            if lang == "agent" {
+                // §34: gen agent py <file.aclp> <out_dir> — one runnable
+                // Python skeleton per role (BEFORE the IDL parse: .aclp
+                // files are protocol programs, not vocabularies)
+                let src = std::fs::read_to_string(&files[1]).unwrap_or_else(|e| {
+                    eprintln!("aclc: cannot read {}: {e}", files[1]);
+                    std::process::exit(2);
+                });
+                let out_dir = &files[2];
+                match acl_core::protocol::parse(&src) {
+                    Err(errors) => {
+                        for e in errors { eprintln!("{}:{e}", files[0]); }
+                        std::process::exit(1);
+                    }
+                    Ok(prog) => {
+                        match acl_core::protocol::check(&prog) {
+                            Err(errors) => {
+                                for e in errors { eprintln!("{}:{e}", files[1]); }
+                                std::process::exit(1);
+                            }
+                            Ok(_) => {}
+                        }
+                        std::fs::create_dir_all(out_dir).expect("mkdir");
+                        let mut failed = false;
+                        for role in &prog.roles {
+                            match acl_core::codegen::gen_agent_py(&prog, role) {
+                                Err(errors) => {
+                                    failed = true;
+                                    for e in errors { eprintln!("{}:{e}", files[1]); }
+                                }
+                                Ok(code) => {
+                                    let path = format!("{out_dir}/agent_{}.py", role.replace('-', "_"));
+                                    if let Err(e) = std::fs::write(&path, &code) {
+                                        eprintln!("aclc: cannot write {path}: {e}");
+                                        failed = true;
+                                    } else {
+                                        println!("{path}");
+                                    }
+                                }
+                            }
+                        }
+                        std::process::exit(if failed { 1 } else { 0 });
+                    }
+                }
+            }
+            if files.len() != 3 {
+                eprintln!("usage: aclc gen <rust|py|ts|schema|agent> <file> <out_dir>");
+                std::process::exit(2);
+            }
             let src = std::fs::read_to_string(&files[1]).expect("read");
             let file: IdlFile = idl::parse(&src).expect("parse");
             idl::typecheck(&file).expect("typecheck");

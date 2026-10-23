@@ -6,6 +6,7 @@
 //! answers `query` with `request` does not compile.
 
 use crate::dialogue::dialogue_legal;
+use crate::runtime::handler_executor;
 use crate::idl::IdlError;
 use crate::Performative;
 use std::collections::BTreeMap;
@@ -28,6 +29,10 @@ pub enum OnTrigger {
     Breach,
     /// `on expired` — the session/commitment deadline passed
     Expired,
+    /// §34: `every 60s while <guard> as <role>` — time-driven handler;
+    /// the HOST injects ticks (runtime stays clock-free and deterministic).
+    /// Unattributed timers fire in every role.
+    Timer { every_ms: i64, guard: Option<Guard>, as_role: Option<String> },
 }
 
 /// What a handler does. Phase 1: the speech-act statement set.
@@ -35,7 +40,7 @@ pub enum OnTrigger {
 pub enum ProtocolAction {
     /// `send propose to seller` — MUST be dialogue-legal for the trigger;
     /// `to` names the receiving role (defaults to the counterpart)
-    Send { performative: Performative, to: Option<String> },
+    Send { performative: Performative, to: Option<String>, fields: Option<BTreeMap<String, String>> },
     /// `begin` — activate the pending commitment (proposed -> active)
     Begin,
     /// `fulfil` — mark the commitment fulfilled (active -> fulfilled)
@@ -44,9 +49,78 @@ pub enum ProtocolAction {
     Retract { target: String },
 }
 
+/// §34: guard — boolean expression over session states, evaluated at
+/// dispatch time. `quoted`, `not quoted`, `a and b`, `a or b`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Guard {
+    Atom { name: String, neg: bool },
+    And(Box<Guard>, Box<Guard>),
+    Or(Box<Guard>, Box<Guard>),
+}
+
+impl Guard {
+    pub fn eval(&self, states: &BTreeMap<String, bool>) -> bool {
+        match self {
+            Guard::Atom { name, neg } => {
+                let v = states.get(name).copied().unwrap_or(false);
+                if *neg { !v } else { v }
+            }
+            Guard::And(a, b) => a.eval(states) && b.eval(states),
+            Guard::Or(a, b) => a.eval(states) || b.eval(states),
+        }
+    }
+    pub fn names(&self) -> Vec<&str> {
+        match self {
+            Guard::Atom { name, .. } => vec![name.as_str()],
+            Guard::And(a, b) | Guard::Or(a, b) => {
+                let mut v = a.names();
+                v.extend(b.names());
+                v
+            }
+        }
+    }
+}
+
+/// parse `a and not b or c` — precedence: not > and > or (left-assoc)
+pub fn parse_guard(src: &str) -> Result<Guard, String> {
+    fn or(it: &mut std::iter::Peekable<std::str::SplitAsciiWhitespace<'_>>) -> Result<Guard, String> {
+        let mut left = and(it)?;
+        while it.peek() == Some(&"or") {
+            it.next();
+            let right = and(it)?;
+            left = Guard::Or(Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+    fn and(it: &mut std::iter::Peekable<std::str::SplitAsciiWhitespace<'_>>) -> Result<Guard, String> {
+        let mut left = atom(it)?;
+        while it.peek() == Some(&"and") {
+            it.next();
+            let right = atom(it)?;
+            left = Guard::And(Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+    fn atom(it: &mut std::iter::Peekable<std::str::SplitAsciiWhitespace<'_>>) -> Result<Guard, String> {
+        let w = it.next().ok_or_else(|| "empty guard".to_string())?;
+        if w == "not" {
+            let n = it.next().ok_or_else(|| "'not' needs a state".to_string())?;
+            return Ok(Guard::Atom { name: n.to_string(), neg: true });
+        }
+        Ok(Guard::Atom { name: w.to_string(), neg: false })
+    }
+    let mut it = src.split_ascii_whitespace().peekable();
+    let g = or(&mut it)?;
+    if it.peek().is_some() {
+        return Err(format!("trailing tokens in guard: '{src}'"));
+    }
+    Ok(g)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Handler {
     pub trigger: OnTrigger,
+    pub guard: Option<Guard>,
     pub actions: Vec<ProtocolAction>,
 }
 
@@ -66,6 +140,14 @@ pub struct ProtocolProgram {
     pub states: Vec<StateDecl>,
     pub handlers: Vec<Handler>,
     pub end_when: Option<EndWhen>,
+}
+
+impl Handler {
+    /// §34: true when the trigger pattern is a content pattern `{"k": "v"}`
+    /// (as opposed to a literal `("quote")` equality pattern)
+    pub fn pattern_is_json(&self) -> bool {
+        matches!(&self.trigger, OnTrigger::Event { pattern: Some(p), .. } if p.starts_with('{'))
+    }
 }
 
 impl ProtocolProgram {
@@ -106,8 +188,11 @@ fn split_trigger(head: &str) -> (String, Option<String>, Option<String>) {
         Some(i) => (head[..i].trim().to_string(), Some(head[i + 6..].trim().to_string())),
         None => (head.trim().to_string(), None),
     };
-    let (word, pattern) = match head.find('(') {
-        Some(i) if head.ends_with(')') => {
+    let (word, pattern) = match (head.find('('), head.find('{')) {
+        (Some(i), _) if head.ends_with(')') => {
+            (head[..i].trim().to_string(), Some(head[i..].to_string()))
+        }
+        (_, Some(i)) if head.ends_with('}') => {
             (head[..i].trim().to_string(), Some(head[i..].to_string()))
         }
         _ => (head.trim().to_string(), None),
@@ -202,10 +287,66 @@ pub fn parse(src: &str) -> Result<ProtocolProgram, Vec<IdlError>> {
             }
             continue;
         }
+        if let Some(rest) = line.strip_prefix("every ") {
+            // §34: time-driven handler — `every 60s while <guard> -> act;`
+            let (spec, arrow, sends) = match rest.split_once("->") {
+                Some((h, s)) => (h.trim(), true, s.trim().to_string()),
+                None => (rest.trim_end_matches('{').trim(), false, String::new()),
+            };
+            // peel `as <role>` BEFORE the guard split (the guard would
+            // otherwise swallow it: 'active as a')
+            let (spec, as_role) = match spec.rfind(" as ") {
+                Some(i) => (spec[..i].trim(), Some(spec[i + 4..].trim().to_string())),
+                None => (spec, None),
+            };
+            let (spec, guard_src) = match spec.split_once(" while ") {
+                Some((a, g)) => (a.trim(), Some(g.trim().to_string())),
+                None => (spec, None),
+            };
+            let every_ms = parse_duration(spec);
+            let Some(every_ms) = every_ms else {
+                errors.push(IdlError { line: line_no, message: format!("bad timer spec: '{spec}' (want e.g. '60s', '500ms')") });
+                continue;
+            };
+            let guard = match guard_src.map(|g| parse_guard(&g)) {
+                Some(Ok(g)) => Some(g),
+                Some(Err(e)) => {
+                    errors.push(IdlError { line: line_no, message: format!("bad guard: {e}") });
+                    continue;
+                }
+                None => None,
+            };
+            let h = Handler { trigger: OnTrigger::Timer { every_ms, guard, as_role }, guard: None, actions: Vec::new() };
+            if arrow {
+                let stmt = sends.trim_end_matches(';').trim();
+                match parse_action(stmt) {
+                    Ok(a) => {
+                        let mut hh = h;
+                        hh.actions.push(a);
+                        prog.handlers.push(hh);
+                    }
+                    Err(e) => errors.push(IdlError { line: line_no, message: e }),
+                }
+            } else {
+                handler = Some(h);
+            }
+            continue;
+        }
         if let Some(rest) = line.strip_prefix("on ") {
             let (head, arrow, sends) = match rest.split_once("->") {
                 Some((h, s)) => (h.trim(), true, s.trim().to_string()),
                 None => (rest.trim_end_matches('{').trim(), false, String::new()),
+            };
+            // §34: peel `when <guard>` (before from-parsing)
+            let (head, guard) = match head.rfind(" when ") {
+                Some(i) => (head[..i].trim(), match parse_guard(head[i + 6..].trim()) {
+                    Ok(g) => Some(g),
+                    Err(e) => {
+                        errors.push(IdlError { line: line_no, message: format!("bad guard: {e}") });
+                        continue;
+                    }
+                }),
+                None => (head, None),
             };
             let trigger = match parse_trigger(&head) {
                 Ok(t) => t,
@@ -214,7 +355,7 @@ pub fn parse(src: &str) -> Result<ProtocolProgram, Vec<IdlError>> {
                     continue;
                 }
             };
-            let mut h = Handler { trigger, actions: Vec::new() };
+            let mut h = Handler { trigger, guard, actions: Vec::new() };
             if arrow {
                 // one-line form: `on X -> send Y;` (no block)
                 let stmt = sends.trim_end_matches(';').trim();
@@ -268,6 +409,18 @@ fn parse_trigger(head: &str) -> Result<OnTrigger, String> {
     }
 }
 
+fn parse_duration(spec: &str) -> Option<i64> {
+    let spec = spec.trim();
+    let (num, unit) = spec.split_at(spec.find(|c: char| !c.is_ascii_digit())?);
+    let n: i64 = num.parse().ok()?;
+    match unit {
+        "ms" => Some(n),
+        "s" => Some(n * 1000),
+        "m" => Some(n * 60_000),
+        _ => None,
+    }
+}
+
 fn parse_action(stmt: &str) -> Result<ProtocolAction, String> {
     let s = stmt.trim().trim_end_matches(';').trim();
     if s == "begin" {
@@ -288,9 +441,19 @@ fn parse_action(stmt: &str) -> Result<ProtocolAction, String> {
             Some(i) => (rest[..i].trim(), Some(rest[i + 4..].trim().to_string())),
             None => (rest, None),
         };
+        // optional payload: `send progress {"pct": "50"}`
+        let (rest, fields) = match (rest.find('{'), rest.ends_with('}')) {
+            (Some(i), true) => {
+                let raw = &rest[i..];
+                let map: BTreeMap<String, String> = serde_json::from_str(raw)
+                    .map_err(|e| format!("bad send payload: {e}"))?;
+                (rest[..i].trim(), Some(map))
+            }
+            _ => (rest, None),
+        };
         let word = rest.split(|c: char| c == '(' || c == ' ' || c == '{').next().unwrap_or(rest);
         return match perf_from_word(word.trim()) {
-            Some(p) => Ok(ProtocolAction::Send { performative: p, to }),
+            Some(p) => Ok(ProtocolAction::Send { performative: p, to, fields }),
             None => Err(format!("unknown performative in send: '{word}'")),
         };
     }
@@ -324,7 +487,13 @@ pub fn check(prog: &ProtocolProgram) -> Result<Vec<String>, Vec<IdlError>> {
     for h in &prog.handlers {
         let sig = match &h.trigger {
             OnTrigger::Event { performative, pattern, from } => {
-                format!("event:{performative:?}:{pattern:?}:{from:?}")
+                format!(
+                    "event:{performative:?}:{pattern:?}:{from:?}:guard={:?}",
+                    h.guard.as_ref().map(|g| guard_word(g))
+                )
+            }
+            OnTrigger::Timer { every_ms, guard, as_role } => {
+                format!("timer:{every_ms}:{guard:?}:{as_role:?}")
             }
             OnTrigger::Breach => "breach".into(),
             OnTrigger::Expired => "expired".into(),
@@ -340,10 +509,10 @@ pub fn check(prog: &ProtocolProgram) -> Result<Vec<String>, Vec<IdlError>> {
             let ProtocolAction::Send { performative: out, .. } = a else { continue };
             let legal = match &h.trigger {
                 OnTrigger::Event { performative: inp, .. } => dialogue_legal(*inp, *out),
-                // breach/expired happen inside a session opened by some
+                // breach/expired/timer happen inside a session opened by some
                 // request-shaped move; the send must be legal after AT
                 // LEAST ONE plausible predecessor
-                OnTrigger::Breach | OnTrigger::Expired => [
+                OnTrigger::Breach | OnTrigger::Expired | OnTrigger::Timer { .. } => [
                     Performative::Request,
                     Performative::Propose,
                     Performative::Delegate,
@@ -352,10 +521,11 @@ pub fn check(prog: &ProtocolProgram) -> Result<Vec<String>, Vec<IdlError>> {
                 .any(|prev| dialogue_legal(*prev, *out)),
             };
             if !legal {
-                let trig = match &h.trigger {
+                let mut trig = match &h.trigger {
                     OnTrigger::Event { performative, .. } => format!("{performative:?}"),
                     OnTrigger::Breach => "Breach".into(),
                     OnTrigger::Expired => "Expired".into(),
+                    OnTrigger::Timer { .. } => "Timer".into(),
                 };
                 errors.push(IdlError {
                     line: 0,
@@ -388,6 +558,186 @@ pub fn check(prog: &ProtocolProgram) -> Result<Vec<String>, Vec<IdlError>> {
         warnings.push("protocol has no event handlers (nothing can arrive)".into());
     }
 
+    // ---- §34: guards reference DECLARED BOOL states ----
+    let state_ty: BTreeMap<&str, &str> = prog
+        .states
+        .iter()
+        .map(|s| (s.name.as_str(), s.ty.as_deref().unwrap_or("bool")))
+        .collect();
+    let mut guard_ok = |g: &Guard, what: &str, errors: &mut Vec<IdlError>| {
+        for n in g.names() {
+            match state_ty.get(n) {
+                None => errors.push(IdlError {
+                    line: 0,
+                    message: format!("{what} references undeclared state '{n}'"),
+                }),
+                Some(t) if *t != "bool" => errors.push(IdlError {
+                    line: 0,
+                    message: format!("{what} requires bool state '{n}', declared '{t}'"),
+                }),
+                _ => {}
+            }
+        }
+    };
+    for h in &prog.handlers {
+        if let Some(g) = &h.guard {
+            guard_ok(g, "handler guard", &mut errors);
+        }
+        if let OnTrigger::Timer { guard: Some(g), as_role, .. } = &h.trigger {
+            guard_ok(g, "timer guard", &mut errors);
+            if let Some(r) = as_role {
+                if !prog.roles.iter().any(|x| x == r) {
+                    errors.push(IdlError {
+                        line: 0,
+                        message: format!("timer 'as {r}': undeclared role"),
+                    });
+                }
+            }
+        }
+    }
+    if let Some(EndWhen::State(sname)) = &prog.end_when {
+        if let Some(t) = state_ty.get(sname.as_str()) {
+            if *t != "bool" {
+                errors.push(IdlError {
+                    line: 0,
+                    message: format!("end when requires bool state '{sname}', declared '{t}'"),
+                });
+            }
+        }
+    }
+
+    // ---- §34: n>2 protocols MUST attribute triggers and sends ----
+    let n_roles = prog.roles.len();
+    if n_roles > 2 {
+        for h in &prog.handlers {
+            if let OnTrigger::Event { from: None, .. } = &h.trigger {
+                errors.push(IdlError {
+                    line: 0,
+                    message: format!(
+                        "{n_roles}-role protocol: trigger 'on {}' needs 'from <role>'",
+                        match &h.trigger {
+                            OnTrigger::Event { performative, .. } => format!("{performative:?}"),
+                            _ => unreachable!(),
+                        }
+                    ),
+                });
+            }
+            for a in &h.actions {
+                if let ProtocolAction::Send { performative, to: None, .. } = a {
+                    if *performative == Performative::Bye {
+                        continue; // session terminator
+                    }
+                    errors.push(IdlError {
+                        line: 0,
+                        message: format!(
+                            "{n_roles}-role protocol: 'send {}' needs 'to <role>'",
+                            format!("{performative:?}")
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
+    // ---- §34: LINEARITY — every send must have a receiver ----
+    // receiver role = explicit `to` (else counterpart in 2-role); that
+    // role's projection must contain a handler `on <perf>` (or breach/
+    // expired/timer counts for state events). Orphan send = compile error.
+    let counterpart = |role: &str| -> String {
+        prog.roles
+            .iter()
+            .map(|s| s.as_str())
+            .find(|r| *r != role)
+            .unwrap_or("")
+            .to_string()
+    };
+    for h in &prog.handlers {
+        // executors of this handler emit its sends
+        for exec in handler_executor(prog, h) {
+            for a in &h.actions {
+                let ProtocolAction::Send { performative, to, .. } = a else { continue };
+                if *performative == Performative::Bye {
+                    continue; // session terminator: needs no receiver
+                }
+                let target = to.clone().unwrap_or_else(|| counterpart(exec));
+                let answered = prog.handlers.iter().any(|h2| {
+                    // h2 runs in `target` and listens for this performative
+                    handler_executor(prog, h2).contains(&target.as_str())
+                        && match &h2.trigger {
+                            OnTrigger::Event { performative: p2, .. } => p2 == performative,
+                            _ => false,
+                        }
+                });
+                if !answered {
+                    errors.push(IdlError {
+                        line: 0,
+                        message: format!(
+                            "unanswered send: '{exec}' sends {performative:?} to '{target}' but no handler 'on {performative:?}' exists there (§34 linearity)"
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
+    // ---- §34: LIVENESS — every handler can reach a terminal action ----
+    // terminal: a handler containing `fulfil`, or one whose send is a
+    // session-ender (bye/reject/error). Edges: handler -> handlers that
+    // listen for its sends (in the target role). BFS from each handler.
+    let is_terminal = |h: &Handler| {
+        h.actions.iter().any(|a| matches!(a, ProtocolAction::Fulfil))
+            || h.actions.iter().any(|a| matches!(
+                a,
+                ProtocolAction::Send { performative: Performative::Bye | Performative::Reject | Performative::Error, .. }
+            ))
+    };
+    let edges = |from_h: usize| -> Vec<usize> {
+        let mut out = Vec::new();
+        for a in &prog.handlers[from_h].actions {
+            let ProtocolAction::Send { performative, to, .. } = a else { continue };
+            for (j, h2) in prog.handlers.iter().enumerate() {
+                if j == from_h {
+                    continue;
+                }
+                let listens = matches!(&h2.trigger, OnTrigger::Event { performative: p2, .. } if p2 == performative);
+                if !listens {
+                    continue;
+                }
+                // h2's executors must include the send's target role
+                for exec in handler_executor(prog, h2) {
+                    let target = to.clone().unwrap_or_else(|| counterpart(exec));
+                    if handler_executor(prog, &prog.handlers[from_h]).contains(&target.as_str()) {
+                        out.push(j);
+                        break;
+                    }
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    };
+    for i in 0..prog.handlers.len() {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut stack = vec![i];
+        let mut reaches_terminal = is_terminal(&prog.handlers[i]);
+        while let Some(n) = stack.pop() {
+            for e in edges(n) {
+                if seen.insert(e) {
+                    if is_terminal(&prog.handlers[e]) {
+                        reaches_terminal = true;
+                    }
+                    stack.push(e);
+                }
+            }
+        }
+        if !reaches_terminal {
+            warnings.push(format!(
+                "liveness: handler #{i} cannot reach a terminal action (fulfil/bye/reject/error) — possible deadlock"
+            ));
+        }
+    }
+
     if errors.is_empty() { Ok(warnings) } else { Err(errors) }
 }
 
@@ -404,7 +754,7 @@ pub fn pretty(prog: &ProtocolProgram) -> String {
         }
     }
     for h in &prog.handlers {
-        let trig = match &h.trigger {
+        let mut trig = match &h.trigger {
             OnTrigger::Event { performative, pattern, from } => {
                 let mut t = match pattern {
                     Some(p) => format!("{}{}", perf_word(performative), p),
@@ -417,7 +767,28 @@ pub fn pretty(prog: &ProtocolProgram) -> String {
             }
             OnTrigger::Breach => "breach".into(),
             OnTrigger::Expired => "expired".into(),
+            OnTrigger::Timer { every_ms, guard, as_role } => {
+                let mut t = if every_ms % 60_000 == 0 {
+                    format!("every {}m", every_ms / 60_000)
+                } else if every_ms % 1000 == 0 {
+                    format!("every {}s", every_ms / 1000)
+                } else {
+                    format!("every {}ms", every_ms)
+                };
+                if let Some(g) = guard {
+                    t.push_str(&format!(" while {}", guard_word(g)));
+                }
+                if let Some(r) = as_role {
+                    t.push_str(&format!(" as {r}"));
+                }
+                t
+            }
         };
+        if let Some(g) = &h.guard {
+            if !matches!(h.trigger, OnTrigger::Timer { .. }) {
+                trig.push_str(&format!(" when {}", guard_word(g)));
+            }
+        }
         if h.actions.len() == 1 {
             out.push_str(&format!("on {} -> {};\n", trig, action_word(&h.actions[0])));
         } else {
@@ -459,12 +830,28 @@ fn perf_word(p: &Performative) -> &'static str {
     }
 }
 
+fn guard_word(g: &Guard) -> String {
+    match g {
+        Guard::Atom { name, neg } => {
+            if *neg { format!("not {name}") } else { name.clone() }
+        }
+        Guard::And(a, b) => format!("{} and {}", guard_word(a), guard_word(b)),
+        Guard::Or(a, b) => format!("{} or {}", guard_word(a), guard_word(b)),
+    }
+}
+
 fn action_word(a: &ProtocolAction) -> String {
     match a {
-        ProtocolAction::Send { performative, to } => match to {
-            Some(r) => format!("send {} to {}", perf_word(performative), r),
-            None => format!("send {}", perf_word(performative)),
-        },
+        ProtocolAction::Send { performative, to, fields } => {
+            let mut out = match to {
+                Some(r) => format!("send {} to {}", perf_word(performative), r),
+                None => format!("send {}", perf_word(performative)),
+            };
+            if let Some(f) = fields {
+                out.push_str(&format!(" {}", serde_json::to_string(f).unwrap_or_default()));
+            }
+            out
+        }
         ProtocolAction::Begin => "begin".into(),
         ProtocolAction::Fulfil => "fulfil".into(),
         ProtocolAction::Retract { target } => format!("retract({target})"),
@@ -478,18 +865,23 @@ mod tests {
     use super::*;
 
     const GOOD: &str = r#"
-// supply-check protocol program
+// supply-check protocol program — fully linear (§34): every send has a receiver
 protocol supply_check v1;
 roles buyer, seller;
 state quoted: bool;
 state paid: bool;
 
-// seller side: a request for a quote gets a proposal
-on request("quote") -> send propose;
-on accept -> begin;
-on query("status") -> send inform;
-on breach -> send failure;
-on expired -> send error;
+// seller side
+on request("quote") from buyer -> send propose to buyer;
+on accept from buyer -> begin;
+on query("status") from buyer -> send inform to buyer;
+on breach -> send failure to buyer;
+on expired -> send error to buyer;
+// buyer side
+on propose from seller -> send accept to seller;
+on inform from seller -> send bye;
+on failure from seller -> send bye;
+on error from seller -> send bye;
 
 end when fulfilled;
 "#;
@@ -501,7 +893,7 @@ end when fulfilled;
         assert_eq!(p.version, 1);
         assert_eq!(p.roles, vec!["buyer", "seller"]);
         assert_eq!(p.states.len(), 2);
-        assert_eq!(p.handlers.len(), 5);
+        assert_eq!(p.handlers.len(), 9); // 5 seller + 4 buyer
         // §16 at compile time: every send is dialogue-legal for its trigger
         check(&p).expect("check");
         // pretty roundtrip
@@ -516,20 +908,21 @@ end when fulfilled;
 protocol bad v1;
 roles a, b;
 on query -> send request;
+on request -> send bye;
 "#;
         let p = parse(src).expect("parse");
         let errs = check(&p).expect_err("must fail");
-        assert!(errs[0].message.contains("dialogue violation"));
+        assert!(errs.iter().any(|e| e.message.contains("dialogue violation")));
         assert!(errs[0].message.contains("§16"));
     }
 
     #[test]
     fn breach_handlers_constrained_by_plausible_predecessors() {
         // failure after breach is fine (legal after request)
-        let ok = parse("protocol p v1;\nroles a,b;\non breach -> send failure;\n").unwrap();
+        let ok = parse("protocol p v1;\nroles a,b;\non breach -> send failure;\non failure -> send bye;\n").unwrap();
         check(&ok).expect("failure legal after breach");
         // hello after breach is NOT legal after request/propose/delegate
-        let bad = parse("protocol p v1;\nroles a,b;\non breach -> send hello;\n").unwrap();
+        let bad = parse("protocol p v1;\nroles a,b;\non breach -> send hello;\non hello -> send bye;\n").unwrap();
         assert!(check(&bad).is_err());
     }
 
@@ -540,6 +933,7 @@ protocol p v1;
 roles a, b;
 on query -> send inform;
 on query -> send inform;
+on inform -> send bye;
 "#;
         let p = parse(src).unwrap();
         let errs = check(&p).expect_err("duplicate");
@@ -551,7 +945,9 @@ on query -> send inform;
         let src = r#"
 protocol p v1;
 roles a, b;
+state done: bool;
 on query -> send inform;
+on inform -> begin;
 end when nowhere;
 "#;
         let p = parse(src).unwrap();
@@ -569,6 +965,7 @@ on request("job") {
   send propose;
   retract(announced);
 }
+on propose -> send bye;
 "#;
         let p = parse(src).unwrap();
         assert_eq!(p.handlers[0].actions.len(), 2);
@@ -577,6 +974,131 @@ on request("job") {
             ProtocolAction::Retract { target: "announced".into() }
         );
         check(&p).expect("check");
+    }
+
+    #[test]
+    fn guards_parse_and_validate() {
+        let src = r#"
+protocol p v1;
+roles a, b;
+state quoted: bool;
+state paid: bool;
+on accept from b when quoted -> begin;
+on accept from b when not quoted -> send error to b;
+on request from b when quoted and not paid -> send propose to b;
+on error from a -> send bye;
+on propose from a -> send bye;
+"#;
+        let p = parse(src).expect("parse");
+        // guard AST shape
+        match &p.handlers[2].guard {
+            Some(Guard::And(l, r)) => {
+                assert!(matches!(**l, Guard::Atom { ref name, neg: false } if name == "quoted"));
+                assert!(matches!(**r, Guard::Atom { ref name, neg: true } if name == "paid"));
+            }
+            other => panic!("expected And guard, got {other:?}"),
+        }
+        check(&p).expect("guards reference declared bool states");
+    }
+
+    #[test]
+    fn guards_reject_undeclared_and_non_bool_states() {
+        // undeclared state in guard
+        let bad = parse("protocol p v1;\nroles a,b;\non accept from b when nowhere -> begin;\non error from b -> send bye;\n").unwrap();
+        let errs = check(&bad).unwrap_err();
+        assert!(errs.iter().any(|e| e.message.contains("undeclared state 'nowhere'")));
+        // non-bool state in guard
+        let bad2 = parse("protocol p v1;\nroles a,b;\nstate n: int;\non accept from b when n -> begin;\non error from b -> send bye;\n").unwrap();
+        let errs2 = check(&bad2).unwrap_err();
+        assert!(errs2.iter().any(|e| e.message.contains("requires bool state 'n'")));
+    }
+
+    #[test]
+    fn end_when_requires_bool_state() {
+        let bad = parse("protocol p v1;\nroles a,b;\nstate n: int;\non query from a -> send inform to a;\non inform -> send bye;\nend when n;\n").unwrap();
+        let errs = check(&bad).unwrap_err();
+        assert!(errs.iter().any(|e| e.message.contains("end when requires bool state 'n'")));
+    }
+
+    #[test]
+    fn content_patterns_in_handlers() {
+        let src = r#"
+protocol p v1;
+roles a, b;
+on request {"task": "deploy*"} from b -> send propose to b;
+on propose from a -> send bye;
+"#;
+        let p = parse(src).expect("content pattern parses");
+        assert!(p.handlers[0].pattern_is_json(), "brace pattern detected");
+        check(&p).expect("linear");
+    }
+
+    #[test]
+    fn timers_parse() {
+        let src = r#"
+protocol p v1;
+roles a, b;
+state active: bool;
+every 60s while active as a -> send progress to b;
+on progress from a -> send bye;
+"#;
+        let p = parse(src).expect("timer parses");
+        match &p.handlers[0].trigger {
+            OnTrigger::Timer { every_ms, guard, as_role } => {
+                assert_eq!(*every_ms, 60_000);
+                assert!(guard.is_some());
+                assert_eq!(as_role.as_deref(), Some("a"));
+            }
+            other => panic!("expected timer, got {other:?}"),
+        }
+        check(&p).expect("timer program is linear");
+    }
+
+    #[test]
+    fn timer_needs_bool_guard_state() {
+        let bad = parse("protocol p v1;\nroles a,b;\nstate n: int;\nevery 5s while n -> send progress to b;\non progress from b -> send bye;\n").unwrap();
+        let errs = check(&bad).unwrap_err();
+        assert!(errs.iter().any(|e| e.message.contains("timer guard requires bool state 'n'")));
+    }
+
+    #[test]
+    fn orphan_send_is_compile_error() {
+        let src = "protocol p v1;\nroles a, b;\non query from a -> send inform to a;\n";
+        let p = parse(src).unwrap();
+        let errs = check(&p).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.message.contains("unanswered send")),
+            "linearity must catch orphan sends, got {errs:?}"
+        );
+        // adding the receiver fixes it
+        let fixed = "protocol p v1;\nroles a, b;\non query -> send inform to a;\non inform from b -> send bye;\n";
+        let p2 = parse(fixed).unwrap();
+        check(&p2).expect("answered send compiles");
+    }
+
+    #[test]
+    fn n_role_requires_full_attribution() {
+        let three = "protocol t v1;\nroles a, b, c;\non query -> send inform to a;\non inform from b -> send bye;\n";
+        let p = parse(three).unwrap();
+        let errs = check(&p).unwrap_err();
+        assert!(errs.iter().any(|e| e.message.contains("3-role protocol")));
+        // fully attributed 3-role program passes the n>2 rule
+        let ok = "protocol t v1;\nroles a, b, c;\non query from a -> send inform to b;\non inform from c -> send bye;\n";
+        let p2 = parse(ok).unwrap();
+        check(&p2).expect("attributed n-role compiles (n>2 projection still phase-limited)");
+    }
+
+    #[test]
+    fn liveness_warns_on_unreachable_terminal() {
+        // request -> propose -> ??? : propose handler does only begin (no
+        // outgoing send) — the chain cannot reach fulfil/bye/reject/error
+        let src = "protocol p v1;\nroles a, b;\non query -> send inform to a;\non inform from b -> send bye;\non request from a -> send propose to a;\non propose from b -> begin;\n";
+        let p = parse(src).unwrap();
+        let warnings = check(&p).expect("compiles (warnings only)");
+        assert!(
+            warnings.iter().any(|w| w.contains("liveness")),
+            "deadlock should be warned, got {warnings:?}"
+        );
     }
 
     #[test]
