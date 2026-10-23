@@ -1,6 +1,6 @@
 [package]
 name = "acl-core"
-version = "0.4.0"
+version = "0.6.0"
 edition = "2024"
 description = "ACL — Agent Communication Language: binary, platform-agnostic protocol for AI agents (envelope, performatives, content language, Ed25519, MessagePack)"
 license = "Apache-2.0"

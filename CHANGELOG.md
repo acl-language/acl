@@ -6,6 +6,31 @@ Format based on Keep a Changelog; versions follow semver for the
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-10-23
+
+The language matures: typed values, bindings, quantification, semantic
+time, explicit intent, and vocabulary evolution. All changes additive;
+SPEC-VERSION on the wire remains `1`.
+
+### Added
+- **Typed content values** (spec §27): `ClValue` (Str/Int/Float/Bool/Var/
+  List/Map/Bytes) with strict typing (`Int` rejects floats, `null` is not
+  a CL value) and full wire compatibility with previous encoders.
+- **Bindings** (spec §28): `bind(name, expr, body)` with `$bind:` lexical
+  references, scope-tracked by the grammar validator.
+- **Partial application** (spec §28): `Action.partial` lists unfilled
+  params; schema validation skips them.
+- **Quantification** (spec §28): `for_all(var, over, such_that)` and
+  `exists(...)` with query domains.
+- **Metanível** (spec §28): `believes(agent, fact)` — reasoning about
+  other agents' knowledge.
+- **Semantic time** (spec §29): `Query.valid_until_ms`, `Renew` operator
+  for commitments, `Fact.derived_from` with validity propagation.
+- **Explicit intent** (spec §30): envelope `rational_effect` and
+  `feasibility_precondition` fields — FP/RE as message data (§17).
+- **Vocabulary evolution** (spec §31): `@deprecated` annotations in IDL,
+  `deprecated` map in compiled schemas, `validate_with_warnings` API.
+
 ## [0.5.0] — 2026-10-23
 
 From standalone language to distributed system. All changes additive;
@@ -135,7 +160,8 @@ First public release.
 - Independent spec-only Python codec; interop validated both directions
 - Robustness fuzz-lite corpus test; codec benchmarks
 
-[Unreleased]: https://github.com/acl-language/acl/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/acl-language/acl/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/acl-language/acl/releases/tag/v0.5.0
 [0.4.0]: https://github.com/acl-language/acl/releases/tag/v0.4.0
 [0.3.0]: https://github.com/acl-language/acl/releases/tag/v0.3.0
 [0.2.0]: https://github.com/acl-language/acl/releases/tag/v0.2.0

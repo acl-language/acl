@@ -1,6 +1,6 @@
 # ACL — Agent Communication Language
 
-**Version:** 0.5.0-draft
+**Version:** 0.6.0-draft
 **Status:** Draft specification
 **License:** Apache-2.0 (spec + reference implementation)
 
@@ -703,6 +703,81 @@ CL facts export as JSON-LD claims for the Linked-Data ecosystem
 
 This gives ACL facts W3C-graph semantics: any JSON-LD processor (and any
 agent consuming schema.org-style data) can consume ACL claims.
+
+## 27. Typed content values (normative)
+
+CL argument values are TYPED: `ClValue = Str | Int | Float | Bool | Var |
+List | Map | Bytes`. Wire-compatible with plain msgpack/JSON (Str→string,
+Int→integer, …) so v0.1-v0.5 encoders keep working — but the type is now
+carried at the language level:
+
+- `Int` rejects floats: `5` is Int, `5.5` is Float (strict at decode);
+- `null` is NOT a CL value (typed languages have no untyped bottom);
+- `Var(name)` serializes as the single-key map `{"$var": name}` — an
+  unambiguous encoding that cannot collide with `Map` (receivers check
+  `$var` before treating a map as data);
+- Rust-level consumers get the type for free (`value.type_name()`,
+  `value.as_str()`), without re-parsing.
+
+## 28. Bindings, partial application and quantification
+
+**Bindings** — `bind(name, expr, body)`: `expr` must be a fact/action
+leaf; `body` may reference it via `ref("$bind:<name>")`. The grammar
+validator tracks the lexical scope: a `$bind:` reference to an unbound
+name is ill-formed. Nesting is arbitrary (inner binds shadow outer).
+
+**Partial application** — `Action` MAY declare `partial: [param...]`:
+parameters deliberately left unfilled; the action is a template awaiting
+completion. Schema validation (§19) skips params listed as partial —
+every other declared param must still be present and typed.
+
+**Quantification** — `for_all(var, over, such_that)` and
+`exists(var, over, such_that)`: `over` MUST be a query (its result is the
+collection); `such_that` follows the enclosing performative's grammar
+with `var` bound (references via `{"$var": name}` in args). Quantifiers
+are legal under `inform` and `query`.
+
+**Metanível** — `believes(agent, fact)`: the sender asserts what ANOTHER
+agent holds. Legal only under `inform`; the inner `fact` follows the fact
+grammar. This is what lets agents reason about other agents' knowledge
+(FIPA-SL tradition) without collapsing beliefs into facts.
+
+## 29. Semantic time
+
+- `Query.valid_until_ms` — the asker states the deadline after which the
+  answer is worthless; receivers SHOULD discard late answers.
+- `Renew(target_msg_id, new_deadline_ms)` — extends an ACTIVE
+  commitment's deadline; legal only under `request`. Renewal is explicit
+  (never implicit by re-creation).
+- `Fact.derived_from(msg_id)` — the fact was computed from another
+  message; its validity is bounded by the source's validity. Receivers
+  SHOULD drop derived facts whose source has expired (§6.4).
+
+## 30. Explicit intent and feasibility
+
+The envelope gains two OPTIONAL semantic fields:
+
+```text
+rational_effect           # what the sender expects to happen (RE)
+feasibility_precondition  # what must have been true of the sender (FP)
+```
+
+These mirror §17's formal semantics as first-class message data: a
+sender that declares RE/FP makes its intent machine-checkable, and a
+receiver can verify the message's declared effect against its own
+capabilities BEFORE acting. Absent fields mean "§17 defaults apply".
+
+## 31. Vocabulary evolution and deprecation
+
+- `.acl` vocabularies MAY annotate declarations:
+  `@deprecated("use file_v2 instead")` — parsed into `Deprecation
+  {reason, since}` (since = vocabulary version).
+- `aclc gen schema` emits a `deprecated` map (term → reason+version).
+- `RuntimeSchema.validate_with_warnings` returns validation result PLUS
+  deprecation warnings — deprecated terms still validate (no breakage)
+  but clients are told.
+- Rules: within a major version, deprecation is the ONLY allowed
+  removal mechanism; major bumps (§14) MAY remove deprecated terms.
 
 ## 16. Dialogue rules (normative)
 

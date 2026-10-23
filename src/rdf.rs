@@ -2,7 +2,7 @@
 //! so ACL vocabularies interoperate with the RDF/Linked-Data ecosystem
 //! (schema.org, W3C ontologies). Scope: mapping layer, not a full RDF lib.
 
-use crate::cl::{ClAction, ClExpr, CommitmentStatus};
+use crate::cl::{ClAction, ClExpr, ClValue, CommitmentStatus};
 use serde_json::{json, Value};
 
 /// Base IRI for ACL-mapped vocabularies: `https://acl-language.dev/ns/<ns>/`.
@@ -29,7 +29,7 @@ pub fn fact_to_jsonld(
     assertor: &str,
 ) -> Result<Value, String> {
     let (predicate, args, truth, modality, provenance, confidence, valid_until_ms) = match expr {
-        ClExpr::Fact { predicate, args, truth, modality, provenance, confidence, valid_until_ms } => {
+        ClExpr::Fact { predicate, args, truth, derived_from: _, modality, provenance, confidence, valid_until_ms } => {
             (predicate, args, truth, modality, provenance, confidence, valid_until_ms)
         }
         other => return Err(format!("fact_to_jsonld expects a Fact, got {other:?}")),
@@ -46,7 +46,7 @@ pub fn fact_to_jsonld(
     // args become typed properties: acl:arg_<name>
     if let Some(obj) = node.as_object_mut() {
         for (k, v) in args {
-            obj.insert(format!("acl:arg_{}", k), v.clone());
+            obj.insert(format!("acl:arg_{}", k), serde_json::to_value(v).unwrap_or(serde_json::Value::Null));
         }
         if let Some(m) = modality {
             obj.insert("acl:modality".into(), json!(format!("{m:?}").to_lowercase()));
@@ -117,8 +117,9 @@ mod tests {
     fn fact() -> ClExpr {
         ClExpr::Fact {
             predicate: "acl.std.fs.file_exists".into(),
-            args: BTreeMap::from([("path".into(), json!("/tmp/x"))]),
+            args: BTreeMap::from([("path".into(), ClValue::Str("/tmp/x".into()))]),
             truth: true,
+            derived_from: None,
             modality: None,
             provenance: None,
             confidence: None,
@@ -147,7 +148,7 @@ mod tests {
         let c = ClExpr::commitment(
             "did:key:z1",
             "did:key:z2",
-            ClAction { name: "acl.std.fs.file_read".into(), params: json!({}), result_schema: None },
+            ClAction { name: "acl.std.fs.file_read".into(), params: json!({}), result_schema: None, partial: None },
             Some(1700000000000),
             CommitmentStatus::Active,
         );

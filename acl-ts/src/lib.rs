@@ -86,6 +86,8 @@ impl AclEnvelope {
                 performative: perf_from_str(&performative)?,
                 body,
                 sig: None,
+                rational_effect: None,
+                feasibility_precondition: None,
             },
         })
     }

@@ -43,6 +43,13 @@ impl std::fmt::Display for IdlError {
     }
 }
 
+/// §31: deprecation metadata for a declaration.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Deprecation {
+    pub reason: String,
+    pub since: String, // vocab version, e.g. "v1"
+}
+
 /// Parse a `.acl` source file.
 pub fn parse(src: &str) -> Result<IdlFile, Vec<IdlError>> {
     struct WfWip {
@@ -62,11 +69,25 @@ pub fn parse(src: &str) -> Result<IdlFile, Vec<IdlError>> {
     let mut namespace: Option<(String, u32)> = None;
     let mut decls = Vec::new();
     let mut doc: Option<String> = None;
+    let mut deprecation: Option<Deprecation> = None;
+    let namespace_version = namespace
+        .as_ref()
+        .map(|(_, v)| format!("v{}", v))
+        .unwrap_or_else(|| "v1".to_string());
 
     for (idx, raw) in src.lines().enumerate() {
         let line_no = idx + 1;
         // doc comments MUST be detected before the plain-comment strip
         // (a "///" line starts with "//" and would otherwise be eaten)
+        // §31: @deprecated("reason") annotation line before a decl
+        if raw.trim_start().starts_with("@deprecated(") {
+            let inner = raw.trim_start().trim_start_matches("@deprecated(").trim_end_matches(")");
+            deprecation = Some(Deprecation {
+                reason: inner.to_string(),
+                since: format!("v{}", 1), // refined below from namespace version
+            });
+            continue;
+        }
         if raw.trim_start().starts_with("///") {
             let text = raw.trim_start()[3..].trim().to_string();
             doc = Some(match doc {
@@ -237,10 +258,11 @@ pub fn parse(src: &str) -> Result<IdlFile, Vec<IdlError>> {
         if let Some((kind_name, prefix)) = kind {
             match parse_signature(&line[prefix.len()..], line_no) {
                 Ok((local, params, ret)) => {
+                    let dep = deprecation.take().map(|mut d| { d.since = namespace_version.clone(); d });
                     let d = if kind_name == "predicate" {
-                        Decl::Predicate { local, params, ret, doc: doc.take() }
+                        Decl::Predicate { local, params, ret, doc: doc.take(), deprecation: dep }
                     } else {
-                        Decl::Action { local, params, ret, doc: doc.take() }
+                        Decl::Action { local, params, ret, doc: doc.take(), deprecation: dep }
                     };
                     decls.push(d);
                     continue;
@@ -270,8 +292,8 @@ pub fn parse(src: &str) -> Result<IdlFile, Vec<IdlError>> {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Decl {
-    Predicate { local: String, params: Vec<Param>, ret: String, doc: Option<String> },
-    Action { local: String, params: Vec<Param>, ret: String, doc: Option<String> },
+    Predicate { local: String, params: Vec<Param>, ret: String, doc: Option<String>, deprecation: Option<Deprecation> },
+    Action { local: String, params: Vec<Param>, ret: String, doc: Option<String>, deprecation: Option<Deprecation> },
     Alias { local: String, target: String },
     /// §20: ordered plan of action groups; groups run in sequence,
     /// actions inside a group run in parallel.
@@ -419,9 +441,9 @@ pub fn pretty(file: &IdlFile) -> String {
     let mut out = format!("namespace {} v{};\n", file.namespace, file.version);
     let mut current_doc: Option<String> = None;
     for d in &file.decls {
-        let (kind, local, params, ret, doc) = match d {
-            Decl::Predicate { local, params, ret, doc } => ("predicate", local, params, ret, doc),
-            Decl::Action { local, params, ret, doc } => ("action", local, params, ret, doc),
+        let (kind, local, params, ret, doc, _dep) = match d {
+            Decl::Predicate { local, params, ret, doc, deprecation } => ("predicate", local, params, ret, doc, deprecation),
+            Decl::Action { local, params, ret, doc, deprecation } => ("action", local, params, ret, doc, deprecation),
             Decl::Alias { local, target } => {
                 out.push_str(&format!("\ntype {local} = {target};\n"));
                 continue;
@@ -594,7 +616,7 @@ pub fn gen_schema(file: &IdlFile) -> String {
             Decl::Alias { local, target } => {
                 aliases.insert(local.clone(), target.clone());
             }
-            Decl::Predicate { local, params, ret, doc } => {
+            Decl::Predicate { local, params, ret, doc, .. } => {
                 predicates.insert(
                     local.clone(),
                     SchemaOpView {
@@ -604,7 +626,7 @@ pub fn gen_schema(file: &IdlFile) -> String {
                     },
                 );
             }
-            Decl::Action { local, params, ret, doc } => {
+            Decl::Action { local, params, ret, doc, .. } => {
                 actions.insert(
                     local.clone(),
                     SchemaOpView {
@@ -617,12 +639,27 @@ pub fn gen_schema(file: &IdlFile) -> String {
             Decl::Workflow { .. } => {}
         }
     }
+    // §31: deprecated terms map (term -> reason)
+    let mut deprecated = serde_json::Map::new();
+    for d in &file.decls {
+        let (full, dep) = match d {
+            Decl::Predicate { local, deprecation: Some(dp), .. }
+            | Decl::Action { local, deprecation: Some(dp), .. } => {
+                (format!("{}.{}", file.namespace, local), Some(dp))
+            }
+            _ => (String::new(), None),
+        };
+        if let Some(dp) = dep {
+            deprecated.insert(full, serde_json::Value::String(format!("{} (since {})", dp.reason, dp.since)));
+        }
+    }
     let view = serde_json::json!({
         "namespace": file.namespace,
         "version": file.version,
         "aliases": aliases,
         "predicates": predicates,
         "actions": actions,
+        "deprecated": deprecated,
     });
     String::from_utf8(serde_json::to_vec_pretty(&view).unwrap_or_default()).unwrap_or_default()
 }
@@ -786,6 +823,25 @@ workflow pipeline(text: string) -> bool {
         assert!(rust.contains("pub fn plan_pipeline() -> Vec<Vec<&'static str>>"));
         let py = gen_py(&f);
         assert!(py.contains("def plan_pipeline():"));
+    }
+
+    #[test]
+    fn deprecation_parsed() {
+        let src = "namespace a.b v1;\n@deprecated(\"use file_v2 instead\")\npredicate old_thing() -> bool;\n";
+        let f = parse(src).expect("parse");
+        match &f.decls[0] {
+            Decl::Predicate { local, deprecation, .. } => {
+                assert_eq!(local, "old_thing");
+                let dp = deprecation.as_ref().expect("deprecation expected");
+                assert!(dp.reason.contains("file_v2"));
+            }
+            other => panic!("expected predicate, got {other:?}"),
+        }
+        // non-deprecated decl has none
+        match &f.decls[0] {
+            Decl::Predicate { deprecation, .. } => assert!(deprecation.is_some()),
+            _ => {}
+        }
     }
 
     #[test]

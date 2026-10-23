@@ -183,6 +183,15 @@ pub struct Envelope {
     /// Ed25519 signature over the encoded envelope with `sig` absent.
     #[serde(default, skip_serializing_if = "Option::is_none", with = "opt_serde_bytes")]
     pub sig: Option<Vec<u8>>,
+    /// §30: what the sender EXPECTS to happen in the world if the message
+    /// is honoured (rational effect). Machine-checkable against the
+    /// sender's declared semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rational_effect: Option<String>,
+    /// §30: what must have been true of the sender for this message to be
+    /// sincere (feasibility precondition).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feasibility_precondition: Option<String>,
 }
 
 fn default_ttl() -> u32 {
@@ -235,7 +244,16 @@ impl Envelope {
             performative,
             body,
             sig: None,
+            rational_effect: None,
+            feasibility_precondition: None,
         }
+    }
+
+    /// §30: declare the intent pair (FP/RE) on this envelope.
+    pub fn with_intent(mut self, fp: &str, re: &str) -> Self {
+        self.feasibility_precondition = Some(fp.into());
+        self.rational_effect = Some(re.into());
+        self
     }
 
     /// Serialize the unsigned envelope (what the signature covers).

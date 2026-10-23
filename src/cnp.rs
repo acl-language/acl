@@ -179,6 +179,7 @@ mod tests {
             name: "acl.std.fs.file_read".into(),
             params: json!({"path": "/tmp/x"}),
             result_schema: None,
+            partial: None,
         }
     }
 

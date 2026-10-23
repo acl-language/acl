@@ -29,6 +29,9 @@ pub struct RuntimeSchema {
     /// local name -> op (full name = namespace.local)
     pub predicates: BTreeMap<String, SchemaOp>,
     pub actions: BTreeMap<String, SchemaOp>,
+    /// §31: deprecated terms (full name -> reason)
+    #[serde(default)]
+    pub deprecated: BTreeMap<String, String>,
 }
 
 impl RuntimeSchema {
@@ -116,7 +119,7 @@ impl RuntimeSchema {
             ClExpr::Action { name, params, .. } => {
                 self.check_op("action", &self.actions, name, params)
             }
-            ClExpr::Query { predicate, args } => {
+            ClExpr::Query { predicate, args, .. } => {
                 self.check_op("predicate", &self.predicates, predicate, args)
             }
             ClExpr::Commitment { act, .. } => self.validate(&ClExpr::Action {
@@ -132,7 +135,34 @@ impl RuntimeSchema {
             }
             ClExpr::Not { expr } => self.validate(expr),
             ClExpr::RefExpr { .. } => Ok(()), // validated where it was produced
+            ClExpr::Bind { expr, body, .. } => {
+                self.validate(expr)?;
+                self.validate(body)
+            }
+            ClExpr::ForAll { over, such_that, .. }
+            | ClExpr::Exists { over, such_that, .. } => {
+                self.validate(over)?;
+                self.validate(such_that)
+            }
+            ClExpr::Believes { fact, .. } => self.validate(fact),
+            // §29: renew targets a prior message — nothing to validate here
+            ClExpr::Renew { .. } => Ok(()),
         }
+    }
+
+    /// §31: validate and COLLECT deprecation warnings. Returns
+    /// (validation_result, warnings). Warnings don't fail validation —
+    /// deprecated terms still work until the vocabulary's major bump.
+    pub fn validate_with_warnings(
+        &self,
+        exprs: &[ClExpr],
+    ) -> (Result<(), Vec<String>>, Vec<String>) {
+        let result = self.validate_all(exprs);
+        let mut warnings = Vec::new();
+        for e in exprs {
+            collect_dep_warnings(e, &self.deprecated, &self.namespace, &mut warnings);
+        }
+        (result, warnings)
     }
 
     /// Validate every expression of a Cl body.
@@ -148,6 +178,43 @@ impl RuntimeSchema {
         } else {
             Err(errors)
         }
+    }
+}
+
+/// Walk expressions collecting deprecation warnings for used terms.
+fn collect_dep_warnings(
+    e: &ClExpr,
+    deprecated: &BTreeMap<String, String>,
+    namespace: &str,
+    out: &mut Vec<String>,
+) {
+    let mut check_term = |term: &str| {
+        if let Some(reason) = deprecated.get(term) {
+            out.push(format!("{term} is deprecated: {reason}"));
+        }
+    };
+    match e {
+        ClExpr::Fact { predicate, .. } => check_term(predicate),
+        ClExpr::Action { name, .. } => check_term(name),
+        ClExpr::Query { predicate, .. } => check_term(predicate),
+        ClExpr::Commitment { act, .. } => check_term(&act.name),
+        ClExpr::And { exprs } | ClExpr::Or { exprs } => {
+            for sub in exprs {
+                collect_dep_warnings(sub, deprecated, namespace, out);
+            }
+        }
+        ClExpr::Not { expr } | ClExpr::Bind { body: expr, .. } => {
+            collect_dep_warnings(expr, deprecated, namespace, out)
+        }
+        ClExpr::ForAll { over, such_that, .. }
+        | ClExpr::Exists { over, such_that, .. } => {
+            collect_dep_warnings(over, deprecated, namespace, out);
+            collect_dep_warnings(such_that, deprecated, namespace, out);
+        }
+        ClExpr::Believes { fact, .. } => {
+            collect_dep_warnings(fact, deprecated, namespace, out)
+        }
+        ClExpr::Renew { .. } | ClExpr::RefExpr { .. } => {}
     }
 }
 
@@ -195,6 +262,7 @@ mod tests {
                     doc: None,
                 },
             )]),
+            deprecated: BTreeMap::new(),
         }
     }
 
@@ -270,6 +338,7 @@ mod tests {
                 name: "acl.std.fs.file_read".into(),
                 params: serde_json::json!({"path": "/x"}),
                 result_schema: None,
+                partial: None,
             },
             deadline_ms: None,
             status: crate::cl::CommitmentStatus::Proposed,
@@ -282,6 +351,7 @@ mod tests {
                 name: "acl.std.fs.file_read".into(),
                 params: serde_json::json!({"path": 7}),
                 result_schema: None,
+                partial: None,
             },
             deadline_ms: None,
             status: crate::cl::CommitmentStatus::Proposed,

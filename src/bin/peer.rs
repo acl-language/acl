@@ -224,7 +224,7 @@ fn main() {
                 } else {
                     let mut facts: Vec<ClExpr> = Vec::new();
                     for e in expressions {
-                        if let ClExpr::Query { predicate, args } = e {
+                        if let ClExpr::Query { predicate, args, .. } = e {
                             // accept both bare and namespace-qualified names:
                             // match the local segment (schema vocabularies use
                             // full names; the peer's own vocabulary is local)

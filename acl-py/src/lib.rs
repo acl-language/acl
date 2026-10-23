@@ -334,6 +334,8 @@ impl AclEnvelope {
                 performative: perf_from_str(&performative)?,
                 body: body_from_py(body)?,
                 sig: None,
+                rational_effect: None,
+                feasibility_precondition: None,
             },
         })
     }
