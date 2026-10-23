@@ -107,6 +107,11 @@ fn body_from_py(body: &Bound<'_, PyAny>) -> PyResult<Body> {
             card_hash: None,
             nonce: vec![],
         }),
+        "Sealed" => Ok(Body::Sealed {
+            sender_pub: vec![],
+            salt: vec![],
+            ciphertext: vec![],
+        }),
         other => Err(PyValueError::new_err(format!("unknown body kind {other}"))),
     }
 }
@@ -189,6 +194,14 @@ fn body_to_py(py: Python<'_>, b: &Body) -> PyObject {
         Body::Delegate { chain, .. } => (
             "Delegate",
             vec![("chain", chain.clone().into_pyobject(py).unwrap().unbind().into())],
+        ),
+        Body::Sealed { sender_pub, salt, ciphertext } => (
+            "Sealed",
+            vec![
+                ("sender_pub", sender_pub.clone().into_pyobject(py).unwrap().unbind().into()),
+                ("salt", salt.clone().into_pyobject(py).unwrap().unbind().into()),
+                ("ciphertext", ciphertext.clone().into_pyobject(py).unwrap().unbind().into()),
+            ],
         ),
     };
     d.set_item("t", t).unwrap();
