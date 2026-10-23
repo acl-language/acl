@@ -49,6 +49,12 @@ fn py_action(a: &ProtocolAction) -> String {
         ProtocolAction::Enter { phase } => format!(
             "{{\"kind\": \"enter\", \"phase\": \"{phase}\"}}",
         ),
+        ProtocolAction::BeginId { id } => format!(
+            "{{\"kind\": \"begin_id\", \"id\": \"{id}\"}}",
+        ),
+        ProtocolAction::FulfilId { id } => format!(
+            "{{\"kind\": \"fulfil_id\", \"id\": \"{id}\"}}",
+        ),
         ProtocolAction::Try { body, catch } => format!(
             "{{\"kind\": \"try\", \"body\": [{}], \"catch\": [{}]}}",
             body.iter().map(py_action).collect::<Vec<_>>().join(", "),
@@ -332,6 +338,7 @@ pub fn gen_agent_py(prog: &ProtocolProgram, role: &str) -> Result<String, Vec<cr
         self._catch = None
         self._jump = False
         self._phase = self.PHASES[0] if self.PHASES else ""
+        self.commitments = {}
         self.states = {k: None for k in self.STATES}
         self.commitment = "proposed"   # proposed -> active -> fulfilled/breached
         self.timer_due = [0] * len([h for h in self.HANDLERS if h["kind"] == "timer"])
@@ -542,6 +549,20 @@ pub fn gen_agent_py(prog: &ProtocolProgram, role: &str) -> Result<String, Vec<cr
                         break
                 self._catch = None
                 self._jump = False
+            elif a["kind"] == "begin_id":
+                # §51: named commitment lifecycle
+                cur = self.commitments.get(a["id"])
+                if cur in ("proposed", "active"):
+                    self.transcript.append(("state", "begin " + a["id"] + " ignored"))
+                else:
+                    self.commitments[a["id"]] = "active"
+                    self.transcript.append(("state", "commitment " + a["id"] + " -> active"))
+            elif a["kind"] == "fulfil_id":
+                if self.commitments.get(a["id"]) == "active":
+                    self.commitments[a["id"]] = "fulfilled"
+                    self.transcript.append(("state", "commitment " + a["id"] + " -> fulfilled"))
+                else:
+                    self.transcript.append(("state", "fulfil " + a["id"] + " ignored"))
             elif a["kind"] == "enter":
                 # §50: conversation phase transition
                 self._phase = a["phase"]

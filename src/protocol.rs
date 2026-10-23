@@ -83,6 +83,10 @@ pub enum ProtocolAction {
     Broadcast { performative: Performative, fields: Option<BTreeMap<String, String>>, to: String },
     /// §50: `enter <phase>;` — transition the session's conversation phase
     Enter { phase: String },
+    /// §51: `begin <id>;` / `fulfil <id>;` — NAMED commitments (several
+    /// obligations per session, each with its own lifecycle)
+    BeginId { id: String },
+    FulfilId { id: String },
     /// §45: `try { ... } catch { ... };` — a failing action inside the
     /// body (set/push/put eval error, container violation, fmt failure)
     /// cuts the body short and runs the catch actions instead of routing
@@ -1764,8 +1768,15 @@ fn parse_action(stmt: &str) -> Result<ProtocolAction, String> {
     if s == "begin" {
         return Ok(ProtocolAction::Begin);
     }
+    if let Some(id) = s.strip_prefix("begin ") {
+        // §51: named commitment begin
+        return Ok(ProtocolAction::BeginId { id: id.trim().to_string() });
+    }
     if s == "fulfil" {
         return Ok(ProtocolAction::Fulfil);
+    }
+    if let Some(id) = s.strip_prefix("fulfil ") {
+        return Ok(ProtocolAction::FulfilId { id: id.trim().to_string() });
     }
     if let Some(rest) = s.strip_prefix("retract(") {
         let target = rest.trim_end_matches(')').trim();
@@ -2919,6 +2930,8 @@ fn action_word(a: &ProtocolAction) -> String {
         }
         ProtocolAction::Begin => "begin".into(),
         ProtocolAction::Fulfil => "fulfil".into(),
+        ProtocolAction::BeginId { id } => format!("begin {id}"),
+        ProtocolAction::FulfilId { id } => format!("fulfil {id}"),
         ProtocolAction::Retract { target } => format!("retract({target})"),
         ProtocolAction::Set { name, field, expr } => format!(
             "set {}{} = {}",

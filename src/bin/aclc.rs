@@ -83,6 +83,8 @@ fn main() {
                                             acl_core::protocol::ProtocolAction::Try { .. } => "try/catch".into(),
                                             acl_core::protocol::ProtocolAction::Enter { phase } =>
                                                 format!("enter {phase}"),
+                                            acl_core::protocol::ProtocolAction::BeginId { id } => format!("begin {id}"),
+                                            acl_core::protocol::ProtocolAction::FulfilId { id } => format!("fulfil {id}"),
                                         }).collect();
                                         println!("    on {} -> {}", t, a.join("; "));
                                     }

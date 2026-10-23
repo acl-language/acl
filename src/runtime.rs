@@ -385,6 +385,8 @@ pub struct Runtime {
     awaits: Vec<AwaitSpec>,
     /// §50: current conversation phase (first declared phase, or "")
     phase: String,
+    /// §51: named commitments — id -> lifecycle status
+    commitments: BTreeMap<String, CommitmentStatus>,
     /// §50: declared phases (for enter validation)
     phases: Vec<String>,
     /// §45: active try/catch — the catch actions of the innermost `try`
@@ -459,6 +461,7 @@ impl Runtime {
             handling_error: false,
             awaits: Vec::new(),
             phase: prog.phases.first().cloned().unwrap_or_default(),
+            commitments: BTreeMap::new(),
             phases: prog.phases.clone(),
             catch_stack: Vec::new(),
             catch_jump: false,
@@ -744,6 +747,11 @@ impl Runtime {
         self.commitment
     }
 
+    /// §51: lifecycle status of a NAMED commitment (Unset = unknown id)
+    pub fn commitment_status(&self, id: &str) -> Option<CommitmentStatus> {
+        self.commitments.get(id).copied()
+    }
+
     pub fn transcript(&self) -> &[LogEntry] {
         &self.log
     }
@@ -1010,6 +1018,30 @@ impl Runtime {
                             let reason = format!("broadcast to '{to}': not a list ({:?})", other.map(value_text).unwrap_or_default());
                             self.action_failed(reason, &mut out);
                         }
+                    }
+                }
+                ProtocolAction::BeginId { id } => {
+                    // §51: activate a NAMED commitment
+                    match self.commitments.get(id) {
+                        Some(CommitmentStatus::Proposed) | Some(CommitmentStatus::Active) => {
+                            self.log(Dir::State, format!("begin {id} ignored: is {:?}", self.commitments.get(id).unwrap()));
+                        }
+                        _ => {
+                            self.commitments.insert(id.clone(), CommitmentStatus::Active);
+                            self.log(Dir::State, format!("commitment {id} -> active"));
+                        }
+                    }
+                }
+                ProtocolAction::FulfilId { id } => {
+                    match self.commitments.get(id) {
+                        Some(CommitmentStatus::Active) => {
+                            self.commitments.insert(id.clone(), CommitmentStatus::Fulfilled);
+                            self.log(Dir::State, format!("commitment {id} -> fulfilled"));
+                        }
+                        other => self.log(
+                            Dir::State,
+                            format!("fulfil {id} ignored: is {other:?}, not Active"),
+                        ),
                     }
                 }
                 ProtocolAction::Enter { phase } => {
@@ -2765,5 +2797,43 @@ mod phase_tests {
         let out = r.deliver(Event::In { from: "a".into(), performative: Performative::Inform, pattern: None, fields: None });
         assert!(out.is_empty());
         assert!(r.transcript().iter().any(|e| e.text.contains("not a declared phase")));
+    }
+}
+
+#[cfg(test)]
+mod named_commitment_tests {
+    use super::*;
+    use crate::protocol::parse;
+
+    // §51: named commitments have independent lifecycles
+    #[test]
+    fn named_commitments_track_independently() {
+        let prog = parse(
+            "protocol p v1;\nroles a, b;\non request from a { begin delivery; begin payment; }\non inform {\"what\": \"delivery\"} from a -> fulfil delivery;\non inform from b -> send bye;\non bye from b -> send inform to b;\non bye from a -> send inform to a;\n",
+        )
+        .unwrap();
+        let mut r = Runtime::new(&prog, "b").unwrap();
+        r.deliver(Event::In { from: "a".into(), performative: Performative::Request, pattern: None, fields: None });
+        assert_eq!(r.commitment_status("delivery"), Some(CommitmentStatus::Active));
+        assert_eq!(r.commitment_status("payment"), Some(CommitmentStatus::Active));
+        // fulfil ONLY delivery
+        r.deliver(Event::In {
+            from: "a".into(),
+            performative: Performative::Inform,
+            pattern: None,
+            fields: Some(BTreeMap::from([("what".into(), FieldValue::Str("delivery".into()))])),
+        });
+        assert_eq!(r.commitment_status("delivery"), Some(CommitmentStatus::Fulfilled));
+        assert_eq!(r.commitment_status("payment"), Some(CommitmentStatus::Active));
+        // the DEFAULT commitment is untouched
+        assert_eq!(r.commitment(), CommitmentStatus::Proposed);
+        // fulfil again on delivery is ignored
+        r.deliver(Event::In {
+            from: "a".into(),
+            performative: Performative::Inform,
+            pattern: None,
+            fields: Some(BTreeMap::from([("what".into(), FieldValue::Str("delivery".into()))])),
+        });
+        assert_eq!(r.commitment_status("delivery"), Some(CommitmentStatus::Fulfilled));
     }
 }
