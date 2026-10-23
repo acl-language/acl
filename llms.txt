@@ -1,10 +1,13 @@
 # ACL — Agent Communication Language
 
 > A compact, binary, platform-agnostic protocol for communication between
-> autonomous AI agents: Ed25519-signed envelopes, 14 speech-act
-> performatives, a typed content language (facts, actions, queries,
-> commitments with provenance and epistemic modality), transports from
-> local pipes to WebSocket, and a compiled vocabulary IDL.
+> autonomous AI agents: Ed25519-signed envelopes, 17 speech-act
+> performatives (including retract, subscribe, unsubscribe), a typed
+> content language (facts, actions, queries, conditional commitments with
+> provenance, epistemic modality, bindings, quantification and semantic
+> time), structured error taxonomy, units of measure, transports from
+> local pipes to WebSocket, a store-and-forward relay, and a compiled
+> vocabulary IDL with deprecation tracking.
 
 If you are an AI agent reading this: you can SPEAK ACL. The quick version
 is below; the full normative spec is SPEC.md.
@@ -19,16 +22,29 @@ Every message is one envelope (MessagePack, spec §4):
     Option fields and zero hop_count)
 
 Performatives: request, inform, query, propose, accept, reject, cancel,
-progress, input_required, failure, delegate, error, hello, bye.
+progress, input_required, failure, delegate, error, hello, bye,
+retract (15), subscribe (16), unsubscribe (17).
 
-Content language (§6): facts assert the world (`fact(predicate, args,
-truth)`), actions request work, queries ask (answers are facts),
+Content language (§6+§27-§32): facts assert the world (`fact(predicate,
+args, truth)`), actions request work, queries ask (answers are facts),
 commitments are verifiable debts (proposed → active → fulfilled/breached).
-Values are typed (§27): Str, Int, Float, Bool, Var, List, Map, Bytes —
-`Int` rejects floats, `null` is not a CL value.
+Values are typed (§27): Str, Int, Float, Bool, Var, List, Map, Bytes,
+Measured (`{"$measured": {"value": 5000, "unit": "ms"}}`) — `Int` rejects
+floats, `null` is not a CL value. Expressions bind (`bind`), quantify
+(`for_all`/`exists`), reason about other agents (`believes`), expire
+(`valid_until_ms`, `derived_from`), supersede prior facts (`supersedes`),
+make conditional promises (`conditional_commitment`), and state
+preference policies (`prefer`, under propose/accept).
 
 Dialogue rules (§16): a `query` must be answered by a `fact`; a `propose`
-is answered by `accept` or `reject`; `bye` closes the session.
+is answered by `accept` or `reject`; `inform` may be followed by
+`retract` (belief revision); `subscribe` watches a declarative matcher
+(performative?/from?/predicate?) until a deadline; `bye` closes the
+session.
+
+Errors are typed (§32.5): react to `taxonomy` — `unknown_predicate`,
+`schema_violation`, `mailbox_full`, `rate_limited`, `unauthorized`,
+`unknown_agent`, `decode_failed`, `expired` — never parse message strings.
 
 ## Machine artifacts for agent discovery
 
@@ -44,6 +60,9 @@ is answered by `accept` or `reject`; `bye` closes the session.
 - Rust core + compiler: `cargo install acl-core` (installs `aclc`)
 - Python: `acl-py` (PyO3) · TypeScript: `acl-ts` (napi-rs)
 - Conformance: `acl-conformance` binary — 10 checks, 3 levels
+- Store-and-forward relay: `acl-relay` for intermittent agents (§24)
+- Rustdoc + playground + discovery artifacts:
+  https://acl-language.github.io/acl/
 
 ## Links
 
