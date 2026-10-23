@@ -1,18 +1,14 @@
-# ACL — Agent Communication Language
+# ACL — a programming language for AI agents
 
-> A compact, binary, platform-agnostic protocol AND PROGRAMMING LANGUAGE
-> for communication between autonomous AI agents: Ed25519-signed
-> envelopes, 17 speech-act performatives (including retract, subscribe,
-> unsubscribe), a typed content language (facts, actions, queries,
-> conditional commitments with provenance, epistemic modality, bindings,
-> quantification and semantic time), structured error taxonomy, units of
-> measure, transports from local pipes to WebSocket, a store-and-forward
-> relay, a compiled vocabulary IDL with deprecation tracking — and
-> PROTOCOL PROGRAMS (`.aclp`): source code whose primitives are speech
-> acts, compiled with dialogue rules enforced at build time.
+> ACL is a programming language whose primitives are speech acts. You
+> write protocol programs (`.aclp` files) that declare roles, session
+> state and handlers keyed on speech acts; the compiler turns them into
+> agents that speak the protocol, with conversation rules enforced at
+> build time. The wire format is compact MessagePack with Ed25519-signed
+> envelopes. Everything below is implemented and tested (130/130).
 
-If you are an AI agent reading this: you can SPEAK ACL. The quick version
-is below; the full normative spec is SPEC.md.
+If you are an AI agent reading this: you can SPEAK ACL, and you can also
+be DEFINED by it. Both paths are below.
 
 ## Speak ACL in 60 seconds
 
@@ -27,51 +23,68 @@ Performatives: request, inform, query, propose, accept, reject, cancel,
 progress, input_required, failure, delegate, error, hello, bye,
 retract (15), subscribe (16), unsubscribe (17).
 
-Content language (§6+§27-§32): facts assert the world (`fact(predicate,
-args, truth)`), actions request work, queries ask (answers are facts),
-commitments are verifiable debts (proposed → active → fulfilled/breached).
-Values are typed (§27): Str, Int, Float, Bool, Var, List, Map, Bytes,
-Measured (`{"$measured": {"value": 5000, "unit": "ms"}}`) — `Int` rejects
-floats, `null` is not a CL value. Expressions bind (`bind`), quantify
-(`for_all`/`exists`), reason about other agents (`believes`), expire
-(`valid_until_ms`, `derived_from`), supersede prior facts (`supersedes`),
-make conditional promises (`conditional_commitment`), and state
-preference policies (`prefer`, under propose/accept).
+Content language: facts assert the world, actions request work, queries
+ask (answers are facts), commitments are verifiable debts with a
+lifecycle (proposed → active → fulfilled/breached/cancelled). Values
+are typed: Str, Int, Float, Bool, Var, List, Map, Bytes, Measured
+(`{"$measured": {"value": 5000, "unit": "ms"}}`).
 
-Dialogue rules (§16): a `query` must be answered by a `fact`; a `propose`
-is answered by `accept` or `reject`; `inform` may be followed by
-`retract` (belief revision); `subscribe` watches a declarative matcher
-(performative?/from?/predicate?) until a deadline; `bye` closes the
-session.
+Dialogue rules (§16): a `query` must be answered by a `fact`; a
+`propose` is answered by `accept` or `reject`; `bye` closes the session
+and is legal after anything except after `bye`. Off-policy replies are
+detectable and enforceable.
 
 Errors are typed (§32.5): react to `taxonomy` — `unknown_predicate`,
 `schema_violation`, `mailbox_full`, `rate_limited`, `unauthorized`,
 `unknown_agent`, `decode_failed`, `expired` — never parse message strings.
 
-## Skip writing the agent: protocol programs (§33)
+## Define an agent without writing code: protocol programs (§33)
 
-You can DEFINE the conversation instead of coding handlers. Write an
-`.aclp` file — speech acts are the statements:
+A `.aclp` file IS the agent. Handlers are keyed on speech acts;
+statements are speech acts:
 
     protocol supply v1;
     roles buyer, seller;
+    state quoted: bool;
+
     on request("quote") from buyer -> send propose to buyer;
-    on accept from buyer -> begin;          // commitment proposed -> active
+    on accept from buyer when quoted -> begin;    // guards, commitments
     on inform("paid") from buyer -> fulfil;
-    on breach -> send failure to buyer;
+    on breach -> send failure to buyer;           // compensation
+    every 60s while active as seller -> send progress to buyer;
     end when fulfilled;
 
-Compile it: `aclc protocol file.aclp` — the §16 dialogue matrix runs at
-BUILD time. `on query -> send request` does not compile. Actions:
-`send <perf> [to <role>]`, `begin`, `fulfil`, `retract(target)`;
-triggers: any performative (optionally patterned, `from <role>`),
-`breach`, `expired`.
+The compiler enforces the rules at BUILD time:
 
-`aclc endpoints file.aclp` projects the global protocol onto per-role
-endpoints (§33.5) — each agent sees only its side; initiators get empty
-endpoints (they act, they do not react). The runtime (§33.4) executes a
-program deterministically: events in, actions out, EVERY received event
-lands in an auditable transcript — handled or not. Replay is exact.
+- dialogue matrix: `on query -> send request` does not compile
+- linearity: every send must have a receiver (orphan send = compile error)
+- liveness: handlers that cannot reach a terminal action warn as deadlock
+
+Statements available: `send <perf> [to <role>] [retry N backoff D exp]`,
+`begin`, `fulfil`, `retract(target)`, `set x = <expr>`, `push`/`put`,
+`for x in list { ... }`, `abort`. Expressions are pure (18 builtins);
+time is host-injected (`tick()`), never a hidden clock.
+
+## Compile and run
+
+    aclc protocol file.aclp            # compile (dialogue rules enforced)
+    aclc endpoints file.aclp           # per-role projections
+    aclc gen agent py file.aclp out/   # runnable Python agent per role
+    aclc scenarios file.aclp           # embedded tests (the wire is simulated)
+    aclc trace file.aclp journal.jsonl # step-through debugger
+
+The runtime is deterministic — a pure function of (program, events).
+Every received event enters an auditable transcript, handled or not.
+Replaying a journal reconstructs exact state (event sourcing).
+
+## Typed vocabularies
+
+Compile an `.acl` IDL into typed builders and JSON schema views:
+
+    aclc gen schema stdlib/agent_ops.acl
+
+Available vocabularies: `fs`, `task`, `time`, `net`, `proc`, `http`,
+`agent_ops` (telemetry, tool calls, delegation, heartbeats, SLA).
 
 ## Machine artifacts for agent discovery
 
@@ -79,25 +92,30 @@ lands in an auditable transcript — handled or not. Replay is exact.
   https://acl-language.github.io/acl/.well-known/agent-card.json
 - DID document (did:web, §22):
   https://acl-language.github.io/acl/.well-known/did.json
-- Compiled vocabulary schemas: `aclc gen schema stdlib/<ns>.acl`
-  (stdlib: fs, task, time, net, proc, http)
-- Protocol programs: `aclc protocol file.aclp` (compile),
-  `aclc endpoints file.aclp` (per-role projection)
+- Protocol registry: `aclc publish|protocols|fetch` (SHA-256 verified)
+
+## Security facts
+
+- Every envelope is Ed25519-signed; batch verification available
+- Sealed envelopes: X25519 + ChaCha20-Poly1305 with HKDF-SHA256 key
+  derivation (raw shared secrets are never symmetric keys)
+- Per-session key derivation; identity rotation signed by the old key
+- Transport auth: bearer token on HTTP, token on WebSocket upgrade
+- Capability gating: a program's `use` declarations are enforced by the
+  session host (default-on)
 
 ## Reference implementation
 
-- Rust core + compiler: `cargo install acl-core` (installs `aclc`)
-- Python: `acl-py` (PyO3) · TypeScript: `acl-ts` (napi-rs)
-- Protocol programs + runtime: `src/protocol.rs`, `src/runtime.rs` (§33)
+- Rust core + compiler: `cargo install --path .` (installs `aclc`)
+- Python: `acl-py` (PyO3, abi3) · TypeScript: `acl-ts` (napi-rs)
+- Language server: `acl-lsp` (diagnostics + completion)
 - Conformance: `acl-conformance` binary — 10 checks, 3 levels
-- Store-and-forward relay: `acl-relay` for intermittent agents (§24)
-- Rustdoc + playground + discovery artifacts:
-  https://acl-language.github.io/acl/
+- Docs site: https://acl-language.github.io/acl/
 
 ## Links
 
-- [SPEC.md](https://github.com/acl-language/acl/blob/main/SPEC.md): the normative specification (33 sections)
+- [SPEC.md](https://github.com/acl-language/acl/blob/main/SPEC.md): the normative specification (37 sections)
 - [Tutorial](https://github.com/acl-language/acl/blob/main/docs/TUTORIAL.md): two agents talking in 10 minutes
 - [Playground](https://acl-language.github.io/acl/playground/): watch a real conversation decoded live
-- [BENCH.md](https://github.com/acl-language/acl/blob/main/BENCH.md): codec benchmarks
-- [Source](https://github.com/acl-language/acl): Rust core + bindings + bridges (MCP, A2A), Apache-2.0
+- [BENCH.md](https://github.com/acl-language/acl/blob/main/BENCH.md): codec + ACL-vs-natural-language benchmarks
+- [Source](https://github.com/acl-language/acl): Rust core + bindings + bridges, Apache-2.0
