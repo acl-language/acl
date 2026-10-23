@@ -49,6 +49,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - run: |
+      - name: MCP bridge demo
+        run: |
           mkdir -p /tmp/acl-mcp
-          python3 /tmp/acl-mcp target/debug/mcp_bridge tests/mcp/server.js
+          python3 tests/mcp/bridge_demo.py /tmp/acl-mcp target/debug/mcp_bridge tests/mcp/server.js
