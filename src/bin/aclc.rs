@@ -9,6 +9,18 @@
 use acl_core::idl::{self, IdlFile};
 use std::path::Path;
 
+/// Read a protocol program with include/import resolution relative to
+/// the file's own directory (§38.10).
+fn read_prog(
+    f: &str,
+    src: &str,
+) -> Result<acl_core::protocol::ProtocolProgram, Vec<acl_core::idl::IdlError>> {
+    let dir = std::path::Path::new(f)
+        .parent()
+        .map(|p| p.to_string_lossy().to_string());
+    acl_core::protocol::parse_with_includes(src, dir.as_deref())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
@@ -27,7 +39,7 @@ fn main() {
                     eprintln!("aclc: cannot read {f}: {e}");
                     std::process::exit(2);
                 });
-                match acl_core::protocol::parse(&src) {
+                match read_prog(f, &src) {
                     Err(errors) => {
                         failed = true;
                         for e in errors { eprintln!("{f}:{e}"); }
@@ -135,7 +147,7 @@ fn main() {
                     eprintln!("aclc: cannot read {f}: {e}");
                     std::process::exit(2);
                 });
-                match acl_core::protocol::parse(&src) {
+                match read_prog(f, &src) {
                     Err(errors) => {
                         failed = true;
                         for e in errors { eprintln!("{f}:{e}"); }
@@ -179,7 +191,7 @@ fn main() {
                     eprintln!("aclc: cannot read {jf}: {e}");
                     std::process::exit(2);
                 });
-                let prog = match acl_core::protocol::parse(&src) {
+                let prog = match read_prog(f, &src) {
                     Ok(p) => p,
                     Err(errors) => {
                         failed = true;
@@ -251,7 +263,7 @@ fn main() {
                     eprintln!("aclc: cannot read {f}: {e}");
                     std::process::exit(2);
                 });
-                match acl_core::protocol::parse(&src) {
+                match read_prog(f, &src) {
                     Err(errors) => {
                         failed = true;
                         for e in errors {
@@ -355,7 +367,7 @@ fn main() {
                     std::process::exit(2);
                 });
                 let out_dir = &files[2];
-                match acl_core::protocol::parse(&src) {
+                match read_prog(&files[1], &src) {
                     Err(errors) => {
                         for e in errors { eprintln!("{}:{e}", files[0]); }
                         std::process::exit(1);

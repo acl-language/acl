@@ -468,6 +468,9 @@ pub struct ProtocolProgram {
     /// §38.5: reusable handler fragments `handler_set name { ... }` —
     /// spliced into a protocol by `include handler_set name;`
     pub handler_sets: BTreeMap<String, Vec<Handler>>,
+    /// §38.10: sets made importable by `export handler_set name;` —
+    /// everything else stays private to the module file
+    pub exported_sets: Vec<String>,
 }
 
 /// §38.1: a user-defined function — pure computation over parameters and
@@ -615,11 +618,40 @@ fn split_trigger(head: &str) -> (String, Option<String>, Option<String>) {
 /// the include is loaded relative to `base_dir`, roles renamed
 /// whole-word, and spliced in place of the include line.
 pub fn parse_with_includes(src: &str, base_dir: Option<&str>) -> Result<ProtocolProgram, Vec<IdlError>> {
+    parse_with_includes_depth(src, base_dir, 0)
+}
+
+fn parse_with_includes_depth(
+    src: &str,
+    base_dir: Option<&str>,
+    depth: usize,
+) -> Result<ProtocolProgram, Vec<IdlError>> {
     let mut out_lines: Vec<String> = Vec::new();
     let mut include_errors: Vec<String> = Vec::new();
     for raw in src.lines() {
         let trimmed = raw.trim();
+        if let Some(rest) = trimmed.strip_prefix("import ") {
+            // §38.10: import "mod.aclp" [as ns]; — splices only the
+            // module's EXPORTED handler sets, namespaced as ns.<set>
+            let body = rest.trim_end_matches(';').trim();
+            let (path, ns) = match body.find(" as ") {
+                Some(i) => (body[..i].trim(), Some(body[i + 4..].trim().to_string())),
+                None => (body.trim(), None),
+            };
+            let path = path.trim_matches('"').trim_matches('\'');
+            match import_module(path, ns.as_deref(), base_dir, 0) {
+                Ok(lines) => out_lines.extend(lines),
+                Err(e) => include_errors.push(e),
+            }
+            continue;
+        }
         if let Some(rest) = trimmed.strip_prefix("include ") {
+            // `include handler_set X;` is NOT a file include — pass it
+            // through for parse()'s set-splice arm (§38.5)
+            if rest.trim_start().starts_with("handler_set ") {
+                out_lines.push(raw.to_string());
+                continue;
+            }
             let body = rest.trim_end_matches(';');
             // include "path" [with roles (X=R1, Y=R2)]
             let (path_part, mapping) = match body.find(" with roles ") {
@@ -697,7 +729,9 @@ pub fn parse(src: &str) -> Result<ProtocolProgram, Vec<IdlError>> {
                 ));
                 match mini {
                     Ok(m) => {
-                        prog.handler_sets.insert(name, m.handlers);
+                        if prog.handler_sets.insert(name.clone(), m.handlers).is_some() {
+                            errors.push(IdlError { line: ln, message: format!("duplicate handler_set '{name}'") });
+                        }
                     }
                     Err(es) => {
                         for e in es {
@@ -719,7 +753,9 @@ pub fn parse(src: &str) -> Result<ProtocolProgram, Vec<IdlError>> {
                     ));
                     match mini {
                         Ok(m) => {
-                            prog.handler_sets.insert(name, m.handlers);
+                            if prog.handler_sets.insert(name.clone(), m.handlers).is_some() {
+                                errors.push(IdlError { line: line_no, message: format!("duplicate handler_set '{name}'") });
+                            }
                         }
                         Err(es) => {
                             for e in es {
@@ -746,7 +782,9 @@ pub fn parse(src: &str) -> Result<ProtocolProgram, Vec<IdlError>> {
                 ));
                 match mini {
                     Ok(m) => {
-                        prog.handler_sets.insert(name, m.handlers);
+                        if prog.handler_sets.insert(name.clone(), m.handlers).is_some() {
+                            errors.push(IdlError { line: line_no, message: format!("duplicate handler_set '{name}'") });
+                        }
                     }
                     Err(es) => {
                         for e in es {
@@ -761,6 +799,16 @@ pub fn parse(src: &str) -> Result<ProtocolProgram, Vec<IdlError>> {
                 open_set = Some((name, Vec::new(), line_no, 1));
             } else {
                 errors.push(IdlError { line: line_no, message: "malformed handler_set (want 'handler_set name {')".into() });
+            }
+            continue;
+        }
+        // §38.10: mark a handler set as importable by other modules
+        if let Some(rest) = line.strip_prefix("export handler_set ") {
+            let name = rest.trim_end_matches(';').trim().to_string();
+            if name.is_empty() {
+                errors.push(IdlError { line: line_no, message: "export handler_set needs a name".into() });
+            } else {
+                prog.exported_sets.push(name);
             }
             continue;
         }
@@ -1229,6 +1277,15 @@ pub fn parse(src: &str) -> Result<ProtocolProgram, Vec<IdlError>> {
     }
     if !seen_protocol {
         errors.push(IdlError { line: 0, message: "missing 'protocol <name> v1;' declaration".into() });
+    }
+    // §38.10: every exported name must name a declared handler set
+    for name in prog.exported_sets.clone() {
+        if !prog.handler_sets.contains_key(&name) {
+            errors.push(IdlError {
+                line: 0,
+                message: format!("export handler_set '{name}': no such handler set"),
+            });
+        }
     }
     if errors.is_empty() { Ok(prog) } else { Err(errors) }
 }
@@ -2512,6 +2569,98 @@ fn expand_include(path: &str, mapping: &[(String, String)], base_dir: Option<&st
     Ok(out)
 }
 
+/// §38.10: load a module file, keep only its exported handler sets,
+/// re-emit them as namespaced `handler_set` blocks in the importing file.
+fn import_module(
+    path: &str,
+    ns: Option<&str>,
+    base_dir: Option<&str>,
+    depth: usize,
+) -> Result<Vec<String>, String> {
+    if depth > 8 {
+        return Err(format!("import '{path}': module nesting too deep (cycle?)"));
+    }
+    let full = match base_dir {
+        Some(d) => format!("{d}/{path}"),
+        None => path.to_string(),
+    };
+    let text = std::fs::read_to_string(&full)
+        .map_err(|e| format!("import '{path}': {e}"))?;
+    let dir = std::path::Path::new(&full)
+        .parent()
+        .map(|p| p.to_string_lossy().to_string());
+    let mod_prog = parse_with_includes_depth(&text, dir.as_deref(), depth + 1)
+        .map_err(|es| {
+            format!(
+                "import '{path}': {}",
+                es.iter().map(|e| e.message.clone()).collect::<Vec<_>>().join("; ")
+            )
+        })?;
+    let mut out = Vec::new();
+    for name in &mod_prog.exported_sets {
+        let Some(hs) = mod_prog.handler_sets.get(name) else { continue };
+        let full_name = match ns {
+            Some(n) => format!("{n}.{name}"),
+            None => name.clone(),
+        };
+        out.push(format!("handler_set {full_name} {{"));
+        for h in hs {
+            for l in handler_to_text(h) {
+                out.push(format!("  {l}"));
+            }
+        }
+        out.push("}".into());
+    }
+    Ok(out)
+}
+
+/// §38.10: render a handler back to source lines (used by module import;
+/// captures/patterns round-trip through the same grammar).
+fn handler_to_text(h: &Handler) -> Vec<String> {
+    let mut head = match &h.trigger {
+        OnTrigger::Event { performative, pattern, from } => {
+            let mut t = perf_word(performative).to_string();
+            if let Some(p) = pattern {
+                t.push(' ');
+                t.push_str(p);
+            }
+            if let Some(f) = from {
+                t.push_str(&format!(" from {f}"));
+            }
+            t
+        }
+        OnTrigger::Breach => "breach".into(),
+        OnTrigger::Expired => "expired".into(),
+        OnTrigger::Timer { every_ms, guard, as_role } => {
+            let mut t = if every_ms % 1000 == 0 {
+                format!("every {}s", every_ms / 1000)
+            } else {
+                format!("every {}ms", every_ms)
+            };
+            if let Some(g) = guard {
+                t.push_str(&format!(" while {}", guard_word(g)));
+            }
+            if let Some(r) = as_role {
+                t.push_str(&format!(" as {r}"));
+            }
+            t
+        }
+    };
+    if let Some(g) = &h.guard {
+        head.push_str(&format!(" when {}", guard_word(g)));
+    }
+    if h.actions.len() == 1 {
+        vec![format!("on {} -> {};", head, action_word(&h.actions[0]))]
+    } else {
+        let mut out = vec![format!("on {} {{", head)];
+        for a in &h.actions {
+            out.push(format!("  {};", action_word(a)));
+        }
+        out.push("}".into());
+        out
+    }
+}
+
 fn regex_escape(s: &str) -> String {
     s.chars().map(|c| if c.is_alphanumeric() || c == '_' { c.to_string() } else { format!("\\{c}") }).collect()
 }
@@ -2710,5 +2859,55 @@ mod static_type_tests {
         )
         .unwrap();
         assert!(check(&prog).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod module_tests {
+    use super::*;
+
+    fn tmpfile(tag: &str, content: &str) -> String {
+        let p = std::env::temp_dir().join(format!("acl_mod_test_{tag}.aclp"));
+        std::fs::write(&p, content).unwrap();
+        p.to_string_lossy().to_string()
+    }
+
+    // §38.10: only exported sets are importable, namespaced by alias
+    #[test]
+    fn import_namespaces_exported_sets_only() {
+        let mod_path = tmpfile(
+            "mod1",
+            "handler_set pub_replies {\non breach -> send failure to buyer;\n}\nhandler_set secret {\non expired -> send error to buyer;\n}\nexport handler_set pub_replies;\nprotocol unused v1;\nroles x, y;\n",
+        );
+        let main = format!(
+            "import \"{mod_path}\" as m;\nprotocol p v1;\nroles buyer, seller;\non request(\"quote\") from buyer -> send propose to buyer;\non propose from seller -> send accept to seller;\non accept from buyer -> begin;\ninclude handler_set m.pub_replies;\non failure from seller -> send bye;\non error from seller -> send bye;\n"
+        );
+        let prog = parse_with_includes(&main, None).unwrap();
+        assert!(prog.handler_sets.contains_key("m.pub_replies"), "{:?}", prog.handler_sets.keys());
+        // private set NOT imported, and un-namespaced name NOT present
+        assert!(!prog.handler_sets.contains_key("m.secret"));
+        assert!(!prog.handler_sets.contains_key("pub_replies"));
+        assert_eq!(prog.handlers.len(), 6); // 5 own + 1 spliced from pub_replies
+        assert!(check(&prog).is_ok());
+    }
+
+    #[test]
+    fn import_without_alias_collides_loudly() {
+        let m1 = tmpfile("mod2", "handler_set shared {\non breach -> send failure to a;\n}\nexport handler_set shared;\nprotocol u1 v1;\nroles a, b;\n");
+        let m2 = tmpfile("mod3", "handler_set shared {\non breach -> send error to a;\n}\nexport handler_set shared;\nprotocol u2 v1;\nroles a, b;\n");
+        let main = format!(
+            "import \"{m1}\";\nimport \"{m2}\";\nprotocol p v1;\nroles a, b;\non inform from a -> send inform to b;\non inform from b -> send bye;\non breach -> send bye;\non error -> send bye;\n"
+        );
+        let errs = parse_with_includes(&main, None).unwrap_err();
+        assert!(errs.iter().any(|e| e.message.contains("duplicate handler_set")), "{errs:?}");
+    }
+
+    #[test]
+    fn export_of_unknown_set_is_error() {
+        let errs = parse(
+            "protocol p v1;\nroles a, b;\nexport handler_set ghost;\non inform from a -> send inform to b;\non inform from b -> send bye;\n",
+        )
+        .unwrap_err();
+        assert!(errs.iter().any(|e| e.message.contains("no such handler set")));
     }
 }
