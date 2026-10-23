@@ -6,6 +6,28 @@ Format based on Keep a Changelog; versions follow semver for the
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-10-23
+
+The expressiveness layer: agents can now revise beliefs, subscribe to
+events, make conditional promises, state preferences, report typed
+failures, and use units. All additive (performatives 15-17, optional
+fields); SPEC-VERSION on the wire remains `1`.
+
+### Added
+- **Belief revision** (§32.1): `retract` performative (15) + `Fact.
+  supersedes` — withdraw/replace prior assertions with full provenance.
+- **Subscriptions** (§32.2): `subscribe` (16) / `unsubscribe` (17) with
+  declarative `Matcher` filters — push instead of poll.
+- **Conditional commitments** (§32.3): IF-THEN commitments, condition
+  validated as fact composition observed by the debtor.
+- **Evaluation policy** (§32.4): `prefer(criteria)` under propose/accept
+  — CNP ranking expressible in the language.
+- **Error taxonomy** (§32.5): 8 machine-actionable `ErrorKind`s on
+  `Body::Error.taxonomy`.
+- **Units of measure** (§32.6): `ClValue::Measured` (`{"$measured":
+  {"value": v, "unit": "ms"}}`).
+- **Formal semantics** (§17): FP/RE for retract/subscribe/unsubscribe.
+
 ## [0.6.0] — 2026-10-23
 
 The language matures: typed values, bindings, quantification, semantic
@@ -160,7 +182,8 @@ First public release.
 - Independent spec-only Python codec; interop validated both directions
 - Robustness fuzz-lite corpus test; codec benchmarks
 
-[Unreleased]: https://github.com/acl-language/acl/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/acl-language/acl/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/acl-language/acl/releases/tag/v0.6.0
 [0.5.0]: https://github.com/acl-language/acl/releases/tag/v0.5.0
 [0.4.0]: https://github.com/acl-language/acl/releases/tag/v0.4.0
 [0.3.0]: https://github.com/acl-language/acl/releases/tag/v0.3.0

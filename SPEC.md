@@ -1,6 +1,6 @@
 # ACL — Agent Communication Language
 
-**Version:** 0.6.0-draft
+**Version:** 0.7.0-draft
 **Status:** Draft specification
 **License:** Apache-2.0 (spec + reference implementation)
 
@@ -778,6 +778,73 @@ capabilities BEFORE acting. Absent fields mean "§17 defaults apply".
   but clients are told.
 - Rules: within a major version, deprecation is the ONLY allowed
   removal mechanism; major bumps (§14) MAY remove deprecated terms.
+
+## 32. Expressiveness layer (normative)
+
+Seven additions that make the language honest about knowledge, time,
+conditionality and failure. All additive: performatives 15-17 extend the
+§5 table; everything else is optional fields or new CL ops.
+
+### 32.1 Belief revision — retract and supersedes
+
+- New performative **`retract` (15)**: carries a `Ref` to a prior message.
+  Legal reply after `inform` (matrix §16: `inform → {inform, error,
+  retract}`). Semantics: the sender withdraws its earlier assertion —
+  the fact is not deleted; receivers mark it retracted (provenance
+  keeps the history).
+- `Fact.supersedes(msg_id)`: the new fact REPLACES the fact asserted in
+  the referenced message (e.g. `task_status` flips false). Retraction
+  with traceability.
+
+### 32.2 Subscriptions — push instead of poll
+
+- New performatives **`subscribe` (16)** and **`unsubscribe` (17)**.
+- `Body::Subscribe { watch: Matcher, until_ms? }` — ongoing interest.
+- `Body::Unsubscribe { target_msg_id }` — cancels a prior subscription.
+- **`Matcher`** (§32 construct): declarative message filter shared by
+  subscriptions and routers — `performative?`, `from?`, `predicate?`.
+- Dialogue: `subscribe → {inform, failure, error}`,
+  `unsubscribe → {inform, error}`.
+
+### 32.3 Conditional commitments
+
+`conditional_commitment(debtor, creditor, condition, act, ...)` —
+activates only when `condition` holds, as observed by the DEBTOR. The
+condition is a fact composition (validated under inform's grammar);
+acting as condition is ill-formed. Enables real negotiation: IF you do
+X, THEN I commit to Y.
+
+### 32.4 Evaluation policy — prefer
+
+`prefer(criteria...)` — legal under `propose` (bid states its own
+preference policy) and `accept` (award states its ranking policy).
+Criteria are fact compositions; empty criteria ill-formed. CNP
+evaluation becomes expressible in the language instead of hidden in
+receiver code.
+
+### 32.5 Structured error taxonomy
+
+`Body::Error` gains `taxonomy: Option<ErrorKind>` — machine-actionable
+failure kinds (snake_case on the wire): `unknown_predicate`,
+`schema_violation`, `mailbox_full`, `rate_limited`, `unauthorized`,
+`unknown_agent`, `decode_failed`, `expired`. Receivers react by kind,
+not by parsing message strings.
+
+### 32.6 Units of measure
+
+`ClValue::Measured { value, unit }` — serializes as
+`{"$measured": {"value": v, "unit": "ms"}}`, the same single-key-tag
+convention as `$var` (§27). `5000 ms` is no longer confusable with
+`5000 s`.
+
+### 32.7 Semantics (§17 extension)
+
+`retract`: FP = sender previously asserted p and now believes it false;
+RE = receiver no longer holds p as asserted by sender.
+`subscribe`: FP = sender wants change notifications until deadline;
+RE = receiver pushes matching informs.
+`unsubscribe`: FP = sender no longer wants the referenced subscription;
+RE = receiver stops pushing.
 
 ## 16. Dialogue rules (normative)
 
