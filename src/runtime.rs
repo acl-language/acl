@@ -170,6 +170,9 @@ pub enum StateValue {
     Record(std::collections::BTreeMap<String, StateValue>),
     Bool(bool),
     Int(i64),
+    /// §38.3: floating-point values (inferred from pattern captures,
+    /// arithmetic results) — serialized as MsgPack f64 / JSON number
+    Float(f64),
     Str(String),
     /// §35: collections in session state
     List(Vec<StateValue>),
@@ -370,6 +373,7 @@ impl Runtime {
             Expr::LitStr(s) => StateValue::Str(s.clone()),
             Expr::LitBool(b) => StateValue::Bool(*b),
             Expr::State(n) => scope.get(n).cloned().unwrap_or_else(|| self.states.get(n).cloned().unwrap_or(StateValue::Unset)),
+            Expr::Capture(n) => scope.get(n).cloned().unwrap_or(StateValue::Unset),
             Expr::Arg(a) => match arg.get(a) {
                 Some(s) => StateValue::Str(s.clone()),
                 None => StateValue::Unset,
@@ -440,6 +444,7 @@ impl Runtime {
         match v {
             StateValue::Bool(b) => *b,
             StateValue::Int(i) => *i != 0,
+            StateValue::Float(f) => *f != 0.0,
             StateValue::Str(s) => !s.is_empty(),
             StateValue::List(l) => !l.is_empty(),
             StateValue::Map(m) => !m.is_empty(),
@@ -456,6 +461,7 @@ impl Runtime {
                 let b = match v {
                     StateValue::Bool(b) => *b,
                     StateValue::Int(i) => *i != 0,
+                    StateValue::Float(f) => *f != 0.0,
                     StateValue::Str(s) => !s.is_empty(),
                     StateValue::List(l) => !l.is_empty(),
                     StateValue::Map(m) => !m.is_empty(),
@@ -554,11 +560,13 @@ impl Runtime {
                                         got_v.starts_with(want_v.trim_end_matches('*'))
                                     }
                                     // §35.5: capture variables `{"k": "$var"}`
-                                    // — the event's value is bound to `var`
+                                    // — the event's value is bound to `var`,
+                                    // with §38.3 type inference (int, float,
+                                    // bool, else string)
                                     Some(got_v) if want_v.starts_with('$') => {
                                         captures.insert(
                                             want_v[1..].to_string(),
-                                            StateValue::Str(got_v.clone()),
+                                            infer_value(got_v),
                                         );
                                         true
                                     }
@@ -572,7 +580,22 @@ impl Runtime {
                     (Some(_), _, None) => false,
                     _ => false,
                 };
-                let guard_ok = h.guard.as_ref().map_or(true, |g| g.eval(&self.bool_view()));
+                let guard_ok = h.guard.as_ref().map_or(true, |g| {
+                    match g {
+                        crate::protocol::Guard::ExprGuard(expr) => {
+                            // §38.3: expression guard — evaluate with captures
+                            // in scope; non-bool results use truthiness
+                            match self.eval(expr, ev, &captures) {
+                                Ok(v) => match v {
+                                    StateValue::Bool(b) => b,
+                                    _ => self.truthy(&v),
+                                },
+                                Err(_) => false, // eval error = guard fails
+                            }
+                        }
+                        _ => g.eval(&self.bool_view()),
+                    }
+                });
                 if content_ok
                     && guard_ok
                     && from.as_ref().map_or(true, |want| want == f)
@@ -1066,10 +1089,29 @@ fn builtin(name: &str, args: &[StateValue]) -> Result<StateValue, String> {
     }
 }
 
+/// §38.3: infer a typed value from a string payload field — ints, floats
+/// and bools are recognized; anything else stays a string.
+fn infer_value(s: &str) -> StateValue {
+    if s == "true" {
+        return StateValue::Bool(true);
+    }
+    if s == "false" {
+        return StateValue::Bool(false);
+    }
+    if let Ok(i) = s.parse::<i64>() {
+        return StateValue::Int(i);
+    }
+    if let Ok(f) = s.parse::<f64>() {
+        return StateValue::Float(f);
+    }
+    StateValue::Str(s.to_string())
+}
+
 fn value_text(v: &StateValue) -> String {
     match v {
         StateValue::Bool(b) => b.to_string(),
         StateValue::Int(i) => i.to_string(),
+        StateValue::Float(f) => f.to_string(),
         StateValue::Str(s) => s.clone(),
         StateValue::List(_) => "<list>".into(),
         StateValue::Map(_) => "<map>".into(),
@@ -1595,5 +1637,59 @@ end when fulfilled;
         a.deliver(Event::In { from: "b".into(), performative: Performative::Inform, pattern: None, fields: None });
         assert_eq!(a.commitment(), CommitmentStatus::Active);
         assert!(a.transcript().iter().any(|e| e.text.contains("begin ignored")));
+    }
+
+    // §38.3: capture type inference — pattern captures infer int/float/bool
+    #[test]
+    fn infer_value_recognizes_types() {
+        assert_eq!(infer_value("true"), StateValue::Bool(true));
+        assert_eq!(infer_value("false"), StateValue::Bool(false));
+        assert_eq!(infer_value("42"), StateValue::Int(42));
+        assert_eq!(infer_value("-7"), StateValue::Int(-7));
+        assert_eq!(infer_value("3.14"), StateValue::Float(3.14));
+        assert_eq!(infer_value("-0.5"), StateValue::Float(-0.5));
+        assert_eq!(infer_value("hello"), StateValue::Str("hello".into()));
+        assert_eq!(infer_value(""), StateValue::Str("".into()));
+    }
+
+    #[test]
+    fn typed_captures_flow_into_guards() {
+        let prog = parse(
+            "protocol p v1;\nroles a, b;\non inform {\"price\": $p} when $p > 100 -> send reject to b;\non inform {\"price\": $p} -> send accept to b;\n",
+        )
+        .unwrap();
+        let mut a = Runtime::new(&prog, "a").unwrap();
+        // price 150 → first handler (reject) matches via typed capture guard
+        let out = a.deliver(Event::In {
+            from: "b".into(),
+            performative: Performative::Inform,
+            pattern: None,
+            fields: Some(BTreeMap::from([("price".into(), "150".into())])),
+        });
+        assert_eq!(out[0].performative, Performative::Reject);
+        // price 50 → guard $p > 100 fails, second handler (accept) fires
+        let out = a.deliver(Event::In {
+            from: "b".into(),
+            performative: Performative::Inform,
+            pattern: None,
+            fields: Some(BTreeMap::from([("price".into(), "50".into())])),
+        });
+        assert_eq!(out[0].performative, Performative::Accept);
+    }
+
+    #[test]
+    fn capture_comparison_eq_string() {
+        let prog = parse(
+            "protocol p v1;\nroles a, b;\non inform {\"cur\": $c} when $c == \"usd\" -> send propose to b;\non inform -> send reject to b;\n",
+        )
+        .unwrap();
+        let mut a = Runtime::new(&prog, "a").unwrap();
+        let out = a.deliver(Event::In {
+            from: "b".into(),
+            performative: Performative::Inform,
+            pattern: None,
+            fields: Some(BTreeMap::from([("cur".into(), "usd".into())])),
+        });
+        assert_eq!(out[0].performative, Performative::Propose);
     }
 }

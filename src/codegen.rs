@@ -20,6 +20,8 @@ fn py_guard(g: &Guard) -> String {
         }
         Guard::And(a, b) => format!("[\"and\", {}, {}]", py_guard(a), py_guard(b)),
         Guard::Or(a, b) => format!("[\"or\", {}, {}]", py_guard(a), py_guard(b)),
+        // §38.3: expression guards serialize as a nested expression node
+        Guard::ExprGuard(e) => format!("[\"expr\", {}]", py_expr(e)),
     }
 }
 
@@ -82,6 +84,8 @@ fn py_expr(e: &Expr) -> String {
         Expr::LitStr(s) => format!("{{\"lit\": {}}}", serde_json::to_string(s).unwrap_or_default()),
         Expr::LitBool(b) => format!("{{\"lit\": {}}}", b),
         Expr::State(n) => format!("{{\"state\": \"{}\"}}", n),
+        // §38.3: capture references serialize as a capture node
+        Expr::Capture(n) => format!("{{\"capture\": \"{}\"}}", n),
         Expr::Field { base, name } => format!(
             "{{\"field\": {{\"base\": {}, \"name\": \"{}\"}}}}",
             py_expr(base), name
@@ -196,6 +200,7 @@ pub fn gen_agent_py(prog: &ProtocolProgram, role: &str) -> Result<String, Vec<cr
     out.push_str(
         r#"    def __init__(self):
         self._arg = {}
+        self._caps = {}
         self.states = {k: None for k in self.STATES}
         self.commitment = "proposed"   # proposed -> active -> fulfilled/breached
         self.timer_due = [0] * len([h for h in self.HANDLERS if h["kind"] == "timer"])
@@ -219,6 +224,8 @@ pub fn gen_agent_py(prog: &ProtocolProgram, role: &str) -> Result<String, Vec<cr
         if kind == "atom":
             v = self._bool(g[1])
             return (not v) if g[2] else v
+        if kind == "expr":
+            return self._truthy(self._eval(g[1]))
         if kind == "and":
             return self._guard(g[1]) and self._guard(g[2])
         return self._guard(g[1]) or self._guard(g[2])
@@ -232,6 +239,7 @@ pub fn gen_agent_py(prog: &ProtocolProgram, role: &str) -> Result<String, Vec<cr
             return False
         import json
         w = json.loads(want)
+        self._caps = {}
         for k, wv in w.items():
             gv = got_fields.get(k)
             if gv is None:
@@ -239,9 +247,26 @@ pub fn gen_agent_py(prog: &ProtocolProgram, role: &str) -> Result<String, Vec<cr
             if wv.endswith("*"):
                 if not gv.startswith(wv[:-1]):
                     return False
+            elif wv.startswith("$"):
+                self._caps[wv[1:]] = self._infer(gv)
             elif gv != wv:
                 return False
         return True
+
+    def _infer(self, s):
+        # §38.3: capture type inference (int/float/bool, else string)
+        if s == "true":
+            return True
+        if s == "false":
+            return False
+        try:
+            return int(s)
+        except ValueError:
+            pass
+        try:
+            return float(s)
+        except ValueError:
+            return s
 
     def _match(self, h, performative, pattern, fields):
         if h["kind"] == "event":
@@ -257,6 +282,8 @@ pub fn gen_agent_py(prog: &ProtocolProgram, role: &str) -> Result<String, Vec<cr
             return e["lit"]
         if "state" in e:
             return self.states.get(e["state"])
+        if "capture" in e:
+            return self._caps.get(e["capture"])
         if "arg" in e:
             return self._arg.get(e["arg"])
         if "not" in e:

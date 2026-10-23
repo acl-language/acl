@@ -79,6 +79,9 @@ pub enum Guard {
     Atom { name: String, neg: bool },
     And(Box<Guard>, Box<Guard>),
     Or(Box<Guard>, Box<Guard>),
+    /// §38.3: full expression guard — `when $p > 100` — evaluated with
+    /// the trigger's captures in scope (captures shadow session states)
+    ExprGuard(Expr),
 }
 
 impl Guard {
@@ -90,6 +93,7 @@ impl Guard {
             }
             Guard::And(a, b) => a.eval(states) && b.eval(states),
             Guard::Or(a, b) => a.eval(states) || b.eval(states),
+            Guard::ExprGuard(_) => true, // resolved by the runtime (needs captures)
         }
     }
     pub fn names(&self) -> Vec<&str> {
@@ -100,6 +104,7 @@ impl Guard {
                 v.extend(b.names());
                 v
             }
+            Guard::ExprGuard(_) => vec![], // runtime resolves captures
         }
     }
 }
@@ -132,6 +137,16 @@ pub fn parse_guard(src: &str) -> Result<Guard, String> {
         }
         Ok(Guard::Atom { name: w.to_string(), neg: false })
     }
+    // §38.3: expression guards — `when $p > 100`, `when $p == "x"` — any
+    // guard containing a capture reference or a comparison operator is an
+    // expression guard (parsed and evaluated by the runtime with captures)
+    if src.contains('$') || src.contains('<') || src.contains('>')
+        || src.contains("==") || src.contains("!=") {
+        return match Expr::parse_expr(src) {
+            Ok(e) => Ok(Guard::ExprGuard(e)),
+            Err(err) => Err(format!("bad expression guard '{src}': {err}")),
+        };
+    }
     let mut it = src.split_ascii_whitespace().peekable();
     let g = or(&mut it)?;
     if it.peek().is_some() {
@@ -155,6 +170,9 @@ pub enum Expr {
     LitStr(String),
     LitBool(bool),
     State(String),
+    /// §38.3: capture reference `$p` — resolves to the value captured by
+    /// the trigger's pattern. Captures shadow session states.
+    Capture(String),
     /// `arg.price` — field of the triggering event's structured payload
     Arg(String),
     Bin { op: BinOp, l: Box<Expr>, r: Box<Expr> },
@@ -209,9 +227,13 @@ impl Expr {
                     i = j;
                     continue;
                 }
-                if c.is_alphabetic() || c == '_' {
+                if c.is_alphabetic() || c == '_' || c == '$' {
                     let mut j = i;
+                    // §38.3: '$' starts a capture token — consume it first,
+                    // then the identifier chars (prevents zero-progress loop)
+                    if cs[j] == '$' { j += 1; }
                     while j < cs.len() && (cs[j].is_alphanumeric() || cs[j] == '_' || cs[j] == '.') { j += 1; }
+                    if j == i { return Err(format!("bad char '{c}' in expression")); }
                     toks.push(Tok::Word(cs[i..j].iter().collect()));
                     i = j;
                     continue;
@@ -254,6 +276,7 @@ impl Expr {
                         "true" => Ok(Expr::LitBool(true)),
                         "false" => Ok(Expr::LitBool(false)),
                         "not" => Ok(Expr::Not(Box::new(self.atom_add()?))),
+                        _ if w.starts_with('$') && w.len() > 1 => Ok(Expr::Capture(w[1..].to_string())),
                         _ if w.starts_with("arg.") => Ok(Expr::Arg(w[4..].to_string())),
                         _ if w.contains('.') && !w.starts_with('.') => {
                             // §38.2: field access chain `q.price` — the
@@ -497,6 +520,46 @@ fn perf_from_word(w: &str) -> Option<Performative> {
 
 /// Strip `(...)` pattern and `from <role>` from a handler head:
 /// `request("quote") from buyer` -> (`request`, Some(`"quote"`), Some(`buyer`))
+/// §38.3: rewrite bare `$var` capture values inside a `{...}` content
+/// pattern into JSON string values (`"$var"`) so the pattern is valid
+/// JSON — `{"price": $p}` becomes `{"price": "$p"}`.
+fn quote_bare_captures(pattern: &str) -> String {
+    if !pattern.contains('$') {
+        return pattern.to_string();
+    }
+    let mut out = String::with_capacity(pattern.len() + 8);
+    let cs: Vec<char> = pattern.chars().collect();
+    let mut i = 0;
+    while i < cs.len() {
+        let c = cs[i];
+        out.push(c);
+        if c == ':' {
+            // skip whitespace, then capture a bare `$ident` value
+            let mut j = i + 1;
+            while j < cs.len() && cs[j].is_whitespace() { j += 1; }
+            if j < cs.len() && cs[j] == '$' {
+                let mut k = j + 1;
+                while k < cs.len() && (cs[k].is_alphanumeric() || cs[k] == '_') { k += 1; }
+                if k > j + 1 {
+                    // only when the value ends here (comma, whitespace or '}')
+                    let end_ok = k >= cs.len()
+                        || cs[k] == ','
+                        || cs[k] == '}'
+                        || cs[k].is_whitespace();
+                    if end_ok {
+                        out.push('"');
+                        out.extend(cs[j..k].iter());
+                        out.push('"');
+                        i = k - 1; // loop's i += 1 lands on k
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
 fn split_trigger(head: &str) -> (String, Option<String>, Option<String>) {
     let (head, from) = match head.rfind(" from ") {
         Some(i) => (head[..i].trim().to_string(), Some(head[i + 6..].trim().to_string())),
@@ -507,7 +570,7 @@ fn split_trigger(head: &str) -> (String, Option<String>, Option<String>) {
             (head[..i].trim().to_string(), Some(head[i..].to_string()))
         }
         (_, Some(i)) if head.ends_with('}') => {
-            (head[..i].trim().to_string(), Some(head[i..].to_string()))
+            (head[..i].trim().to_string(), Some(quote_bare_captures(&head[i..])))
         }
         _ => (head.trim().to_string(), None),
     };
@@ -1571,6 +1634,8 @@ fn guard_word(g: &Guard) -> String {
         }
         Guard::And(a, b) => format!("{} and {}", guard_word(a), guard_word(b)),
         Guard::Or(a, b) => format!("{} or {}", guard_word(a), guard_word(b)),
+        // §38.3: expression guards render back as their expression
+        Guard::ExprGuard(e) => expr_word(e),
     }
 }
 
@@ -1612,6 +1677,7 @@ fn expr_word(e: &Expr) -> String {
         Expr::LitStr(s) => format!("\"{s}\""),
         Expr::LitBool(b) => b.to_string(),
         Expr::State(n) => n.clone(),
+        Expr::Capture(n) => format!("${n}"),
         Expr::Arg(a) => format!("arg.{a}"),
         Expr::Bin { op, l, r } => {
             let o = match op {
