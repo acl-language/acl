@@ -1,6 +1,6 @@
 # ACL — Agent Communication Language
 
-**Version:** 0.4.0-draft
+**Version:** 0.5.0-draft
 **Status:** Draft specification
 **License:** Apache-2.0 (spec + reference implementation)
 
@@ -647,6 +647,62 @@ concern. Reference: `src/did.rs`.
 Exit 0 = compliant at the highest fully-passing level. External
 implementations MUST pass L1 to claim ACL support; L3 requires the full
 feature set. Reference: `src/bin/acl_conformance.rs`.
+
+## 24. Store-and-forward relay and delivery guarantees (normative)
+
+A relay turns point-to-point ACL into an asynchronous system. Reference:
+`src/bin/relay.rs`.
+
+**Wire protocol** (all framed per §3):
+1. client connects, sends any envelope; its `from` AID identifies its mailbox;
+2. the relay resolves `did:key` senders (§22) and verifies with ONLY the
+   `from` field; unresolvable schemes (e.g. `local:`) are accepted unsigned;
+3. replay protection: duplicate `msg_id`s within a 5-minute window are
+   rejected (`ReplayGuard`);
+4. rate limiting: token bucket per connection (default 100 burst, 1 msg/2ms);
+5. the envelope is enqueued for `to` — persistent on disk, one file per
+   message — unless already expired (`ttl`, swept on delivery);
+6. everything pending for the client's mailbox is delivered immediately,
+   BATCH-VERIFIED first (§23 C10): messages whose signature fails are
+   dropped before sending; the mailbox is drained after delivery.
+
+**Delivery guarantees**: at-least-once while the recipient polls; messages
+persist across relay restarts (file-backed store); expired messages are
+dropped. Confidentiality: sealed envelopes (§10.1) stay sealed through the
+relay — it routes opaque ciphertext.
+
+## 25. Packaging and installability
+
+- `acl-core` publishes to crates.io (metadata validated; `cargo publish
+  --dry-run` passes). `cargo install acl-core` installs the `aclc` compiler.
+- `acl-py` publishes to PyPI via maturin (`packaging/py/pyproject.toml`).
+- `acl-ts` publishes to npm (`packaging/npm/package.json`).
+- Package versions track the GitHub release tag; the wire protocol version
+  is independent (`acl` field, §14).
+- Publishing requires maintainer registry tokens; see PUBLISHING.md.
+
+## 26. RDF / JSON-LD mapping (interop layer)
+
+CL facts export as JSON-LD claims for the Linked-Data ecosystem
+(reference: `src/rdf.rs`):
+
+```json
+{"@id": "urn:acl:claim:<msg_id>", "@type": "acl:Claim",
+ "acl:assertedBy": {"@id": "<assertor AID>"},
+ "acl:about": {"@id": "<base>/<vocab>/<predicate>"},
+ "acl:holds": true, "acl:arg_<name>": <value>,
+ "acl:modality": "believed", "acl:provenance": [...], "acl:validUntil": <ms>}
+```
+
+- dotted vocabulary names map to IRI paths: `acl.std.fs.file_exists` →
+  `<base>/acl.std.fs/file_exists`;
+- commitments map to `acl:Commitment` nodes with debtor/creditor/act/status;
+- queries and actions are speech acts, not claims — skipped in the graph;
+- the `@context` binds `acl:` to `https://acl-language.dev/ns/core/` and
+  `vocab:` to the vocabulary's base.
+
+This gives ACL facts W3C-graph semantics: any JSON-LD processor (and any
+agent consuming schema.org-style data) can consume ACL claims.
 
 ## 16. Dialogue rules (normative)
 

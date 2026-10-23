@@ -1,0 +1,21 @@
+// ACL standard vocabulary: processes (namespace acl.std.proc).
+namespace acl.std.proc v1;
+
+type Pid = int;
+type Cmd = string;
+type ExitCode = int;
+
+/// A process with the given pid is currently running.
+predicate running(pid: Pid) -> bool;
+
+/// A command exists in the agent's PATH.
+predicate command_available(cmd: Cmd) -> bool;
+
+/// Action: spawn a process; returns its pid.
+action spawn(cmd: Cmd) -> Pid;
+
+/// Action: terminate a process.
+action kill(pid: Pid) -> bool;
+
+/// Action: wait for exit; returns the exit code.
+action wait(pid: Pid) -> ExitCode;

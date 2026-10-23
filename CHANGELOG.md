@@ -6,6 +6,32 @@ Format based on Keep a Changelog; versions follow semver for the
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-10-23
+
+From standalone language to distributed system. All changes additive;
+SPEC-VERSION on the wire remains `1`.
+
+### Added
+- **Store-and-forward relay** (spec §24): `acl-relay` daemon — TCP, file-
+  backed persistent queues, mailbox drain on connect, TTL expiry sweep,
+  did:key signature verification via the `from` field alone, batch-verified
+  delivery (invalid messages dropped pre-send).
+- **Replay protection & rate limiting** (spec §24): `ReplayGuard` (msg_id
+  window) and token-bucket `RateLimiter`, enforced by the relay.
+- **Runtime schema validation in the reference agent** (spec §19): `acl-peer
+  --schema` validates incoming CL payloads against compiled vocabularies —
+  strict full-name matching, param types, 422 with violation details.
+- **Standard library extended** (§18): `proc.acl` and `http.acl` added
+  (6 vocabularies, ~40 documented declarations).
+- **`aclc` installable** (§25): `cargo install acl-core` puts the compiler
+  on PATH; `cargo publish --dry-run` validated for crates.io.
+- **RDF / JSON-LD mapping** (spec §26): CL facts → `acl:Claim` nodes,
+  commitments → `acl:Commitment`; provenance and epistemic metadata mapped.
+- **Property-based tests** (proptest): encode/decode roundtrip on arbitrary
+  strings, decode-never-panics, idempotency no-duplicates, encoding
+  determinism.
+- **Publishing guide** (PUBLISHING.md) for crates.io / PyPI / npm.
+
 ## [0.4.0] — 2026-10-23
 
 Distributed-systems maturity: types enforced on the wire, declarative

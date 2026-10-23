@@ -16,6 +16,8 @@ pub mod semantics;
 pub mod sealed;
 pub mod idempotency;
 pub mod registry;
+pub mod replay;
+pub mod rdf;
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use std::io::Read;

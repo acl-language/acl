@@ -8,6 +8,7 @@
 
 use acl_core::{
     cl::{well_formed, ClExpr},
+    schema::RuntimeSchema,
     AgentCard, Aid, Body, Capability, Envelope, Performative, ACL_VERSION,
 };
 use ed25519_dalek::SigningKey;
@@ -27,6 +28,7 @@ fn main() {
     let mut name = String::from("peer");
     let mut key_file = PathBuf::from("/tmp/acl-peer.key");
     let mut pub_out = String::new();
+    let mut schema_path: Option<String> = None;
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
     while i < args.len() {
@@ -42,6 +44,10 @@ fn main() {
             "--pub-out" => {
                 i += 1;
                 pub_out = args[i].clone();
+            }
+            "--schema" => {
+                i += 1;
+                schema_path = Some(args[i].clone());
             }
             other => {
                 eprintln!("unknown arg {other}");
@@ -67,6 +73,28 @@ fn main() {
         std::fs::write(&pub_out, key.verifying_key().to_bytes()).expect("write pub");
     }
     let my_aid = Aid::local(std::process::id(), &name);
+    // §19: runtime schema validation — Cl bodies checked against the
+    // compiled vocabulary BEFORE processing
+    let schema: Option<RuntimeSchema> = schema_path.as_ref().and_then(|p| {
+        match std::fs::read(p).map_err(|e| e.to_string()).and_then(|b| RuntimeSchema::from_json(&b)) {
+            Ok(s) => {
+                eprintln!("[{name}] schema loaded: {} v{} ({} predicates, {} actions)",
+                    s.namespace, s.version, s.predicates.len(), s.actions.len());
+                Some(s)
+            }
+            Err(e) => {
+                eprintln!("[{name}] schema load FAILED: {e}");
+                None
+            }
+        }
+    });
+    let validate_cl = |exprs: &[ClExpr]| -> Option<String> {
+        let schema = schema.as_ref()?;
+        match schema.validate_all(exprs) {
+            Ok(()) => None,
+            Err(violations) => Some(violations.join("; ")),
+        }
+    };
     eprintln!("[{name}] aid={} acl={ACL_VERSION} ready", my_aid.0);
 
     let mut blocked: HashMap<String, (String, String)> = HashMap::new(); // reply msg_id -> (task msg_id, description)
@@ -185,7 +213,11 @@ fn main() {
             // §6.2: the peer SPEAKS the content language — answers Cl
             // queries with facts, executes Cl actions, enforces grammar.
             (Performative::Query, Body::Cl { expressions }) => {
-                if let Err(e) = well_formed(env.performative, expressions) {
+                if let Some(v) = validate_cl(expressions) {
+                    Some(mk(&my_aid, &env, Performative::Error, Body::Error {
+                        code: 422, message: format!("schema violation: {v}"), details: None,
+                    }))
+                } else if let Err(e) = well_formed(env.performative, expressions) {
                     Some(mk(&my_aid, &env, Performative::Error, Body::Error {
                         code: 422, message: format!("ill-formed CL: {e}"), details: None,
                     }))
@@ -193,7 +225,11 @@ fn main() {
                     let mut facts: Vec<ClExpr> = Vec::new();
                     for e in expressions {
                         if let ClExpr::Query { predicate, args } = e {
-                            match predicate.as_str() {
+                            // accept both bare and namespace-qualified names:
+                            // match the local segment (schema vocabularies use
+                            // full names; the peer's own vocabulary is local)
+                            let local = predicate.rsplit('.').next().unwrap_or(predicate);
+                            match local {
                                 "file_exists" => {
                                     let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
                                     let truth = std::path::Path::new(path).exists();
@@ -220,7 +256,11 @@ fn main() {
                 }
             }
             (Performative::Request, Body::Cl { expressions }) => {
-                if let Err(e) = well_formed(env.performative, expressions) {
+                if let Some(v) = validate_cl(expressions) {
+                    Some(mk(&my_aid, &env, Performative::Error, Body::Error {
+                        code: 422, message: format!("schema violation: {v}"), details: None,
+                    }))
+                } else if let Err(e) = well_formed(env.performative, expressions) {
                     Some(mk(&my_aid, &env, Performative::Error, Body::Error {
                         code: 422, message: format!("ill-formed CL: {e}"), details: None,
                     }))

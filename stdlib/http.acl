@@ -1,0 +1,16 @@
+// ACL standard vocabulary: HTTP (namespace acl.std.http).
+namespace acl.std.http v1;
+
+type Url = string;
+type Method = string;
+type StatusCode = int;
+type Body = string;
+
+/// An endpoint answered with the given status recently.
+predicate responded(url: Url, status: StatusCode) -> bool;
+
+/// Action: perform an HTTP request.
+action request(method: Method, url: Url, body: Body) -> StatusCode;
+
+/// Action: health-check an endpoint (GET, expect 2xx).
+action health_check(url: Url) -> bool;
