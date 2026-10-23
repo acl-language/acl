@@ -254,6 +254,26 @@ can be relayed over HTTP untouched (relay increments `hop_count`).
 - **Confidentiality:** out of scope for v0.1 (transport-level TLS is expected
   on network transports). A `sealed` envelope variant is planned for v0.2.
 
+### 10.1 Sealed envelopes (v0.1, implemented)
+
+For end-to-end confidentiality through relays, an envelope may carry a
+`Sealed` body:
+
+```text
+Sealed = { sender_pub (32B X25519), salt (12B), ciphertext }
+```
+
+- Key agreement: X25519 ECDH between the sender's static secret and the
+  recipient's public key; the 32-byte shared secret is the ChaCha20-Poly1305
+  key directly (v0.1 simplification; HKDF extraction is a v0.2 TODO).
+- Encryption: ChaCha20-Poly1305 with AAD = `"acl-sealed-v1"`, nonce = `salt`.
+- `sender_pub` travels in the clear so the recipient can derive the same key.
+- The outer envelope keeps `msg_id` and `reply_with` of the inner one (so
+  correlation survives), but relays cannot read `to`-scoped payloads beyond
+  routing fields.
+- Verified properties: roundtrip, wrong key rejected, tampered ciphertext
+  rejected (AEAD tag).
+
 ## 11. Reference Implementation
 
 `acl-core` (Rust) is the reference implementation of L1–L5:

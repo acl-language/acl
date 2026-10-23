@@ -5,6 +5,7 @@
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 pub mod bridge;
+pub mod sealed;
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use std::io::Read;
@@ -113,6 +114,12 @@ pub enum Body {
     Delegate {
         task: Box<Body>, // must be Body::Task
         chain: Vec<String>,
+    },
+    /// §10.1: encrypted inner envelope (X25519 + ChaCha20-Poly1305)
+    Sealed {
+        sender_pub: Vec<u8>,
+        salt: Vec<u8>,
+        ciphertext: Vec<u8>,
     },
 }
 
