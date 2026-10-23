@@ -56,6 +56,42 @@ impl SessionHost {
         Ok(host)
     }
 
+    /// §54: open without journaling — used by replay, which processes the
+    /// journal's OWN open events (the public open() journals)
+    fn open_inner(&mut self, id: &str, role: &str, journal_it: bool) -> Result<(), String> {
+        let ungranted: Vec<&str> = self
+            .program
+            .capabilities
+            .iter()
+            .map(|c| c.name.as_str())
+            .filter(|name| !name.starts_with("stdlib.") && !self.granted.contains(*name))
+            .collect();
+        if !ungranted.is_empty() {
+            return Err(format!(
+                "capability gate: session '{id}' rejected — program requires {} which was not granted",
+                ungranted.join(", ")
+            ));
+        }
+        if self.sessions.contains_key(id) {
+            return Err(format!("session '{id}' already open"));
+        }
+        if self.sessions.len() >= self.capacity {
+            return Err(format!(
+                "capacity reached ({}) — session '{id}' rejected",
+                self.capacity
+            ));
+        }
+        let rt = Runtime::new(&self.program, role)
+            .map_err(|e| format!("session '{id}': {}", e.message))?;
+        self.sessions.insert(id.to_string(), rt);
+        self.opened_roles.insert(id.to_string(), role.to_string());
+        if journal_it {
+            self.journal
+                .push((id.to_string(), Event::SessionOpened { role: role.to_string() }));
+        }
+        Ok(())
+    }
+
     /// verify a peer's capability list against this program's needs
     /// (the AgentCard check, §35.6)
     pub fn peer_satisfies(card_capabilities: &[String]) -> impl Fn(&ProtocolProgram) -> Result<(), String> + '_ {
@@ -104,6 +140,10 @@ impl SessionHost {
             .map_err(|e| format!("session '{id}': {}", e.message))?;
         self.sessions.insert(id.to_string(), rt);
         self.opened_roles.insert(id.to_string(), role.to_string());
+        // §54: opens are journaled IN ORDER (with the role) so replay
+        // respects capacity and reincarnations
+        self.journal
+            .push((id.to_string(), Event::SessionOpened { role: role.to_string() }));
         Ok(())
     }
 
@@ -136,6 +176,12 @@ impl SessionHost {
         if matches!(ev, Event::SessionClosed) {
             // close() itself journals the SessionClosed entry (§49)
             self.close(id)?;
+            return Ok(Vec::new());
+        }
+        if let Event::SessionOpened { role } = &ev {
+            // §54: the journal's open event drives the ordered open —
+            // do NOT journal again (open() journals)
+            self.open(id, role)?;
             return Ok(Vec::new());
         }
         if let Event::Tick(ms) = ev {
@@ -245,12 +291,32 @@ impl SessionHost {
     ) -> Result<Self, String> {
         // §49: capability grants are reconstructed — they gate open()
         let mut host = SessionHost::new_gated(program, grants)?;
+        // §54: sessions whose lifecycle is IN the journal are opened in
+        // order by the replay loop (capacity + reincarnations respected).
+        // Legacy journals (no open events) fall back to the header.
+        let journaled_opens: std::collections::BTreeSet<&str> = journal
+            .iter()
+            .filter_map(|(id, ev)| match ev {
+                Event::SessionOpened { .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
         for (id, role) in roles {
-            host.open(id, role)?;
+            if !journaled_opens.contains(&id.as_str()) {
+                host.open(id, role)?;
+            }
         }
         for (id, ev) in journal {
-            if host.is_open(id) {
-                let _ = host.deliver(id, ev.clone());
+            match ev {
+                Event::SessionOpened { role } => {
+                    // journaling here keeps the rebuilt journal IDENTICAL
+                    host.open_inner(id, role, true)?;
+                }
+                _ => {
+                    if host.is_open(id) {
+                        let _ = host.deliver(id, ev.clone());
+                    }
+                }
             }
         }
         Ok(host)
@@ -330,7 +396,7 @@ mod tests {
 
         // persist: journal + role header; crash; replay
         let (roles, grants, journal) = host.journal_with_roles();
-        assert_eq!(journal.len(), 2);
+        assert_eq!(journal.len(), 3); // open + 2 delivered events (§54)
         let rebuilt = SessionHost::replay_from(&prog, &roles, &grants, &journal).unwrap();
         assert!(host.same_state_as(&rebuilt), "replay must reconstruct exact state");
         // and the replayed host continues deterministically
@@ -396,7 +462,7 @@ mod tests {
             }
         }
         assert_eq!(host.session_count(), 200);
-        assert_eq!(host.journal().len(), 200 * 25);
+        assert_eq!(host.journal().len(), 200 * 25 + 200); // + 200 opens (§54)
         // replay the whole journal into a fresh host — must be identical
         let (roles, grants, journal) = host.journal_with_roles();
         assert_eq!(roles.len(), 200);
@@ -422,7 +488,7 @@ mod tests {
         host.open("s1", "buyer").unwrap();
         // buyer has no handlers for request — still journaled
         host.deliver("s1", event("seller", Performative::Request, None)).unwrap();
-        assert_eq!(host.journal().len(), 1);
+        assert_eq!(host.journal().len(), 2); // open + the delivered event
     }
 }
 
@@ -602,5 +668,72 @@ mod concurrent_conversations_tests {
             host.sessions.get("s2").unwrap().states_snapshot().get("n"),
             Some(&StateValue::Int(7))
         );
+    }
+}
+
+#[cfg(test)]
+mod ordered_open_replay_tests {
+    use super::*;
+    use crate::protocol::parse;
+
+    fn prog() -> crate::protocol::ProtocolProgram {
+        parse(
+            "protocol p v1;\nroles a, b;\non inform from a -> send bye;\non inform from b -> send bye;\n",
+        )
+        .unwrap()
+    }
+
+    fn inform(from: &str) -> Event {
+        Event::In {
+            from: from.into(),
+            performative: crate::Performative::Inform,
+            pattern: None,
+            fields: None,
+        }
+    }
+
+    // §54: capacity 1 + close + reopen — replay follows the ORDERED opens
+    #[test]
+    fn replay_respects_capacity_and_reincarnation() {
+        let program = prog();
+        let mut host = SessionHost::new(&program).unwrap();
+        host.capacity = 1;
+        host.open("s1", "b").unwrap();
+        host.deliver("s1", inform("a")).unwrap();
+        host.close("s1").unwrap();
+        // capacity 1: the slot is free again
+        host.open("s2", "b").unwrap();
+        host.deliver("s2", inform("a")).unwrap();
+
+        let (roles, grants, journal) = host.journal_with_roles();
+        let rebuilt = SessionHost::replay_from(&program, &roles, &grants, &journal)
+            .expect("replay must respect the ordered lifecycle");
+        // s1 closed, s2 open — the ORIGINAL end state
+        assert!(!rebuilt.is_open("s1"));
+        assert!(rebuilt.is_open("s2"));
+        assert_eq!(rebuilt.session_count(), 1);
+        assert_eq!(rebuilt.journal().len(), host.journal().len());
+    }
+
+    // §54: reopening the SAME id after close (reincarnation) keeps both
+    // lifecycle records in the header
+    #[test]
+    fn same_id_reincarnation_replays() {
+        let program = prog();
+        let mut host = SessionHost::new(&program).unwrap();
+        host.capacity = 1;
+        host.open("s1", "b").unwrap();
+        host.deliver("s1", inform("a")).unwrap();
+        host.close("s1").unwrap();
+        host.open("s1", "b").unwrap(); // SAME id, new incarnation
+        host.deliver("s1", inform("a")).unwrap();
+
+        let (roles, grants, journal) = host.journal_with_roles();
+        let rebuilt = SessionHost::replay_from(&program, &roles, &grants, &journal).unwrap();
+        assert!(rebuilt.is_open("s1"));
+        assert_eq!(rebuilt.session_count(), 1);
+        assert_eq!(rebuilt.journal().len(), host.journal().len());
+        // the header records the LATEST incarnation's role
+        assert_eq!(roles.len(), 1);
     }
 }

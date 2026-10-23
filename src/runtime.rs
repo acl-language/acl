@@ -218,6 +218,9 @@ pub enum Event {
     Tick(i64),
     /// §49: a session close — journaled so replay closes the same sessions
     SessionClosed,
+    /// §54: a session OPEN — journaled IN ORDER (with the role) so replay
+    /// respects capacity and session-ID reincarnations
+    SessionOpened { role: String },
     /// the deadline passed
     Expired,
 }
@@ -1791,6 +1794,7 @@ fn event_text(ev: &Event) -> String {
         Event::InternalError(r) => format!("internal error: {r}"),
         Event::Tick(ms) => format!("tick {ms}ms"),
         Event::SessionClosed => "session closed".into(),
+        Event::SessionOpened { role } => format!("session opened (role {role})"),
     }
 }
 
