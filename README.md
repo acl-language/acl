@@ -182,7 +182,7 @@ from [`llms.txt`](llms.txt). Deployed artifacts live on the
 
 ## Status
 
-v0.9-draft, Apache-2.0 (SPEC-VERSION 1 on the wire — all changes additive).
+v0.13-draft, Apache-2.0 (SPEC-VERSION 1 on the wire — all changes additive).
 
 Validated end-to-end: stdio/pipes, HTTP sync, SSE streaming (per-event
 signatures), WebSocket, store-and-forward relay, Python + TypeScript
@@ -247,9 +247,10 @@ end when fulfilled;
   protocol into per-role endpoints — each agent sees only its side;
   two projected runtimes reproduce the global conversation exactly
 
-Also here: [BENCH.md](BENCH.md) (codec benchmarks),
+Also here: [docs/architecture.html](docs/architecture.html) (visual stack map),
+[BENCH.md](BENCH.md) (codec benchmarks),
 [docs/TUTORIAL.md](docs/TUTORIAL.md) (10-minute guide),
-[CHANGELOG.md](CHANGELOG.md) (v0.1.0 → v0.7.0),
+[CHANGELOG.md](CHANGELOG.md) (v0.1.0 → v0.13.0),
 [governance/](governance/) (RFC process).
 
 Not yet: sealed-envelope key rotation, public governance body (RFCs

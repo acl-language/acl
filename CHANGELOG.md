@@ -6,6 +6,33 @@ Format based on Keep a Changelog; versions follow semver for the
 
 ## [Unreleased]
 
+## [0.13.0] — 2026-10-23
+
+Hardening and real-world readiness: the security TODOs are closed and
+the protocol is wired for operating real agents.
+
+### Added
+- **HKDF-SHA256 key derivation** (§37.1): raw shared secrets never used
+  as symmetric keys (closes the §10.1 v0.1 simplification).
+- **Session key derivation** (§37.2): per-channel keys via HKDF.
+- **Identity rotation** (§37.3): `Body::KeyRotation` signed by the old
+  key — provable continuity; `rotate_identity` helper.
+- **Transport authentication** (§37.4): bearer-token gate on
+  `acl-httpd`, token on `acl-wsd` upgrade; agent-card stays pre-auth.
+- **Operations vocabulary** (§37.5): `stdlib/agent_ops.acl` — telemetry,
+  tool calls, delegation, heartbeats, SLA.
+- **Reference protocol** (§37.6): `stdlib/protocols/pilot_ops.aclp`
+  with a passing embedded scenario.
+- **Soak verification** (§37.7): 200 sessions × 25 events, exact-state
+  replay.
+- **Registry ↔ AgentCard discovery** (§37.8): register/discover via
+  cards.
+- **Dialogue-matrix enforcement** (§37.9): opt-in strict mode on the
+  runtime; off-policy replies logged and dropped.
+- **Bridges completed** (§37.10): `a2a_task_to_acl` inverse bridge +
+  MCP `validate_arguments` schema-lite validation.
+- **Architecture diagram**: `docs/architecture.html` — visual stack map.
+
 ## [0.12.0] — 2026-10-23
 
 The three remaining gaps closed: enforced capability gating, a language

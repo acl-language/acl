@@ -1,6 +1,6 @@
 # ACL — Agent Communication Language
 
-**Version:** 0.8.0-draft
+**Version:** 0.13.0-draft
 **Status:** Draft specification
 **License:** Apache-2.0 (spec + reference implementation)
 
@@ -1112,6 +1112,76 @@ File-backed registry with integrity: `aclc publish <file.aclp>
 `aclc protocols <registry.json>` lists; `aclc fetch <name> <version>
 <registry.json>` verifies the checksum before parsing — a tampered
 registry fails to fetch.
+
+## 37. Hardening and real-world readiness (normative)
+
+### 37.1 HKDF key derivation (§10.1 hardening)
+
+The raw X25519 shared secret is NEVER used as the ChaCha20-Poly1305
+key. The symmetric key is derived: `HKDF-SHA256(salt, shared)`, expand
+with info `acl-sealed-v1-key` (salt = the 12-byte message salt, domain-
+separated from its nonce use by the info label).
+
+### 37.2 Session key derivation
+
+`derive_session_key(root_secret, session_id)` — derive per-channel keys
+from a root secret via HKDF (info = `acl-session-v1-{session_id}`),
+deterministic and distinct per session; no re-handshake per message.
+
+### 37.3 Identity rotation
+
+`Body::KeyRotation { new_did, valid_from_ms, reason? }` — a rotation
+statement SIGNED BY THE OLD KEY: continuity is provable because the
+message verifies under the old did:key while announcing the new one.
+`rotate_identity(old_key, new_key, ...)` builds it.
+
+### 37.4 Transport authentication
+
+- `acl-httpd --token <t>`: bearer-token gate (`Authorization: Bearer`)
+  on every ACL-carrying route; `/agent-card` stays open (capability
+  discovery is verifiable pre-auth). Unauthorized = 401.
+- `acl-wsd --token <t>`: token via upgrade-path query param.
+
+### 37.5 Operations vocabulary
+
+`stdlib/agent_ops.acl` — the vocabulary for operating AI agents:
+`agent_healthy`, `agent_status`, `heartbeat`, `tool_call`, `tool_result`,
+`telemetry`, `delegation_active`, `delegate_task`, `run_tool`,
+`rotate_identity`, `sla_acknowledged`.
+
+### 37.6 Reference protocol program
+
+`stdlib/protocols/pilot_ops.aclp` — orchestrator delegates a tool call
+to a pilot with an SLA commitment (delegate → propose → accept → begin
+→ tool_result → fulfil), with an embedded passing scenario.
+
+### 37.7 Soak verification
+
+The multi-session host is soak-verified: 200 concurrent sessions × 25
+events, full-journal replay reconstructs exact state, outbox accounted
+(one propose per session).
+
+### 37.8 Registry ↔ AgentCard discovery
+
+`Registry::register_card(&AgentCard)` and `Registry::discover_cards(cap)`
+— capability discovery returns best-effort AgentCards with public keys
+restored from the registry (signature verification deferred to contact).
+
+### 37.9 Dialogue-matrix enforcement (§16 runtime)
+
+`Runtime::enforce_dialogue(true)` — incoming messages are validated
+against the dialogue matrix given the last outgoing performative;
+off-policy replies are logged ("off-policy reply dropped") and the
+handler does not fire. Opt-in per runtime.
+
+### 37.10 Bridges completed
+
+- `a2a_task_to_acl(task)` — the inverse A2A bridge: full task JSON →
+  Envelope (performative from state, body from artifacts/metadata,
+  correlation preserved). Roundtrip ACL→A2A→ACL tested.
+- `validate_arguments(card, name, args)` — JSON-schema-lite validation
+  of MCP call arguments against the card's declared input schema
+  (required fields + types).
 
 ## 16. Dialogue rules (normative)
 
