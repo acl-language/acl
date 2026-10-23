@@ -5,7 +5,7 @@
 //! generated agent has no ACL-specific dependencies — it speaks the
 //! protocol the program declares, exactly as compiled.
 
-use crate::protocol::{Guard, OnTrigger, ProtocolAction, ProtocolProgram};
+use crate::protocol::{BinOp, Expr, Guard, OnTrigger, ProtocolAction, ProtocolProgram};
 use crate::runtime::{project, RoleEndpoint};
 use crate::Performative;
 
@@ -32,7 +32,7 @@ fn py_opt_guard(g: &Option<Guard>) -> String {
 
 fn py_action(a: &ProtocolAction) -> String {
     match a {
-        ProtocolAction::Send { performative, to, fields } => format!(
+        ProtocolAction::Send { performative, to, fields, .. } => format!(
             "{{\"kind\": \"send\", \"performative\": \"{}\", \"to\": {}, \"fields\": {}}}",
             py_perf(performative),
             match to {
@@ -48,6 +48,46 @@ fn py_action(a: &ProtocolAction) -> String {
         ProtocolAction::Fulfil => "{\"kind\": \"fulfil\"}".into(),
         ProtocolAction::Retract { target } => {
             format!("{{\"kind\": \"retract\", \"target\": \"{}\"}}", target)
+        }
+        ProtocolAction::Set { name, expr } => format!(
+            "{{\"kind\": \"set\", \"name\": \"{}\", \"expr\": {}}}", name, py_expr(expr)
+        ),
+        ProtocolAction::Push { state, expr } => format!(
+            "{{\"kind\": \"push\", \"state\": \"{}\", \"expr\": {}}}", state, py_expr(expr)
+        ),
+        ProtocolAction::Put { state, key, expr } => format!(
+            "{{\"kind\": \"put\", \"state\": \"{}\", \"key\": \"{}\", \"expr\": {}}}", state, key, py_expr(expr)
+        ),
+        ProtocolAction::For { var, over, actions } => {
+            let inner: Vec<String> = actions.iter().map(py_action).collect();
+            format!(
+                "{{\"kind\": \"for\", \"var\": \"{}\", \"over\": \"{}\", \"actions\": [{}]}}",
+                var, over, inner.join(", ")
+            )
+        }
+        ProtocolAction::Abort => "{\"kind\": \"abort\"}".into(),
+    }
+}
+
+fn py_expr(e: &Expr) -> String {
+    match e {
+        Expr::LitInt(i) => format!("{{\"lit\": {}}}", i),
+        Expr::LitStr(s) => format!("{{\"lit\": {}}}", serde_json::to_string(s).unwrap_or_default()),
+        Expr::LitBool(b) => format!("{{\"lit\": {}}}", b),
+        Expr::State(n) => format!("{{\"state\": \"{}\"}}", n),
+        Expr::Arg(a) => format!("{{\"arg\": \"{}\"}}", a),
+        Expr::Bin { op, l, r } => {
+            let o = match op {
+                BinOp::Add => "add", BinOp::Sub => "sub", BinOp::Mul => "mul", BinOp::Div => "div",
+                BinOp::Lt => "lt", BinOp::Le => "le", BinOp::Gt => "gt", BinOp::Ge => "ge",
+                BinOp::Eq => "eq", BinOp::Ne => "ne", BinOp::And => "and", BinOp::Or => "or",
+            };
+            format!("{{\"op\": \"{}\", \"l\": {}, \"r\": {}}}", o, py_expr(l), py_expr(r))
+        }
+        Expr::Not(x) => format!("{{\"not\": {}}}", py_expr(x)),
+        Expr::Call { name, args } => {
+            let a: Vec<String> = args.iter().map(py_expr).collect();
+            format!("{{\"call\": \"{}\", \"args\": [{}]}}", name, a.join(", "))
         }
     }
 }
@@ -140,6 +180,7 @@ pub fn gen_agent_py(prog: &ProtocolProgram, role: &str) -> Result<String, Vec<cr
     // the runtime loop — mirrors src/runtime.rs semantics exactly
     out.push_str(
         r#"    def __init__(self):
+        self._arg = {}
         self.states = {k: None for k in self.STATES}
         self.commitment = "proposed"   # proposed -> active -> fulfilled/breached
         self.timer_due = [0] * len([h for h in self.HANDLERS if h["kind"] == "timer"])
@@ -196,6 +237,63 @@ pub fn gen_agent_py(prog: &ProtocolProgram, role: &str) -> Result<String, Vec<cr
             return self._guard(h["guard"])
         return False
 
+    def _eval(self, e):
+        if "lit" in e:
+            return e["lit"]
+        if "state" in e:
+            return self.states.get(e["state"])
+        if "arg" in e:
+            return self._arg.get(e["arg"])
+        if "not" in e:
+            return not self._truthy(self._eval(e["not"]))
+        if "op" in e:
+            l = self._eval(e["l"]); r = self._eval(e["r"])
+            op = e["op"]
+            if op == "and": return self._truthy(l) and self._truthy(r)
+            if op == "or": return self._truthy(l) or self._truthy(r)
+            # unset states behave as 0 in arithmetic (§35.1 convention)
+            if op == "add": return (l or 0) + (r or 0)
+            if op == "sub": return (l or 0) - (r or 0)
+            if op == "mul": return (l or 0) * (r or 0)
+            if op == "div": return (l or 0) // (r or 0)
+            if op == "eq": return l == r
+            if op == "ne": return l != r
+            if op == "lt": return l < r
+            if op == "le": return l <= r
+            if op == "gt": return l > r
+            if op == "ge": return l >= r
+        if "call" in e:
+            args = [self._eval(a) for a in e["args"]]
+            name = e["call"]
+            if name == "add": return (args[0] or 0) + (args[1] or 0)
+            if name == "sub": return (args[0] or 0) - (args[1] or 0)
+            if name == "mul": return (args[0] or 0) * (args[1] or 0)
+            if name == "div": return (args[0] or 0) // (args[1] or 0)
+            if name == "min": return min(args)
+            if name == "max": return max(args)
+            if name == "abs": return abs(args[0])
+            if name == "len": return len(args[0])
+            if name == "sum": return sum(args[0])
+            if name == "count": return len(args[0])
+            if name == "concat": return str(args[0]) + str(args[1])
+            if name == "upper": return str(args[0]).upper()
+            if name == "lower": return str(args[0]).lower()
+            if name == "str": return str(args[0])
+            if name == "int": return int(args[0])
+            if name == "exists": return args[0] is not None
+            if name == "first": return args[0][0]
+            if name == "last": return args[0][-1]
+            if name == "fmt":
+                raise NotImplementedError("fmt requires template support")
+        raise ValueError("bad expression: %r" % e)
+
+    def _truthy(self, v):
+        if v is None: return False
+        if isinstance(v, bool): return v
+        if isinstance(v, (int, float)): return v != 0
+        if isinstance(v, (str, list, dict)): return len(v) > 0
+        return False
+
     def _run(self, h):
         out = []
         for a in h["actions"]:
@@ -213,11 +311,47 @@ pub fn gen_agent_py(prog: &ProtocolProgram, role: &str) -> Result<String, Vec<cr
             elif a["kind"] == "retract":
                 self.states[a["target"]] = False
                 self.transcript.append(("state", "retract:" + a["target"]))
+            elif a["kind"] == "set":
+                self.states[a["name"]] = self._eval(a["expr"])
+                self.transcript.append(("state", "set:" + a["name"]))
+            elif a["kind"] == "push":
+                cur = self.states.get(a["state"])
+                if cur is None:
+                    self.states[a["state"]] = [self._eval(a["expr"])]
+                elif isinstance(cur, list):
+                    cur.append(self._eval(a["expr"]))
+                self.transcript.append(("state", "push:" + a["state"]))
+            elif a["kind"] == "put":
+                cur = self.states.get(a["state"])
+                if cur is None:
+                    self.states[a["state"]] = {}
+                if isinstance(self.states[a["state"]], dict):
+                    key = self._eval({"lit": 0, "str": a["key"]}) if False else a["key"]
+                    self.states[a["state"]][key] = self._eval(a["expr"])
+                self.transcript.append(("state", "put:" + a["state"]))
+            elif a["kind"] == "for":
+                lst = list(self.states.get(a["over"]) or [])
+                saved = self.states.get(a["var"])
+                for item in lst:
+                    self.states[a["var"]] = item
+                    for sub in a["actions"]:
+                        self._exec_one(sub)
+                if saved is None:
+                    self.states.pop(a["var"], None)
+                else:
+                    self.states[a["var"]] = saved
+            elif a["kind"] == "abort":
+                self.commitment = "breached"
+                self.transcript.append(("state", "abort"))
         return out
+
+    def _exec_one(self, a):
+        self._run({"actions": [a]})
 
     # -- public surface -----------------------------------------------
     def deliver(self, from_role, performative, pattern=None, fields=None):
         """Feed one incoming speech act; returns the outgoing ones."""
+        self._arg = fields or {}
         self.transcript.append(("in", performative, from_role))
         for h in self.HANDLERS:
             if h["kind"] == "breach" or h["kind"] == "expired":

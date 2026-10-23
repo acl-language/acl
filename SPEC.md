@@ -993,6 +993,97 @@ for the receiving role's previous turn (§16), target a declared role,
 and have a destination. Unhandled deliveries are warnings (logged,
 visible) — never silent. Replay is deterministic and bounded.
 
+## 35. Completing the language (normative)
+
+Fifteen additions that make `.aclp` a complete programming language
+for agents.
+
+### 35.1 Expressions and `set`
+
+`set <state> = <expr>;` — pure expressions over session states and the
+triggering event's fields (`arg.<field>`). Operators: `+ - * /`,
+`< <= > >= == !=`, `and or not` (precedence: not > mul > add > cmp >
+and > or). Unset states behave as 0 in arithmetic. Builtins (all pure):
+`add sub mul div min max abs len sum count concat upper lower str int
+exists first last`.
+
+### 35.2 Collections
+
+Session states gain `list` and `map` types: `state bids: list;`.
+Statements: `push <list>, <expr>;`, `put <map>, <key>, <expr>;`.
+
+### 35.3 Message templates
+
+`message <name> = "<text with {0}, {1}...>";` — named by role and
+rendered with `fmt(name, args...)`. Templates are part of the compiled
+program (code and presentation travel together).
+
+### 35.4 Abort and compensation
+
+`abort;` statement and top-level `abort when <guard>;` (checked after
+every delivery, latched — compensation runs once). Aborting marks the
+commitment breached and fires every `on breach` (compensation) handler
+of the role. Programs declare failure handling, not just happy paths.
+
+### 35.5 Declarative retry
+
+`send X to Y retry <n> backoff <dur> [exp];` — the runtime tracks
+pending sends and re-emits on host ticks; exponential doubling with
+`exp`. Exhaustion is logged in the transcript (visible, never silent).
+
+### 35.6 Capability model
+
+`use <cap> [as <alias>];` declares what the program NEEDS. The language
+itself grants no effects: a program can only speak and remember; any
+external effect goes through a declared capability that the HOST gates
+against the peer's AgentCard before the session starts.
+
+### 35.7 Session templates (multi-session)
+
+`capacity <n>;` bounds concurrent sessions. `SessionHost` multiplexes
+sessions of one program with fully isolated state per session; opening
+beyond capacity is rejected.
+
+### 35.8 Event sourcing
+
+Every delivered event is journaled (handled or not). `replay_from`
+reconstructs a host from journal + role header — byte-equivalent state,
+because the runtime is a pure function of (program, events). Crash
+recovery and full audit come from the same mechanism.
+
+### 35.9-35.11 n-role projection, transports, liveness
+
+Projection extends beyond two roles when fully attributed. `transport
+stdio|http|ws|relay;` declares the intended transport (unknown =
+compile error). Liveness analysis is unchanged but now includes the new
+action kinds.
+
+### 35.12 Scenario tests
+
+`scenario "<name>" { <role> sends <perf> [pattern] to <role>; expect
+<role> sends <perf>; expect state <role>.<name>; expect commitment
+<role> <status>; }` — executable tests inside the `.aclp` file, run on
+the deterministic runtime via `aclc scenarios`. Expected sends DELIVER
+to their target (the wire is simulated), so multi-step conversations
+are testable end-to-end.
+
+### 35.13 Protocol composition
+
+`include "<file>" [with roles (A=R1, B=R2)];` — splices a foreign
+protocol with role renaming (whole-word). Name collisions between
+merged states are compile errors.
+
+### 35.14 Standard fragments
+
+`stdlib.rs` ships reusable handler fragments (`deadline_escalation`,
+`double_confirmation`) with dedup on merge.
+
+### 35.15 Tooling
+
+`aclc scenarios <file>` runs all scenarios; `aclc trace <file.aclp>
+<journal.jsonl>` is the protocol debugger — replays a journal step by
+step and prints each role's transcript (seq, direction, text).
+
 ## 16. Dialogue rules (normative)
 
 A conversation has policy: after a given performative, only certain replies

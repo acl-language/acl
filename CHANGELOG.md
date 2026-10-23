@@ -6,6 +6,40 @@ Format based on Keep a Changelog; versions follow semver for the
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-10-23
+
+The complete programming language: computation, collections, failure
+handling, multi-session operation, event sourcing, executable tests,
+composition, and tooling. 15 additions (spec §35).
+
+### Added
+- **Expressions + `set`** (§35.1): arithmetic/comparison/logic over
+  states and event fields (`arg.x`), 18 pure builtins; unset = 0.
+- **Collections** (§35.2): `list`/`map` states with `push`/`put`.
+- **Message templates** (§35.3): `message name = "text {0}";` rendered
+  by `fmt()`.
+- **Abort + compensation** (§35.4): `abort;` statement, `abort when
+  <guard>` (latched), `on breach` handlers fire as compensation.
+- **Declarative retry** (§35.5): `send X retry 3 backoff 2s exp` —
+  deterministic re-emission via tick; exhaustion logged.
+- **Capability model** (§35.6): `use fs.read as reader;` — programs can
+  only speak and remember; external effects are host-gated.
+- **Multi-session host** (§35.7): `capacity n;`, isolated sessions,
+  capacity rejection.
+- **Event sourcing** (§35.8): journal + deterministic `replay_from`
+  reconstructs exact state (tested byte-equivalent).
+- **n-role projection / transports** (§35.9-35.11).
+- **Scenario tests** (§35.12): executable tests inside `.aclp`, run via
+  `aclc scenarios` — expected sends DELIVER to their target.
+- **Composition** (§35.13): `include "file.aclp" with roles (a=X);`.
+- **Standard fragments** (§35.14): `deadline_escalation`,
+  `double_confirmation`, dedup on merge.
+- **Tooling** (§35.15): `aclc trace` protocol debugger (step-through
+  replay with per-role transcripts).
+- **Codegen**: generated Python agents now compute (`set`/`push`/`put`/
+  `for`/`abort`) — validated by running generated code.
+- 16 new tests (**118/118**).
+
 ## [0.10.0] — 2026-10-23
 
 The programming-language layer completes: `.aclp` programs now branch on

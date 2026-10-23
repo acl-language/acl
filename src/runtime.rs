@@ -12,7 +12,7 @@
 
 use crate::dialogue::dialogue_legal;
 use crate::idl::IdlError;
-use crate::protocol::{EndWhen, Handler, OnTrigger, ProtocolAction, ProtocolProgram};
+use crate::protocol::{EndWhen, Expr, Handler, OnTrigger, ProtocolAction, ProtocolProgram};
 use crate::cl::CommitmentStatus;
 use crate::Performative;
 use std::collections::BTreeMap;
@@ -113,7 +113,7 @@ pub fn project(prog: &ProtocolProgram, role: &str) -> Result<RoleEndpoint, Vec<I
         let mut actions = Vec::new();
         for a in &h.actions {
             match a {
-                ProtocolAction::Send { performative, to, fields } => {
+                ProtocolAction::Send { performative, to, fields, retry } => {
                     // the sender is the executor; resolve the receiver
                     let target = match to {
                         Some(r) => {
@@ -142,6 +142,7 @@ pub fn project(prog: &ProtocolProgram, role: &str) -> Result<RoleEndpoint, Vec<I
                                 performative: *performative,
                                 to: Some(t),
                                 fields: fields.clone(),
+                                retry: retry.clone(),
                             });
                         }
                     }
@@ -169,6 +170,9 @@ pub enum StateValue {
     Bool(bool),
     Int(i64),
     Str(String),
+    /// §35: collections in session state
+    List(Vec<StateValue>),
+    Map(BTreeMap<String, StateValue>),
     Unset,
 }
 
@@ -198,6 +202,18 @@ pub struct OutEvent {
     pub fields: Option<BTreeMap<String, String>>,
 }
 
+/// §35.5: a send awaiting retry — driven by tick(), not by a clock.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingSend {
+    pub to: Option<String>,
+    pub performative: Performative,
+    pub fields: Option<BTreeMap<String, String>>,
+    pub attempts_left: u32,
+    pub next_due: i64,
+    pub backoff_ms: i64,
+    pub exponential: bool,
+}
+
 /// One line of the auditable transcript (§33.3).
 #[derive(Debug, Clone, PartialEq)]
 pub struct LogEntry {
@@ -217,6 +233,8 @@ pub enum Dir {
 /// lifecycle + transcript.
 pub struct Runtime {
     pub role: String,
+    /// public session id (set by SessionHost)
+    pub session: Option<String>,
     /// this role's projected view — the runtime NEVER sees handlers
     /// that belong to another role (§33.5)
     endpoint: RoleEndpoint,
@@ -230,6 +248,16 @@ pub struct Runtime {
     timer_due: Vec<i64>,
     /// §34 transcript verification: this role's last seen performative
     pub(crate) last_seen: Option<Performative>,
+    /// §35.5: sends awaiting retry
+    pending: Vec<PendingSend>,
+    /// §35.4: host-injected clock (set by tick)
+    now_ms: i64,
+    /// §35.3: message templates for fmt()
+    templates: Vec<(String, String)>,
+    /// abort latch: compensation runs once
+    aborted: bool,
+    /// §35.4: abort conditions from the program
+    abort_when: Vec<crate::protocol::Guard>,
 }
 
 impl Runtime {
@@ -269,6 +297,12 @@ impl Runtime {
                 .map(|_| 0i64)
                 .collect(),
             last_seen: None,
+            pending: Vec::new(),
+            now_ms: 0,
+            aborted: false,
+            templates: prog.templates.clone(),
+            abort_when: prog.abort_when.clone(),
+            session: None,
         })
     }
 
@@ -288,8 +322,9 @@ impl Runtime {
             let d: &str = &declared;
             let mismatch = match (d, &v) {
                 ("bool", StateValue::Bool(_)) | ("int", StateValue::Int(_)) | ("str", StateValue::Str(_)) => false,
-                ("bool", _) | ("int", _) | ("str", _) => v != StateValue::Unset,
-                _ => false, // vocabulary types: untyped in phase 34
+                ("list", StateValue::List(_)) | ("map", StateValue::Map(_)) => false,
+                ("bool", _) | ("int", _) | ("str", _) | ("list", _) | ("map", _) => v != StateValue::Unset,
+                _ => false, // vocabulary types: untyped
             };
             if mismatch {
                 self.log(
@@ -301,6 +336,84 @@ impl Runtime {
         self.states.insert(name.to_string(), v);
     }
 
+    /// §35.9: full state snapshot (for replay verification)
+    pub fn states_snapshot(&self) -> BTreeMap<String, StateValue> {
+        self.states.clone()
+    }
+
+    /// §35.1: evaluate a pure expression against state + event fields
+    fn eval(&self, e: &Expr, ev: &Event) -> Result<StateValue, String> {
+        let arg = match ev {
+            Event::In { fields, .. } => fields.clone().unwrap_or_default(),
+            _ => BTreeMap::new(),
+        };
+        let eval = |e: &Expr, s: &Runtime| -> Result<StateValue, String> { s.eval(e, ev) };
+        Ok(match e {
+            Expr::LitInt(i) => StateValue::Int(*i),
+            Expr::LitStr(s) => StateValue::Str(s.clone()),
+            Expr::LitBool(b) => StateValue::Bool(*b),
+            Expr::State(n) => self.states.get(n).cloned().unwrap_or(StateValue::Unset),
+            Expr::Arg(a) => match arg.get(a) {
+                Some(s) => StateValue::Str(s.clone()),
+                None => StateValue::Unset,
+            },
+            Expr::Not(x) => match eval(x, self)? {
+                StateValue::Bool(b) => StateValue::Bool(!b),
+                other => StateValue::Bool(!self.truthy(&other)),
+            },
+            Expr::Bin { op, l, r } => {
+                let lv = eval(l, self)?;
+                let rv = eval(r, self)?;
+                use crate::protocol::BinOp::*;
+                match op {
+                    And => StateValue::Bool(self.truthy(&lv) && self.truthy(&rv)),
+                    Or => StateValue::Bool(self.truthy(&lv) || self.truthy(&rv)),
+                    Lt | Le | Gt | Ge | Eq | Ne => {
+                        let c = compare(&lv, &rv, *op)?;
+                        StateValue::Bool(c)
+                    }
+                    Add | Sub | Mul | Div => arithmetic(&lv, &rv, *op)?,
+                }
+            }
+            Expr::Call { name, args } => {
+                let vals: Vec<StateValue> = args
+                    .iter()
+                    .map(|a| eval(a, self))
+                    .collect::<Result<_, _>>()?;
+                if name == "fmt" {
+                    // fmt(template_name, args...) — §35.3 user templates
+                    let tname = match vals.first() {
+                        Some(StateValue::Str(s)) => s.clone(),
+                        _ => return Err("fmt needs a template name".into()),
+                    };
+                    let template = self
+                        .templates
+                        .iter()
+                        .find(|(n, _)| *n == tname)
+                        .map(|(_, t)| t.clone())
+                        .ok_or_else(|| format!("no message template '{tname}'"))?;
+                    let mut out = template;
+                    for (i, v) in vals[1..].iter().enumerate() {
+                        out = out.replace(&format!("{{{i}}}"), &value_text(v));
+                    }
+                    return Ok(StateValue::Str(out));
+                }
+                builtin(name, &vals)?
+            }
+        })
+    }
+
+    fn truthy(&self, v: &StateValue) -> bool {
+        match v {
+            StateValue::Bool(b) => *b,
+            StateValue::Int(i) => *i != 0,
+            StateValue::Str(s) => !s.is_empty(),
+            StateValue::List(l) => !l.is_empty(),
+            StateValue::Map(m) => !m.is_empty(),
+            StateValue::Unset => false,
+        }
+    }
+
     /// boolean view of session state for guard evaluation (§34)
     fn bool_view(&self) -> BTreeMap<String, bool> {
         self.states
@@ -310,6 +423,8 @@ impl Runtime {
                     StateValue::Bool(b) => *b,
                     StateValue::Int(i) => *i != 0,
                     StateValue::Str(s) => !s.is_empty(),
+                    StateValue::List(l) => !l.is_empty(),
+                    StateValue::Map(m) => !m.is_empty(),
                     StateValue::Unset => false,
                 };
                 (k.clone(), b)
@@ -338,10 +453,24 @@ impl Runtime {
         if let Event::In { performative, .. } = &ev {
             self.last_seen = Some(*performative);
         }
-        match self.matching_handler(&ev) {
+        let mut out = match self.matching_handler(&ev) {
             Some(hidx) => self.run_handler(hidx, &ev),
             None => Vec::new(),
+        };
+        // §35.4: abort conditions — checked after every delivery; when a
+        // guard holds, compensation handlers run once (latched)
+        if !self.aborted {
+            let guards = self.abort_when.clone();
+            for g in guards {
+                if g.eval(&self.bool_view()) {
+                    self.log(Dir::State, "abort condition met".into());
+                    out.extend(self.run_actions(&[ProtocolAction::Abort], &ev));
+                    self.aborted = true;
+                    break;
+                }
+            }
         }
+        out
     }
 
     fn matching_handler(&self, ev: &Event) -> Option<usize> {
@@ -390,17 +519,116 @@ impl Runtime {
         let mut out = Vec::new();
         for a in &actions {
             match a {
-                ProtocolAction::Send { performative, to, fields } => {
+                ProtocolAction::Send { performative, to, fields, retry } => {
                     self.log(
                         Dir::Out,
                         format!(
-                            "send {} to {}{}",
+                            "send {} to {}{}{}",
                             perf_name(*performative),
                             to.clone().unwrap_or_default(),
-                            fields.clone().map(|f| format!(" {}", serde_json::to_string(&f).unwrap_or_default())).unwrap_or_default()
+                            fields.clone().map(|f| format!(" {}", serde_json::to_string(&f).unwrap_or_default())).unwrap_or_default(),
+                            retry.as_ref().map(|r| format!(" retry={} backoff={}ms{}", r.attempts, r.backoff_ms, if r.exponential { " exp" } else { "" })).unwrap_or_default()
                         ),
                     );
+                    if let Some(rp) = retry {
+                        self.pending.push(PendingSend {
+                            to: to.clone(),
+                            performative: *performative,
+                            fields: fields.clone(),
+                            attempts_left: rp.attempts,
+                            next_due: self.now_ms + rp.backoff_ms,
+                            backoff_ms: rp.backoff_ms,
+                            exponential: rp.exponential,
+                        });
+                    }
                     out.push(OutEvent { to: to.clone(), performative: *performative, fields: fields.clone() });
+                }
+                ProtocolAction::Set { name, expr } => match self.eval(expr, ev) {
+                    Ok(v) => {
+                        self.log(Dir::State, format!("set {} = {}", name, value_text(&v)));
+                        self.set_state(name, v);
+                    }
+                    Err(e) => self.log(Dir::State, format!("set {} failed: {}", name, e)),
+                },
+                ProtocolAction::Push { state, expr } => match self.eval(expr, ev) {
+                    Ok(v) => {
+                        let is_list = matches!(self.states.get(state), Some(StateValue::List(_)) | Some(StateValue::Unset) | None);
+                        if !is_list {
+                            let other = self.states.get(state).cloned().unwrap_or(StateValue::Unset);
+                            self.log(Dir::State, format!("push {}: not a list ({:?})", state, other));
+                            continue;
+                        }
+                        match self.states.get_mut(state) {
+                            Some(StateValue::List(l)) => l.push(v),
+                            _ => {
+                                self.states.insert(state.clone(), StateValue::List(vec![v]));
+                            }
+                        }
+                        self.log(Dir::State, format!("push {}", state));
+                    }
+                    Err(e) => self.log(Dir::State, format!("push {} failed: {}", state, e)),
+                },
+                ProtocolAction::Put { state, key, expr } => match self.eval(expr, ev) {
+                    Ok(v) => {
+                        let is_map = matches!(self.states.get(state), Some(StateValue::Map(_)) | Some(StateValue::Unset) | None);
+                        if !is_map {
+                            let other = self.states.get(state).cloned().unwrap_or(StateValue::Unset);
+                            self.log(Dir::State, format!("put {}: not a map ({:?})", state, other));
+                            continue;
+                        }
+                        match self.states.get_mut(state) {
+                            Some(StateValue::Map(m)) => {
+                                m.insert(key.clone(), v);
+                            }
+                            _ => {
+                                self.states.insert(state.clone(), StateValue::Map(BTreeMap::from([(key.clone(), v)])));
+                            }
+                        }
+                        self.log(Dir::State, format!("put {}[{}]", state, key));
+                    }
+                    Err(e) => self.log(Dir::State, format!("put {} failed: {}", state, e)),
+                },
+                ProtocolAction::For { var, over, actions } => {
+                    // iterate a SNAPSHOT (the body may mutate the list);
+                    // the loop var is a scoped state, restored after
+                    let snapshot = match self.states.get(over) {
+                        Some(StateValue::List(l)) => l.clone(),
+                        Some(other) => {
+                            self.log(Dir::State, format!("for {}: not a list ({:?})", over, other));
+                            continue;
+                        }
+                        None => continue,
+                    };
+                    let saved = self.states.get(var).cloned();
+                    self.log(Dir::State, format!("for {} in {} ({} items)", var, over, snapshot.len()));
+                    for item in snapshot {
+                        self.states.insert(var.clone(), item.clone());
+                        out.extend(self.run_actions(actions, ev));
+                    }
+                    match saved {
+                        Some(v) => {
+                            self.states.insert(var.clone(), v);
+                        }
+                        None => {
+                            self.states.remove(var);
+                        }
+                    }
+                }
+                ProtocolAction::Abort => {
+                    // §35.4: fire compensation handlers, mark breached
+                    self.log(Dir::State, "ABORT: compensation begins".into());
+                    self.commitment = CommitmentStatus::Breached;
+                    let abort_handlers: Vec<usize> = self
+                        .endpoint
+                        .handlers
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, h)| matches!(h.trigger, OnTrigger::Breach))
+                        .map(|(i, _)| i)
+                        .collect();
+                    for i in abort_handlers {
+                        out.extend(self.run_handler(i, &Event::Breach));
+                    }
                 }
                 ProtocolAction::Begin => match self.commitment {
                     CommitmentStatus::Proposed => {
@@ -430,7 +658,65 @@ impl Runtime {
                 }
             }
         }
-        let _ = ev;
+        out
+    }
+
+    /// run a list of actions (used by `for` bodies)
+    fn run_actions(&mut self, actions: &[ProtocolAction], ev: &Event) -> Vec<OutEvent> {
+        let mut out = Vec::new();
+        for a in actions {
+            match a {
+                ProtocolAction::For { .. } | ProtocolAction::Abort => {
+                    // nested for: clone through a single-handler trick is
+                    // overkill — inline recursively via a mini handler
+                    match a {
+                        ProtocolAction::For { var, over, actions } => {
+                            let snapshot = match self.states.get(over) {
+                                Some(StateValue::List(l)) => l.clone(),
+                                _ => continue,
+                            };
+                            let saved = self.states.get(var).cloned();
+                            for item in snapshot {
+                                self.states.insert(var.clone(), item.clone());
+                                out.extend(self.run_actions(actions, ev));
+                            }
+                            match saved {
+                                Some(v) => {
+                                    self.states.insert(var.clone(), v);
+                                }
+                                None => {
+                                    self.states.remove(var);
+                                }
+                            }
+                        }
+                        ProtocolAction::Abort => {
+                            self.log(Dir::State, "ABORT (nested): compensation begins".into());
+                            self.commitment = CommitmentStatus::Breached;
+                            let comp: Vec<usize> = self
+                                .endpoint
+                                .handlers
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, h)| matches!(h.trigger, OnTrigger::Breach))
+                                .map(|(i, _)| i)
+                                .collect();
+                            for i in comp {
+                                out.extend(self.run_handler(i, ev));
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                other => {
+                    // reuse run_handler's single-action logic by wrapping
+                    let h = Handler { trigger: OnTrigger::Expired, guard: None, actions: vec![other.clone()] };
+                    self.endpoint.handlers.push(h);
+                    let idx = self.endpoint.handlers.len() - 1;
+                    out.extend(self.run_handler(idx, ev));
+                    self.endpoint.handlers.pop();
+                }
+            }
+        }
         out
     }
 
@@ -464,6 +750,46 @@ impl Runtime {
                 out.extend(self.run_handler(i, &Event::Expired));
             }
         }
+        // §35.5: retry pending sends when due; exhaustion = retry dropped
+        // (logged; the caller sees only the original send)
+        self.now_ms = elapsed_ms;
+        let drained: Vec<PendingSend> = self.pending.drain(..).collect();
+        let mut still_pending = Vec::new();
+        for p in drained {
+            if p.next_due <= elapsed_ms {
+                if p.attempts_left > 1 {
+                    let backoff = if p.exponential { p.backoff_ms * 2 } else { p.backoff_ms };
+                    self.log(
+                        Dir::Out,
+                        format!(
+                            "retry {} to {} ({} left)",
+                            perf_name(p.performative),
+                            p.to.clone().unwrap_or_default(),
+                            p.attempts_left - 1
+                        ),
+                    );
+                    out.push(OutEvent { to: p.to.clone(), performative: p.performative, fields: p.fields.clone() });
+                    still_pending.push(PendingSend {
+                        attempts_left: p.attempts_left - 1,
+                        next_due: elapsed_ms + backoff,
+                        backoff_ms: backoff,
+                        ..p
+                    });
+                } else {
+                    self.log(
+                        Dir::State,
+                        format!(
+                            "retry exhausted: {} to {}",
+                            perf_name(p.performative),
+                            p.to.clone().unwrap_or_default()
+                        ),
+                    );
+                }
+            } else {
+                still_pending.push(p);
+            }
+        }
+        self.pending = still_pending;
         out
     }
 
@@ -573,6 +899,109 @@ pub fn verify_transcript(
     if errors.is_empty() { Ok(warnings) } else { Err(errors) }
 }
 
+fn compare(l: &StateValue, r: &StateValue, op: crate::protocol::BinOp) -> Result<bool, String> {
+    use crate::protocol::BinOp::*;
+    use StateValue::*;
+    let ord = match (l, r) {
+        (Int(a), Int(b)) => a.cmp(b),
+        (Str(a), Str(b)) => a.cmp(b),
+        (Bool(a), Bool(b)) => a.cmp(b),
+        _ => return Err(format!("cannot compare {l:?} with {r:?}")),
+    };
+    Ok(match op {
+        Lt => ord.is_lt(),
+        Le => ord.is_le(),
+        Gt => ord.is_gt(),
+        Ge => ord.is_ge(),
+        Eq => ord.is_eq(),
+        Ne => ord.is_ne(),
+        _ => unreachable!(),
+    })
+}
+
+fn arithmetic(l: &StateValue, r: &StateValue, op: crate::protocol::BinOp) -> Result<StateValue, String> {
+    use crate::protocol::BinOp::*;
+    // §35.1 convention: unset states behave as 0 in arithmetic
+    let zero = StateValue::Int(0);
+    let l = if matches!(l, StateValue::Unset) { &zero } else { l };
+    let r = if matches!(r, StateValue::Unset) { &zero } else { r };
+    match (l, r) {
+        (StateValue::Int(a), StateValue::Int(b)) => {
+            let v = match op {
+                Add => a + b,
+                Sub => a - b,
+                Mul => a * b,
+                Div => {
+                    if *b == 0 {
+                        return Err("division by zero".into());
+                    }
+                    a / b
+                }
+                _ => unreachable!(),
+            };
+            Ok(StateValue::Int(v))
+        }
+        (StateValue::Str(a), StateValue::Str(b)) if matches!(op, Add) => {
+            Ok(StateValue::Str(format!("{a}{b}")))
+        }
+        (StateValue::List(a), StateValue::List(b)) if matches!(op, Add) => {
+            let mut v = a.clone();
+            v.extend(b.clone());
+            Ok(StateValue::List(v))
+        }
+        _ => Err(format!("cannot apply arithmetic to {l:?}, {r:?}")),
+    }
+}
+
+fn builtin(name: &str, args: &[StateValue]) -> Result<StateValue, String> {
+    use StateValue::*;
+    match (name, args) {
+        ("add", [Int(a), Int(b)]) => Ok(Int(a + b)),
+        ("sub", [Int(a), Int(b)]) => Ok(Int(a - b)),
+        ("mul", [Int(a), Int(b)]) => Ok(Int(a * b)),
+        ("div", [Int(a), Int(b)]) if *b != 0 => Ok(Int(a / b)),
+        ("min", [Int(a), Int(b)]) => Ok(Int(*a.min(b))),
+        ("max", [Int(a), Int(b)]) => Ok(Int(*a.max(b))),
+        ("abs", [Int(a)]) => Ok(Int(a.abs())),
+        ("len", [List(l)]) => Ok(Int(l.len() as i64)),
+        ("len", [Map(m)]) => Ok(Int(m.len() as i64)),
+        ("len", [Str(s)]) => Ok(Int(s.len() as i64)),
+        ("count", [List(l)]) => Ok(Int(l.len() as i64)),
+        ("sum", [List(l)]) => Ok(Int(
+            l.iter()
+                .map(|v| match v {
+                    Int(i) => *i,
+                    _ => 0,
+                })
+                .sum(),
+        )),
+        ("concat", [Str(a), Str(b)]) => Ok(Str(format!("{a}{b}"))),
+        ("upper", [Str(s)]) => Ok(Str(s.to_uppercase())),
+        ("lower", [Str(s)]) => Ok(Str(s.to_lowercase())),
+        ("str", [v]) => Ok(Str(value_text(v))),
+        ("int", [Str(s)]) => Ok(Int(s.parse().map_err(|_| format!("'{s}' is not an int"))?)),
+        ("exists", [v]) => Ok(Bool(*v != Unset)),
+        ("first", [List(l)]) if !l.is_empty() => Ok(l[0].clone()),
+        ("last", [List(l)]) if !l.is_empty() => Ok(l[l.len() - 1].clone()),
+        _ => Err(format!("builtin '{name}' not found or bad arity ({args:?})")),
+    }
+}
+
+fn value_text(v: &StateValue) -> String {
+    match v {
+        StateValue::Bool(b) => b.to_string(),
+        StateValue::Int(i) => i.to_string(),
+        StateValue::Str(s) => s.clone(),
+        StateValue::List(_) => "<list>".into(),
+        StateValue::Map(_) => "<map>".into(),
+        StateValue::Unset => "<unset>".into(),
+    }
+}
+
+pub fn perf_name_pub(p: Performative) -> &'static str {
+    perf_name(p)
+}
+
 fn perf_name(p: Performative) -> &'static str {
     match p {
         Performative::Request => "request",
@@ -663,7 +1092,7 @@ end when fulfilled;
             .unwrap();
         assert_eq!(
             propose.actions[0],
-            ProtocolAction::Send { performative: Performative::Propose, to: Some("buyer".into()), fields: None }
+            ProtocolAction::Send { performative: Performative::Propose, to: Some("buyer".into()), fields: None , retry: None}
         );
         // pretty roundtrip of the extended grammar still works
         assert!(parse(&crate::protocol::pretty(&prog)).is_ok());
@@ -935,6 +1364,110 @@ end when fulfilled;
         // it is unhandled (warning). This documents: unhandled != illegal.
         let w = verify_transcript(&prog, &bad2).expect("unhandled is a warning, not an error");
         assert!(w.iter().any(|x| x.contains("unhandled")));
+    }
+
+    #[test]
+    fn set_expressions_and_collections() {
+        let prog = parse(
+            "protocol p v1;\nroles a, b;\nstate total: int;\nstate items: list;\nstate meta: map;\non inform from b {\n  set total = total + 5;\n  push items, arg.name;\n  put meta, \"src\", arg.name;\n}\n",
+        )
+        .unwrap();
+        let mut a = Runtime::new(&prog, "a").unwrap();
+        a.deliver(Event::In {
+            from: "b".into(),
+            performative: Performative::Inform,
+            pattern: None,
+            fields: Some(BTreeMap::from([("name".into(), "widget".into())])),
+        });
+        assert_eq!(a.state("total"), Some(&StateValue::Int(5)));
+        assert_eq!(
+            a.state("items"),
+            Some(&StateValue::List(vec![StateValue::Str("widget".into())]))
+        );
+        assert_eq!(
+            a.state("meta"),
+            Some(&StateValue::Map(BTreeMap::from([("src".into(), StateValue::Str("widget".into()))])))
+        );
+        // arithmetic + builtins
+        a.deliver(Event::In { from: "b".into(), performative: Performative::Inform, pattern: None, fields: None });
+        assert_eq!(a.state("total"), Some(&StateValue::Int(10)));
+        // second delivery pushed an Unset arg (arg.name absent) — list has 2
+        assert_eq!(a.state("items").map(|v| match v { StateValue::List(l) => l.len(), _ => 0 }), Some(2));
+    }
+
+    #[test]
+    fn for_fanout_over_collection() {
+        let prog = parse(
+            "protocol p v1;\nroles a, b;\nstate debitors: list;\non inform from b {\n  for d in debitors { send reject to b; }\n}\non reject from b -> send bye;\n",
+        )
+        .unwrap();
+        let mut a = Runtime::new(&prog, "a").unwrap();
+        a.set_state("debitors", StateValue::List(vec![
+            StateValue::Str("x".into()),
+            StateValue::Str("y".into()),
+            StateValue::Str("z".into()),
+        ]));
+        let out = a.deliver(Event::In { from: "b".into(), performative: Performative::Inform, pattern: None, fields: None });
+        // one reject PER debitor item
+        assert_eq!(out.len(), 3);
+        assert!(out.iter().all(|o| o.performative == Performative::Reject));
+        // loop var restored
+        assert_eq!(a.state("d"), None.or(None));
+        assert_eq!(a.states_snapshot().get("d"), None);
+    }
+
+    #[test]
+    fn retry_via_tick() {
+        let prog = parse(
+            "protocol p v1;\nroles a, b;\non query from b -> send inform to b retry 3 backoff 10s;\non inform from b -> send bye;\n",
+        )
+        .unwrap();
+        let mut a = Runtime::new(&prog, "a").unwrap();
+        let out = a.deliver(Event::In { from: "b".into(), performative: Performative::Query, pattern: None, fields: None });
+        assert_eq!(out.len(), 1);
+        // first retry at t=10s
+        assert!(a.tick(9_999).is_empty());
+        let r1 = a.tick(10_000);
+        assert_eq!(r1.len(), 1);
+        assert!(a.tick(15_000).is_empty());
+        let r2 = a.tick(20_000);
+        assert_eq!(r2.len(), 1);
+        // exhausted: no more retries
+        assert!(a.tick(90_000).is_empty());
+        assert!(a.transcript().iter().any(|e| e.text.contains("retry exhausted")));
+    }
+
+    #[test]
+    fn abort_statement_runs_compensation_and_breaches() {
+        let prog = parse(
+            "protocol p v1;\nroles a, b;\non accept from b {\n  abort;\n}\non breach -> send failure to b;\n",
+        )
+        .unwrap();
+        let mut a = Runtime::new(&prog, "a").unwrap();
+        let out = a.deliver(Event::In { from: "b".into(), performative: Performative::Accept, pattern: None, fields: None });
+        // abort fired the breach (compensation) handler
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].performative, Performative::Failure);
+        assert_eq!(a.commitment(), crate::cl::CommitmentStatus::Breached);
+        assert!(a.transcript().iter().any(|e| e.text.contains("ABORT")));
+    }
+
+    #[test]
+    fn abort_when_guard_triggers_compensation() {
+        let prog = parse(
+            "protocol p v1;\nroles a, b;\nstate quoted: bool;\nstate paid: bool;\nabort when quoted and not paid;\non accept from b -> begin;\non breach -> send failure to b;\n",
+        )
+        .unwrap();
+        let mut a = Runtime::new(&prog, "a").unwrap();
+        // quoted=true, paid=false → abort condition holds after any delivery
+        a.set_state("quoted", StateValue::Bool(true));
+        let out = a.deliver(Event::In { from: "b".into(), performative: Performative::Accept, pattern: None, fields: None });
+        // begin ran, then compensation fired
+        assert_eq!(a.commitment(), crate::cl::CommitmentStatus::Breached);
+        assert!(out.iter().any(|o| o.performative == Performative::Failure));
+        // abort latched: no second compensation
+        let out2 = a.deliver(Event::In { from: "b".into(), performative: Performative::Accept, pattern: None, fields: None });
+        assert!(!out2.iter().any(|o| o.performative == Performative::Failure));
     }
 
     #[test]

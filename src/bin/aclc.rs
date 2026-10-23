@@ -57,12 +57,132 @@ fn main() {
                                             acl_core::protocol::ProtocolAction::Begin => "begin".into(),
                                             acl_core::protocol::ProtocolAction::Fulfil => "fulfil".into(),
                                             acl_core::protocol::ProtocolAction::Retract { target } => format!("retract({target})"),
+                                            acl_core::protocol::ProtocolAction::Set { name, .. } => format!("set {name}"),
+                                            acl_core::protocol::ProtocolAction::Push { state, .. } => format!("push {state}"),
+                                            acl_core::protocol::ProtocolAction::Put { state, key, .. } => format!("put {state}[{key}]"),
+                                            acl_core::protocol::ProtocolAction::For { var, over, .. } => format!("for {var} in {over}"),
+                                            acl_core::protocol::ProtocolAction::Abort => "abort".into(),
                                         }).collect();
                                         println!("    on {} -> {}", t, a.join("; "));
                                     }
                                 }
                             }
                         }
+                    }
+                }
+            }
+            std::process::exit(if failed { 1 } else { 0 });
+        }
+        "scenarios" => {
+            // §35.12: run every scenario in the program (deterministic)
+            let mut failed = false;
+            for f in files {
+                let src = std::fs::read_to_string(f).unwrap_or_else(|e| {
+                    eprintln!("aclc: cannot read {f}: {e}");
+                    std::process::exit(2);
+                });
+                match acl_core::protocol::parse(&src) {
+                    Err(errors) => {
+                        failed = true;
+                        for e in errors { eprintln!("{f}:{e}"); }
+                    }
+                    Ok(prog) => {
+                        let (passed, failures) = acl_core::scenario::run_all(&prog);
+                        for name in &passed {
+                            println!("{f}: scenario '{}' PASS", name);
+                        }
+                        for (name, errors) in &failures {
+                            failed = true;
+                            println!("{f}: scenario '{}' FAIL", name);
+                            for e in errors {
+                                eprintln!("    {e}");
+                            }
+                        }
+                        if prog.scenarios.is_empty() {
+                            println!("{f}: (no scenarios declared)");
+                        }
+                    }
+                }
+            }
+            std::process::exit(if failed { 1 } else { 0 });
+        }
+        "trace" => {
+            // §35.15: protocol debugger — replay a journal step by step.
+            // journal file: one JSON event per line:
+            //   {"role":"seller","from":"buyer","performative":"request"}
+            let mut failed = false;
+            for pair in files.chunks(2) {
+                if pair.len() < 2 {
+                    eprintln!("usage: aclc trace <file.aclp> <journal.jsonl>");
+                    std::process::exit(2);
+                }
+                let (f, jf) = (&pair[0], &pair[1]);
+                let src = std::fs::read_to_string(f).unwrap_or_else(|e| {
+                    eprintln!("aclc: cannot read {f}: {e}");
+                    std::process::exit(2);
+                });
+                let journal_src = std::fs::read_to_string(jf).unwrap_or_else(|e| {
+                    eprintln!("aclc: cannot read {jf}: {e}");
+                    std::process::exit(2);
+                });
+                let prog = match acl_core::protocol::parse(&src) {
+                    Ok(p) => p,
+                    Err(errors) => {
+                        failed = true;
+                        for e in errors { eprintln!("{f}:{e}"); }
+                        continue;
+                    }
+                };
+                // parse journal lines
+                let mut events: Vec<(String, acl_core::runtime::Event)> = Vec::new();
+                let mut roles: Vec<(String, String)> = Vec::new();
+                for (n, line) in journal_src.lines().enumerate() {
+                    if line.trim().is_empty() { continue; }
+                    let v: serde_json::Value = match serde_json::from_str(line) {
+                        Ok(v) => v,
+                        Err(e) => { eprintln!("{jf}:{n}: {e}"); failed = true; continue; }
+                    };
+                    if let Some(mode) = v.get("open") {
+                        roles.push((v["session"].as_str().unwrap_or("s").into(), mode.as_str().unwrap_or("buyer").into()));
+                        continue;
+                    }
+                    let perf = v["performative"].as_str().unwrap_or("inform");
+                    let perf = match perf {
+                        "request" => acl_core::Performative::Request,
+                        "inform" => acl_core::Performative::Inform,
+                        "query" => acl_core::Performative::Query,
+                        "propose" => acl_core::Performative::Propose,
+                        "accept" => acl_core::Performative::Accept,
+                        "reject" => acl_core::Performative::Reject,
+                        "progress" => acl_core::Performative::Progress,
+                        "failure" => acl_core::Performative::Failure,
+                        "error" => acl_core::Performative::Error,
+                        "bye" => acl_core::Performative::Bye,
+                        _ => acl_core::Performative::Inform,
+                    };
+                    events.push((
+                        v["session"].as_str().unwrap_or("s").to_string(),
+                        acl_core::runtime::Event::In {
+                            from: v["from"].as_str().unwrap_or("peer").to_string(),
+                            performative: perf,
+                            pattern: v["pattern"].as_str().map(|s| s.to_string()),
+                            fields: v["fields"].as_object().map(|o| o.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string())).collect()),
+                        },
+                    ));
+                }
+                match acl_core::session::SessionHost::replay_from(&prog, &roles, &events) {
+                    Ok(host) => {
+                        println!("{f}: replayed {} events across {} sessions", events.len(), host.session_count());
+                        for (id, rt) in host.sessions_iter() {
+                            println!("  session {id} (role {}): commitment={:?}, {} transcript entries", rt.role, rt.commitment(), rt.transcript().len());
+                            for e in rt.transcript() {
+                                println!("    {:>3} {:?} {}", e.seq, e.dir, e.text);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        failed = true;
+                        eprintln!("{f}: replay failed: {e}");
                     }
                 }
             }

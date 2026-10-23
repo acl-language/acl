@@ -307,7 +307,7 @@ pub enum Step {
     Parallel(Vec<String>),
 }
 
-fn valid_type_name(s: &str) -> bool {
+pub(crate) fn valid_type_name(s: &str) -> bool {
     !s.is_empty()
         && s.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false)
         && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')

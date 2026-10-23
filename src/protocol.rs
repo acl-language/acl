@@ -40,13 +40,33 @@ pub enum OnTrigger {
 pub enum ProtocolAction {
     /// `send propose to seller` — MUST be dialogue-legal for the trigger;
     /// `to` names the receiving role (defaults to the counterpart)
-    Send { performative: Performative, to: Option<String>, fields: Option<BTreeMap<String, String>> },
+    Send { performative: Performative, to: Option<String>, fields: Option<BTreeMap<String, String>>, retry: Option<Retry> },
     /// `begin` — activate the pending commitment (proposed -> active)
     Begin,
     /// `fulfil` — mark the commitment fulfilled (active -> fulfilled)
     Fulfil,
     /// `retract(fact_name)` — belief revision as a statement (§32.1)
     Retract { target: String },
+    /// §35.1: `set <state> = <expr>;`
+    Set { name: String, expr: Expr },
+    /// §35.2: `push <state>, <expr>;` — append to a list state
+    Push { state: String, expr: Expr },
+    /// §35.2: `put <state>, <key>, <expr>;` — set a map entry
+    Put { state: String, key: String, expr: Expr },
+    /// §35.3: `for <var> in <list_state> { ... }` — fan-out over a collection
+    For { var: String, over: String, actions: Vec<ProtocolAction> },
+    /// §35.4: `abort;` — trigger compensation handlers immediately
+    Abort,
+}
+
+/// §35.5: retry policy on sends — declarative, driven by the runtime's
+/// own deterministic timers (no clock).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Retry {
+    pub attempts: u32,
+    pub backoff_ms: i64,
+    /// exponential (double) backoff between attempts
+    pub exponential: bool,
 }
 
 /// §34: guard — boolean expression over session states, evaluated at
@@ -123,6 +143,220 @@ pub struct Handler {
     pub guard: Option<Guard>,
     pub actions: Vec<ProtocolAction>,
 }
+/// §35: expression language for `set` — pure functions over session
+/// state and the triggering event's fields. No I/O, no clock: the only
+/// effects a program can cause are speech acts (§35.6).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Expr {
+    LitInt(i64),
+    LitStr(String),
+    LitBool(bool),
+    State(String),
+    /// `arg.price` — field of the triggering event's structured payload
+    Arg(String),
+    Bin { op: BinOp, l: Box<Expr>, r: Box<Expr> },
+    Not(Box<Expr>),
+    /// builtin pure functions: add sub mul div min max len sum count
+    /// concat upper lower str int exists abs
+    Call { name: String, args: Vec<Expr> },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BinOp {
+    Add, Sub, Mul, Div,
+    Lt, Le, Gt, Ge, Eq, Ne,
+    And, Or,
+}
+
+impl Expr {
+    /// parse one expression string (recursive descent, real tokenizer)
+    pub fn parse_expr(src: &str) -> Result<Expr, String> {
+        #[derive(Debug, Clone, PartialEq)]
+        enum Tok {
+            Word(String),
+            Int(i64),
+            Str(String),
+            Op(&'static str),
+        }
+        fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
+            let mut toks = Vec::new();
+            let cs: Vec<char> = src.chars().collect();
+            let mut i = 0;
+            while i < cs.len() {
+                let c = cs[i];
+                if c.is_whitespace() { i += 1; continue; }
+                if c == '"' {
+                    let mut j = i + 1;
+                    while j < cs.len() && cs[j] != '"' { j += 1; }
+                    if j >= cs.len() { return Err("unterminated string".into()); }
+                    toks.push(Tok::Str(cs[i + 1..j].iter().collect()));
+                    i = j + 1;
+                    continue;
+                }
+                if c.is_ascii_digit() {
+                    let mut j = i;
+                    while j < cs.len() && cs[j].is_ascii_digit() { j += 1; }
+                    toks.push(Tok::Int(cs[i..j].iter().collect::<String>().parse().map_err(|_| "bad int")?));
+                    i = j;
+                    continue;
+                }
+                if c.is_alphabetic() || c == '_' {
+                    let mut j = i;
+                    while j < cs.len() && (cs[j].is_alphanumeric() || cs[j] == '_' || cs[j] == '.') { j += 1; }
+                    toks.push(Tok::Word(cs[i..j].iter().collect()));
+                    i = j;
+                    continue;
+                }
+                if i + 1 < cs.len() {
+                    let two: String = cs[i..i + 2].iter().collect();
+                    let op = match two.as_str() {
+                        "<=" => "<=", ">=" => ">=", "==" => "==", "!=" => "!=",
+                        _ => "",
+                    };
+                    if !op.is_empty() {
+                        toks.push(Tok::Op(match op { "<=" => "<=", ">=" => ">=", "==" => "==", _ => "!=" }));
+                        i += 2;
+                        continue;
+                    }
+                }
+                let one = match c {
+                    '+' => "+", '-' => "-", '*' => "*", '/' => "/",
+                    '<' => "<", '>' => ">", '(' => "(", ')' => ")",
+                    ',' => ",",
+                    _ => return Err(format!("bad char '{c}' in expression")),
+                };
+                toks.push(Tok::Op(one));
+                i += 1;
+            }
+            Ok(toks)
+        }
+        struct P {
+            toks: Vec<Tok>,
+            pos: usize,
+        }
+        impl P {
+            fn peek(&self) -> Option<&Tok> { self.toks.get(self.pos) }
+            fn next(&mut self) -> Option<Tok> { let t = self.peek().cloned(); self.pos += 1; t }
+            fn atom(&mut self) -> Result<Expr, String> {
+                match self.next() {
+                    Some(Tok::Int(i)) => Ok(Expr::LitInt(i)),
+                    Some(Tok::Str(s)) => Ok(Expr::LitStr(s)),
+                    Some(Tok::Word(w)) => match w.as_str() {
+                        "true" => Ok(Expr::LitBool(true)),
+                        "false" => Ok(Expr::LitBool(false)),
+                        "not" => Ok(Expr::Not(Box::new(self.atom_add()?))),
+                        _ if w.starts_with("arg.") => Ok(Expr::Arg(w[4..].to_string())),
+                        _ if self.peek().map_or(false, |t| matches!(t, Tok::Op("("))) => {
+                            // function call
+                            self.next(); // consume (
+                            let mut args = Vec::new();
+                            if self.peek().map_or(false, |t| matches!(t, Tok::Op(")"))) {
+                                self.next();
+                            } else {
+                                loop {
+                                    args.push(self.expr()?);
+                                    match self.next() {
+                                        Some(Tok::Op(",")) => continue,
+                                        Some(Tok::Op(")")) => break,
+                                        other => return Err(format!("bad call syntax near {other:?}")),
+                                    }
+                                }
+                            }
+                            Ok(Expr::Call { name: w, args })
+                        }
+                        _ if w.chars().all(|c| c.is_alphanumeric() || c == '_')
+                            && w.chars().next().map_or(false, |c| c.is_alphabetic() || c == '_') =>
+                        {
+                            Ok(Expr::State(w))
+                        }
+                        _ => Err(format!("bad token '{w}'")),
+                    },
+                    Some(Tok::Op("(")) => {
+                        let e = self.expr()?;
+                        if self.next().map_or(false, |t| matches!(t, Tok::Op(")"))) {
+                            Ok(e)
+                        } else {
+                            Err("missing ')'".into())
+                        }
+                    },
+                    Some(Tok::Op("-")) => match self.atom()? {
+                        Expr::LitInt(i) => Ok(Expr::LitInt(-i)),
+                        other => Err(format!("cannot negate {other:?}")),
+                    },
+                    other => Err(format!("unexpected {other:?}")),
+                }
+            }
+            fn atom_mul(&mut self) -> Result<Expr, String> {
+                let mut l = self.atom()?;
+                loop {
+                    let op = match self.peek() {
+                        Some(Tok::Op("*")) => BinOp::Mul,
+                        Some(Tok::Op("/")) => BinOp::Div,
+                        _ => break,
+                    };
+                    self.next();
+                    let r = self.atom()?;
+                    l = Expr::Bin { op, l: Box::new(l), r: Box::new(r) };
+                }
+                Ok(l)
+            }
+            fn atom_add(&mut self) -> Result<Expr, String> {
+                let mut l = self.atom_mul()?;
+                loop {
+                    let op = match self.peek() {
+                        Some(Tok::Op("+")) => BinOp::Add,
+                        Some(Tok::Op("-")) => BinOp::Sub,
+                        _ => break,
+                    };
+                    self.next();
+                    let r = self.atom_mul()?;
+                    l = Expr::Bin { op, l: Box::new(l), r: Box::new(r) };
+                }
+                Ok(l)
+            }
+            fn atom_cmp(&mut self) -> Result<Expr, String> {
+                let l = self.atom_add()?;
+                let op = match self.peek() {
+                    Some(Tok::Op("<=")) => BinOp::Le,
+                    Some(Tok::Op(">=")) => BinOp::Ge,
+                    Some(Tok::Op("==")) => BinOp::Eq,
+                    Some(Tok::Op("!=")) => BinOp::Ne,
+                    Some(Tok::Op("<")) => BinOp::Lt,
+                    Some(Tok::Op(">")) => BinOp::Gt,
+                    _ => return Ok(l),
+                };
+                self.next();
+                let r = self.atom_add()?;
+                Ok(Expr::Bin { op, l: Box::new(l), r: Box::new(r) })
+            }
+            fn atom_and(&mut self) -> Result<Expr, String> {
+                let mut l = self.atom_cmp()?;
+                while self.peek().map_or(false, |t| matches!(t, Tok::Word(w) if w == "and")) {
+                    self.next();
+                    let r = self.atom_cmp()?;
+                    l = Expr::Bin { op: BinOp::And, l: Box::new(l), r: Box::new(r) };
+                }
+                Ok(l)
+            }
+            fn expr(&mut self) -> Result<Expr, String> {
+                let mut l = self.atom_and()?;
+                while self.peek().map_or(false, |t| matches!(t, Tok::Word(w) if w == "or")) {
+                    self.next();
+                    let r = self.atom_and()?;
+                    l = Expr::Bin { op: BinOp::Or, l: Box::new(l), r: Box::new(r) };
+                }
+                Ok(l)
+            }
+        }
+        let mut p = P { toks: tokenize(src)?, pos: 0 };
+        let e = p.expr()?;
+        if p.pos != p.toks.len() {
+            return Err(format!("trailing tokens in expression '{src}'"));
+        }
+        Ok(e)
+    }
+}
+
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum EndWhen {
@@ -140,6 +374,44 @@ pub struct ProtocolProgram {
     pub states: Vec<StateDecl>,
     pub handlers: Vec<Handler>,
     pub end_when: Option<EndWhen>,
+    /// §35.6: capabilities this program requires (host-gated)
+    pub capabilities: Vec<CapabilityDecl>,
+    /// §35.11: declared transport hint (stdio|http|ws|relay)
+    pub transport: Option<String>,
+    /// §35.8: max concurrent sessions (capacity model)
+    pub capacity: Option<usize>,
+    /// §35.4: abort conditions — when one becomes true, compensation runs
+    pub abort_when: Vec<Guard>,
+    /// §35.12: executable scenarios (protocol tests)
+    pub scenarios: Vec<Scenario>,
+    /// §35.3: user-defined message templates `message name = "text";`
+    pub templates: Vec<(String, String)>,
+}
+
+/// §35.6: capability declaration — the ONLY door to external effects.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CapabilityDecl {
+    pub name: String,
+    pub alias: Option<String>,
+}
+
+/// §35.12: scenario — an executable test inside the .aclp file.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Scenario {
+    pub name: String,
+    pub steps: Vec<ScenarioStep>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ScenarioStep {
+    /// `<role> sends <perf> [pattern] to <role>;`
+    Send { from: String, performative: Performative, pattern: Option<String>, to: String },
+    /// `expect <role> sends <perf>;`
+    ExpectSend { from: String, performative: Performative },
+    /// `expect state <role>.<name>;` (true) / `== false`
+    ExpectState { role: String, name: String, value: bool },
+    /// `expect commitment <role> <status>;`
+    ExpectCommitment { role: String, status: String },
 }
 
 impl Handler {
@@ -200,11 +472,59 @@ fn split_trigger(head: &str) -> (String, Option<String>, Option<String>) {
     (word, pattern, from)
 }
 
+/// §35.13: parse with `include "file" with roles (a=X, b=Y);` support —
+/// the include is loaded relative to `base_dir`, roles renamed
+/// whole-word, and spliced in place of the include line.
+pub fn parse_with_includes(src: &str, base_dir: Option<&str>) -> Result<ProtocolProgram, Vec<IdlError>> {
+    let mut out_lines: Vec<String> = Vec::new();
+    let mut include_errors: Vec<String> = Vec::new();
+    for raw in src.lines() {
+        let trimmed = raw.trim();
+        if let Some(rest) = trimmed.strip_prefix("include ") {
+            let body = rest.trim_end_matches(';');
+            // include "path" [with roles (X=R1, Y=R2)]
+            let (path_part, mapping) = match body.find(" with roles ") {
+                Some(i) => {
+                    let map_src = body[i + " with roles ".len()..]
+                        .trim()
+                        .trim_start_matches('(')
+                        .trim_end_matches(')');
+                    let mapping: Vec<(String, String)> = map_src
+                        .split(',')
+                        .filter_map(|p| {
+                            let p = p.trim();
+                            p.split_once('=')
+                                .map(|(a, b)| (b.trim().to_string(), a.trim().to_string()))
+                        })
+                        .collect();
+                    (body[..i].trim(), mapping)
+                }
+                None => (body.trim(), Vec::new()),
+            };
+            let path = path_part.trim().trim_matches('"').trim_matches('\'');
+            match expand_include(path, &mapping, base_dir) {
+                Ok(text) => out_lines.extend(text.lines().map(|l| l.to_string())),
+                Err(e) => include_errors.push(e),
+            }
+        } else {
+            out_lines.push(raw.to_string());
+        }
+    }
+    if !include_errors.is_empty() {
+        return Err(include_errors
+            .into_iter()
+            .map(|m| IdlError { line: 0, message: m })
+            .collect());
+    }
+    parse(&out_lines.join("\n"))
+}
+
 pub fn parse(src: &str) -> Result<ProtocolProgram, Vec<IdlError>> {
     let mut errors = Vec::new();
     let mut prog = ProtocolProgram::default();
     let mut seen_protocol = false;
     let mut handler: Option<Handler> = None;
+    let mut scenario: Option<Scenario> = None;
 
     for (idx, raw) in src.lines().enumerate() {
         let line_no = idx + 1;
@@ -227,6 +547,14 @@ pub fn parse(src: &str) -> Result<ProtocolProgram, Vec<IdlError>> {
                     errors.push(IdlError { line: line_no, message: "empty handler block".into() });
                 }
                 prog.handlers.push(handler.take().unwrap());
+                continue;
+            }
+            // §35.3: inline for-block: `for x in list { act; act; }`
+            if line.starts_with("for ") && line.ends_with('}') {
+                match parse_for_block(line) {
+                    Ok(a) => h.actions.push(a),
+                    Err(e) => errors.push(IdlError { line: line_no, message: e }),
+                }
                 continue;
             }
             let action = match parse_action(line) {
@@ -366,8 +694,97 @@ pub fn parse(src: &str) -> Result<ProtocolProgram, Vec<IdlError>> {
                 prog.handlers.push(h);
             } else if line.ends_with('{') {
                 handler = Some(h);
+            } else if line.contains('{') && line.ends_with('}') {
+                // inline block: `on X { act; act; }`
+                let body = &line[line.find('{').unwrap() + 1..line.len() - 1];
+                for stmt in body.split(';') {
+                    if stmt.trim().is_empty() {
+                        continue;
+                    }
+                    match parse_action(stmt.trim()) {
+                        Ok(a) => h.actions.push(a),
+                        Err(e) => {
+                            errors.push(IdlError { line: line_no, message: e });
+                            break;
+                        }
+                    }
+                }
+                if !h.actions.is_empty() {
+                    prog.handlers.push(h);
+                }
             } else {
                 errors.push(IdlError { line: line_no, message: format!("malformed handler: '{line}' (want 'on <event> -> <action>;' or 'on <event> {{')") });
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("message ") {
+            let body = rest.trim_end_matches(';').trim();
+            match body.split_once('=') {
+                Some((name, text)) => {
+                    let name = name.trim().to_string();
+                    let text = text.trim().trim_matches('"').to_string();
+                    if name.is_empty() || text.is_empty() {
+                        errors.push(IdlError { line: line_no, message: format!("bad message template: '{line}'") });
+                    } else {
+                        prog.templates.push((name, text));
+                    }
+                }
+                None => errors.push(IdlError { line: line_no, message: format!("bad message template: '{line}' (want 'message name = \"text\";')") }),
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("use ") {
+            let body = rest.trim_end_matches(';').trim();
+            let (name, alias) = match body.split_once(" as ") {
+                Some((n, a)) => (n.trim().to_string(), Some(a.trim().to_string())),
+                None => (body.to_string(), None),
+            };
+            prog.capabilities.push(CapabilityDecl { name, alias });
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("transport ") {
+            let t = rest.trim_end_matches(';').trim().to_string();
+            if !["stdio", "http", "ws", "relay"].contains(&t.as_str()) {
+                errors.push(IdlError {
+                    line: line_no,
+                    message: format!("unknown transport '{t}' (want stdio|http|ws|relay)"),
+                });
+            }
+            prog.transport = Some(t);
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("capacity ") {
+            match rest.trim_end_matches(';').trim().parse::<usize>() {
+                Ok(n) if n > 0 => prog.capacity = Some(n),
+                _ => errors.push(IdlError { line: line_no, message: format!("bad capacity: '{line}'") }),
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("abort when ") {
+            match parse_guard(rest.trim_end_matches(';').trim()) {
+                Ok(g) => prog.abort_when.push(g),
+                Err(e) => errors.push(IdlError { line: line_no, message: format!("bad abort guard: {e}") }),
+            }
+            continue;
+        }
+        if line.starts_with("scenario ") && line.ends_with('{') {
+            scenario = Some(Scenario {
+                name: line[8..line.len() - 1].trim().trim_matches('"').to_string(),
+                steps: Vec::new(),
+            });
+            continue;
+        }
+        if let Some(sc) = scenario.as_mut() {
+            if line == "}" {
+                if sc.steps.is_empty() {
+                    errors.push(IdlError { line: line_no, message: "empty scenario".into() });
+                }
+                prog.scenarios.push(scenario.take().unwrap());
+                continue;
+            }
+            match parse_scenario_step(line) {
+                Ok(st) => sc.steps.push(st),
+                Err(e) => errors.push(IdlError { line: line_no, message: e }),
             }
             continue;
         }
@@ -388,6 +805,9 @@ pub fn parse(src: &str) -> Result<ProtocolProgram, Vec<IdlError>> {
     if handler.is_some() {
         errors.push(IdlError { line: 0, message: "unterminated handler block (missing '}')".into() });
     }
+    if scenario.is_some() {
+        errors.push(IdlError { line: 0, message: "unterminated scenario block".into() });
+    }
     if !seen_protocol {
         errors.push(IdlError { line: 0, message: "missing 'protocol <name> v1;' declaration".into() });
     }
@@ -407,6 +827,87 @@ fn parse_trigger(head: &str) -> Result<OnTrigger, String> {
             None => Err(format!("unknown trigger '{word}'")),
         },
     }
+}
+
+/// §35.3: `for x in list { send inform to x; set done = true; }`
+fn parse_for_block(line: &str) -> Result<ProtocolAction, String> {
+    let inner = line
+        .strip_prefix("for ")
+        .ok_or("not a for")?
+        .trim_end_matches('}')
+        .trim();
+    let (head, body) = inner
+        .split_once('{')
+        .ok_or("for needs a block")?;
+    let (var, over) = head
+        .trim()
+        .split_once(" in ")
+        .ok_or("for needs 'for var in list'")?;
+    let actions: Vec<ProtocolAction> = body
+        .split(';')
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| parse_action(p.trim()))
+        .collect::<Result<_, _>>()?;
+    Ok(ProtocolAction::For {
+        var: var.trim().to_string(),
+        over: over.trim().to_string(),
+        actions,
+    })
+}
+
+/// §35.12: one scenario step
+fn parse_scenario_step(line: &str) -> Result<ScenarioStep, String> {
+    let s = line.trim().trim_end_matches(';').trim();
+    if let Some(rest) = s.strip_prefix("expect ") {
+        if let Some(rest) = rest.strip_prefix("state ") {
+            // expect state <role>.<name> [== <bool>]
+            let (ref_part, val) = match rest.split_once("==") {
+                Some((a, b)) => (a.trim(), b.trim() == "true"),
+                None => (rest, true),
+            };
+            let (role, name) = ref_part
+                .split_once('.')
+                .ok_or("expect state needs role.name")?;
+            return Ok(ScenarioStep::ExpectState {
+                role: role.trim().to_string(),
+                name: name.trim().to_string(),
+                value: val,
+            });
+        }
+        if let Some(rest) = rest.strip_prefix("commitment ") {
+            let (role, status) = rest
+                .split_once(' ')
+                .ok_or("expect commitment needs role status")?;
+            return Ok(ScenarioStep::ExpectCommitment {
+                role: role.trim().to_string(),
+                status: status.trim().to_string(),
+            });
+        }
+        // expect <role> sends <perf>
+        let (role, perf) = rest
+            .split_once(" sends ")
+            .ok_or("expect sends needs 'role sends perf'")?;
+        let p = perf_from_word(perf.trim()).ok_or(format!("unknown performative '{perf}'"))?;
+        return Ok(ScenarioStep::ExpectSend { from: role.trim().to_string(), performative: p });
+    }
+    // <role> sends <perf> [pattern] to <role>
+    let (head, to) = s.split_once(" to ").ok_or("scenario send needs 'to <role>'")?;
+    let (from, rest) = head
+        .split_once(" sends ")
+        .ok_or("scenario step must be 'X sends Y to Z' or 'expect ...'")?;
+    let rest = rest.trim();
+    // peel an optional pattern: `request("q")` or `request {...}`
+    let (perf_word, pattern) = match rest.find(|c| c == '(' || c == '{') {
+        Some(i) => (rest[..i].trim(), Some(rest[i..].to_string())),
+        None => (rest, None),
+    };
+    let p = perf_from_word(perf_word).ok_or(format!("unknown performative '{perf_word}'"))?;
+    Ok(ScenarioStep::Send {
+        from: from.trim().to_string(),
+        performative: p,
+        pattern,
+        to: to.trim().to_string(),
+    })
 }
 
 fn parse_duration(spec: &str) -> Option<i64> {
@@ -436,7 +937,61 @@ fn parse_action(stmt: &str) -> Result<ProtocolAction, String> {
         }
         return Ok(ProtocolAction::Retract { target: target.trim_matches('"').to_string() });
     }
+    if let Some(rest) = s.strip_prefix("set ") {
+        let (name, expr) = rest
+            .split_once('=')
+            .ok_or_else(|| format!("bad set: '{s}' (want 'set x = expr')"))?;
+        let expr = Expr::parse_expr(expr.trim())?;
+        return Ok(ProtocolAction::Set { name: name.trim().to_string(), expr });
+    }
+    if let Some(rest) = s.strip_prefix("push ") {
+        let parts: Vec<&str> = rest.splitn(2, ',').collect();
+        if parts.len() != 2 {
+            return Err(format!("bad push: '{s}' (want 'push list, expr')"));
+        }
+        let expr = Expr::parse_expr(parts[1].trim())?;
+        return Ok(ProtocolAction::Push { state: parts[0].trim().to_string(), expr });
+    }
+    if let Some(rest) = s.strip_prefix("put ") {
+        let parts: Vec<&str> = rest.splitn(3, ',').collect();
+        if parts.len() != 3 {
+            return Err(format!("bad put: '{s}' (want 'put map, key, expr')"));
+        }
+        let expr = Expr::parse_expr(parts[2].trim())?;
+        return Ok(ProtocolAction::Put {
+            state: parts[0].trim().to_string(),
+            key: parts[1].trim().trim_matches('"').to_string(),
+            expr,
+        });
+    }
+    if s == "abort" {
+        return Ok(ProtocolAction::Abort);
+    }
     if let Some(rest) = s.strip_prefix("send ") {
+        // peel retry clause first: `retry 3 backoff 2s exp`
+        let (rest, retry) = match rest.find(" retry ") {
+            Some(i) => {
+                let clause = rest[i..].trim();
+                let head = rest[..i].trim();
+                // parse: retry N backoff D [exp]
+                let parts: Vec<&str> = clause.split_whitespace().collect();
+                let retry = match parts.as_slice() {
+                    ["retry", n, "backoff", d] => Retry {
+                        attempts: n.parse().map_err(|_| "bad retry count")?,
+                        backoff_ms: parse_duration(d).ok_or("bad backoff duration")?,
+                        exponential: false,
+                    },
+                    ["retry", n, "backoff", d, "exp"] => Retry {
+                        attempts: n.parse().map_err(|_| "bad retry count")?,
+                        backoff_ms: parse_duration(d).ok_or("bad backoff duration")?,
+                        exponential: true,
+                    },
+                    _ => return Err(format!("bad retry clause: '{clause}' (want 'retry N backoff D [exp]')")),
+                };
+                (head, Some(retry))
+            }
+            None => (rest, None),
+        };
         let (rest, to) = match rest.find(" to ") {
             Some(i) => (rest[..i].trim(), Some(rest[i + 4..].trim().to_string())),
             None => (rest, None),
@@ -453,7 +1008,7 @@ fn parse_action(stmt: &str) -> Result<ProtocolAction, String> {
         };
         let word = rest.split(|c: char| c == '(' || c == ' ' || c == '{').next().unwrap_or(rest);
         return match perf_from_word(word.trim()) {
-            Some(p) => Ok(ProtocolAction::Send { performative: p, to, fields }),
+            Some(p) => Ok(ProtocolAction::Send { performative: p, to, fields, retry }),
             None => Err(format!("unknown performative in send: '{word}'")),
         };
     }
@@ -680,6 +1235,37 @@ pub fn check(prog: &ProtocolProgram) -> Result<Vec<String>, Vec<IdlError>> {
         }
     }
 
+    // ---- §35: set/push/put/for targets must be declared states ----
+    for h in &prog.handlers {
+        for a in &h.actions {
+            match a {
+                ProtocolAction::Set { name, .. } | ProtocolAction::Push { state: name, .. }
+                | ProtocolAction::Put { state: name, .. } => {
+                    if !prog.states.iter().any(|st| &st.name == name) {
+                        errors.push(IdlError {
+                            line: 0,
+                            message: format!("'{name}' is not a declared state (set/push/put)"),
+                        });
+                    }
+                }
+                ProtocolAction::For { var, over, .. } => {
+                    if !prog.states.iter().any(|st| &st.name == over) {
+                        errors.push(IdlError {
+                            line: 0,
+                            message: format!("for over '{over}': not a declared state"),
+                        });
+                    }
+                    if !prog.states.iter().any(|st| &st.name == var) && !var.starts_with('$') {
+                        warnings.push(format!(
+                            "for var '{var}' is not a declared state — it is scoped to the loop"
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     // ---- §34: LIVENESS — every handler can reach a terminal action ----
     // terminal: a handler containing `fulfil`, or one whose send is a
     // session-ender (bye/reject/error). Edges: handler -> handlers that
@@ -842,7 +1428,7 @@ fn guard_word(g: &Guard) -> String {
 
 fn action_word(a: &ProtocolAction) -> String {
     match a {
-        ProtocolAction::Send { performative, to, fields } => {
+        ProtocolAction::Send { performative, to, fields, .. } => {
             let mut out = match to {
                 Some(r) => format!("send {} to {}", perf_word(performative), r),
                 None => format!("send {}", perf_word(performative)),
@@ -855,6 +1441,37 @@ fn action_word(a: &ProtocolAction) -> String {
         ProtocolAction::Begin => "begin".into(),
         ProtocolAction::Fulfil => "fulfil".into(),
         ProtocolAction::Retract { target } => format!("retract({target})"),
+        ProtocolAction::Set { name, expr } => format!("set {} = {}", name, expr_word(expr)),
+        ProtocolAction::Push { state, expr } => format!("push {}, {}", state, expr_word(expr)),
+        ProtocolAction::Put { state, key, expr } => format!("put {}, {}, {}", state, key, expr_word(expr)),
+        ProtocolAction::For { var, over, actions } => {
+            let inner: Vec<String> = actions.iter().map(|a| action_word(a)).collect();
+            format!("for {} in {} {{ {} }}", var, over, inner.join("; "))
+        }
+        ProtocolAction::Abort => "abort".into(),
+    }
+}
+
+fn expr_word(e: &Expr) -> String {
+    match e {
+        Expr::LitInt(i) => i.to_string(),
+        Expr::LitStr(s) => format!("\"{s}\""),
+        Expr::LitBool(b) => b.to_string(),
+        Expr::State(n) => n.clone(),
+        Expr::Arg(a) => format!("arg.{a}"),
+        Expr::Bin { op, l, r } => {
+            let o = match op {
+                BinOp::Add => "+", BinOp::Sub => "-", BinOp::Mul => "*", BinOp::Div => "/",
+                BinOp::Lt => "<", BinOp::Le => "<=", BinOp::Gt => ">", BinOp::Ge => ">=",
+                BinOp::Eq => "==", BinOp::Ne => "!=", BinOp::And => "and", BinOp::Or => "or",
+            };
+            format!("{} {} {}", expr_word(l), o, expr_word(r))
+        }
+        Expr::Not(x) => format!("not {}", expr_word(x)),
+        Expr::Call { name, args } => {
+            let a: Vec<String> = args.iter().map(expr_word).collect();
+            format!("{}({})", name, a.join(", "))
+        }
     }
 }
 
@@ -1102,10 +1719,161 @@ on progress from a -> send bye;
     }
 
     #[test]
+    fn computation_statements_parse_and_check() {
+        let src = r#"
+protocol p v1;
+roles a, b;
+state total: int;
+state bids: list;
+state idx: int;
+on request from b {
+  set total = total + 1;
+  push bids, arg.price;
+  put idx, "last", total;
+  for x in bids { set total = total + len(bids); }
+}
+on inform from b -> send bye;
+"#;
+        let p = parse(src).expect("computation statements parse");
+        check(&p).expect("targets declared");
+    }
+
+    #[test]
+    fn set_undeclared_state_is_error() {
+        let bad = parse("protocol p v1;\nroles a,b;\non query from a { set nope = 1; }\non inform from b -> send bye;\n").unwrap();
+        let errs = check(&bad).unwrap_err();
+        assert!(errs.iter().any(|e| e.message.contains("'nope' is not a declared state")));
+    }
+
+    #[test]
+    fn retry_clause_parses() {
+        let src = "protocol p v1;\nroles a, b;\non query from a -> send inform to a retry 3 backoff 2s exp;\non inform from b -> send bye;\n";
+        let p = parse(src).unwrap();
+        match &p.handlers[0].actions[0] {
+            ProtocolAction::Send { retry: Some(r), .. } => {
+                assert_eq!(r.attempts, 3);
+                assert_eq!(r.backoff_ms, 2000);
+                assert!(r.exponential);
+            }
+            other => panic!("expected retry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn capabilities_transport_capacity_parse() {
+        let src = r#"
+protocol p v1;
+roles a, b;
+use fs.read as reader;
+use net.http;
+transport relay;
+capacity 5;
+on query from a -> send inform to a;
+on inform from b -> send bye;
+"#;
+        let p = parse(src).unwrap();
+        assert_eq!(p.capabilities.len(), 2);
+        assert_eq!(p.capabilities[0].alias.as_deref(), Some("reader"));
+        assert_eq!(p.transport.as_deref(), Some("relay"));
+        assert_eq!(p.capacity, Some(5));
+        check(&p).expect("ok");
+        // unknown transport
+        assert!(parse("protocol p v1;\nroles a,b;\ntransport carrier_pigeon;\non query from a -> send inform to a;\non inform from b -> send bye;\n").is_err());
+        assert!(parse("protocol p v1;\nroles a,b;\ntransport pigeon;\non query from a -> send inform to a;\non inform from b -> send bye;\n").is_err());
+    }
+
+    #[test]
+    fn abort_when_and_abort_statement_parse() {
+        let src = r#"
+protocol p v1;
+roles a, b;
+state quoted: bool;
+state paid: bool;
+abort when quoted and not paid;
+on request from b -> send propose to b;
+on accept from b {
+  abort;
+}
+on propose from a -> send bye;
+"#;
+        let p = parse(src).unwrap();
+        assert_eq!(p.abort_when.len(), 1);
+        assert!(p.handlers.iter().any(|h| h.actions.iter().any(|a| matches!(a, ProtocolAction::Abort))));
+        check(&p).expect("ok");
+    }
+
+    #[test]
+    fn scenarios_parse() {
+        let src = r#"
+protocol p v1;
+roles a, b;
+on query from a -> send inform to a;
+on inform from b -> send bye;
+
+scenario "q&a" {
+  a sends query to b;
+  expect b sends inform;
+  expect a sends bye;
+}
+"#;
+        let p = parse(src).unwrap();
+        assert_eq!(p.scenarios.len(), 1);
+        assert_eq!(p.scenarios[0].name, "q&a");
+        assert_eq!(p.scenarios[0].steps.len(), 3);
+    }
+
+    #[test]
+    fn message_templates_parse() {
+        let src = "protocol p v1;\nroles a,b;\nmessage invoice = \"INVOICE {0} for {1}\";\non query from a -> send inform to a;\non inform from b -> send bye;\n";
+        let p = parse(src).unwrap();
+        assert_eq!(p.templates, vec![("invoice".into(), "INVOICE {0} for {1}".into())]);
+    }
+
+    #[test]
     fn unterminated_block_and_missing_protocol() {
         assert!(parse("on query -> send inform;").is_err());
         assert!(parse("protocol p v1;\nroles a;\non query {").is_err());
         let e = parse("roles a;").unwrap_err();
         assert!(e.iter().any(|x| x.message.contains("missing 'protocol")));
     }
+}
+
+/// expand an include: load `path` (relative to `base_dir`), rename roles
+/// per mapping (whole-word), return its text.
+fn expand_include(path: &str, mapping: &[(String, String)], base_dir: Option<&str>) -> Result<String, String> {
+    let full = match base_dir {
+        Some(d) => format!("{d}/{path}"),
+        None => path.to_string(),
+    };
+    let text = std::fs::read_to_string(&full)
+        .map_err(|e| format!("include '{path}': {e}"))?;
+    let mut out = text;
+    for (from, to) in mapping {
+        // whole-word rename
+        let pattern = format!(r"\b{}\b", regex_escape(from));
+        out = regex_replace(&out, &pattern, to);
+    }
+    Ok(out)
+}
+
+fn regex_escape(s: &str) -> String {
+    s.chars().map(|c| if c.is_alphanumeric() || c == '_' { c.to_string() } else { format!("\\{c}") }).collect()
+}
+
+fn regex_replace(text: &str, pattern: &str, replacement: &str) -> String {
+    // minimal whole-word replacer: split on non-word chars, rebuild
+    let word = pattern.trim_start_matches(r"\b").trim_end_matches(r"\b");
+    let mut out = String::new();
+    let mut cur = String::new();
+    for c in text.chars() {
+        if c.is_alphanumeric() || c == '_' {
+            cur.push(c);
+        } else {
+            out.push_str(if cur == word { replacement } else { &cur });
+            out.push(c);
+            cur.clear();
+        }
+    }
+    out.push_str(if cur == word { replacement } else { &cur });
+    out
 }
