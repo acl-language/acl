@@ -130,6 +130,11 @@ fn body_from_py(body: &Bound<'_, PyAny>) -> PyResult<Body> {
             }),
             until_ms: opt_json("until_ms")?.and_then(|x| x.as_i64()),
         }),
+        "KeyRotation" => Ok(Body::KeyRotation {
+            new_did: s("new_did")?,
+            valid_from_ms: opt_json("valid_from_ms")?.and_then(|x| x.as_i64()).unwrap_or(0),
+            reason: opt_s("reason")?,
+        }),
         "Unsubscribe" => Ok(Body::Unsubscribe {
             target_msg_id: s("target_msg_id")?,
         }),
@@ -234,6 +239,14 @@ fn body_to_py(py: Python<'_>, b: &Body) -> PyObject {
             vec![
                 ("watch", serde_json::to_value(watch.as_ref()).map(|v| json_to_py(py, &v)).unwrap_or(py.None())),
                 ("until_ms", until_ms.map(|x| x.into_pyobject(py).unwrap().unbind().into()).unwrap_or(py.None())),
+            ],
+        ),
+        Body::KeyRotation { new_did, valid_from_ms, reason } => (
+            "KeyRotation",
+            vec![
+                ("new_did", new_did.to_string().into_pyobject(py).unwrap().unbind().into()),
+                ("valid_from_ms", valid_from_ms.into_pyobject(py).unwrap().unbind().into()),
+                ("reason", reason.as_deref().map(|r| r.into_pyobject(py).unwrap().unbind().into()).unwrap_or(py.None())),
             ],
         ),
         Body::Unsubscribe { target_msg_id } => (

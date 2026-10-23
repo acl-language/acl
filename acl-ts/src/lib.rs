@@ -324,6 +324,7 @@ fn body_to_json(b: &Body) -> serde_json::Value {
             let w = serde_json::to_value(watch.as_ref()).unwrap_or(serde_json::Value::Null);
             ("Subscribe", serde_json::json!({ "watch": w, "until_ms": until_ms }))
         }
+        Body::KeyRotation { new_did, valid_from_ms, reason } => ("KeyRotation", serde_json::json!({ "new_did": new_did, "valid_from_ms": valid_from_ms, "reason": reason })),
         Body::Unsubscribe { target_msg_id } => ("Unsubscribe", serde_json::json!({ "target_msg_id": target_msg_id })),
         Body::Delegate { chain, .. } => ("Delegate", serde_json::json!({ "chain": chain })),
     };
