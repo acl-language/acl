@@ -75,6 +75,18 @@ pub fn semantics(p: Performative) -> PerformativeSemantics {
             "FP(bye): sender has no pending obligations in this session",
             "RE(bye): session is closed; further messages require a new session",
         ),
+        Retract => (
+            "FP(retract): sender previously asserted proposition(p) and now believes it false or inapplicable",
+            "RE(retract): receiver no longer holds proposition(p) as asserted by sender",
+        ),
+        Subscribe => (
+            "FP(subscribe): sender wants to be informed of changes to proposition(p) until deadline",
+            "RE(subscribe): receiver will push inform messages matching the matcher",
+        ),
+        Unsubscribe => (
+            "FP(unsubscribe): sender no longer wants the referenced subscription",
+            "RE(unsubscribe): receiver stops pushing for that subscription",
+        ),
     };
     PerformativeSemantics { performative: p, feasibility_precondition: fp, rational_effect: re }
 }

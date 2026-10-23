@@ -21,11 +21,13 @@ fn body_to_value(b: &Body) -> serde_json::Value {
         Body::Progress { target_msg_id, percent, note } => serde_json::json!({ "k": "Progress", "t": target_msg_id, "p": percent, "n": note }),
         Body::InputNeeded { target_msg_id, what, schema } => serde_json::json!({ "k": "InputNeeded", "t": target_msg_id, "w": what, "s": schema }),
         Body::Failure { target_msg_id, code, reason, recoverable } => serde_json::json!({ "k": "Failure", "t": target_msg_id, "c": code, "r": reason, "rec": recoverable }),
-        Body::Error { code, message, details } => serde_json::json!({ "k": "Error", "c": code, "m": message, "d": details }),
+        Body::Error { code, message, taxonomy, details } => serde_json::json!({ "k": "Error", "c": code, "m": message, "t": taxonomy, "d": details }),
         Body::Hello { nonce, .. } => serde_json::json!({ "k": "Hello", "n": nonce }),
         Body::Sealed { ciphertext, .. } => serde_json::json!({ "k": "Sealed", "c": ciphertext }),
         Body::Delegate { chain, .. } => serde_json::json!({ "k": "Delegate", "c": chain }),
         Body::Cl { expressions } => serde_json::json!({ "k": "Cl", "e": expressions }),
+        Body::Subscribe { watch, until_ms } => serde_json::json!({ "k": "Subscribe", "w": watch, "u": until_ms }),
+        Body::Unsubscribe { target_msg_id } => serde_json::json!({ "k": "Unsubscribe", "t": target_msg_id }),
     }
 }
 

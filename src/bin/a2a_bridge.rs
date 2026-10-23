@@ -54,7 +54,8 @@ fn main() {
                     Ok(v) => v,
                     Err(e) => {
                         eprintln!("[a2a-bridge] a2a parse: {e}: {resp}");
-                        let err = Body::Error { code: 502, message: "a2a unreachable".into(), details: None };
+                        let err = Body::Error {
+ code: 502, message: "a2a unreachable".into(), taxonomy: None, details: None };
                         let mut out = Envelope::new(my_aid.clone(), env.from.clone(), Performative::Error, err);
                         out.in_reply_to = Some(env.msg_id.clone());
                         out.sign(&key).expect("sign");
@@ -113,7 +114,8 @@ fn main() {
             }
             _ => (
                 Performative::Error,
-                Body::Error { code: 400, message: "bridge supports request/Task and query/agent.card".into(), details: None },
+                Body::Error {
+ code: 400, message: "bridge supports request/Task and query/agent.card".into(), taxonomy: None, details: None },
             ),
         };
 

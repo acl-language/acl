@@ -100,6 +100,7 @@ fn body_from_py(body: &Bound<'_, PyAny>) -> PyResult<Body> {
         "Error" => Ok(Body::Error {
             code: opt_json("code")?.and_then(|x| x.as_u64().map(|x| x as u16)).unwrap_or(400),
             message: s("message")?,
+            taxonomy: None,
             details: opt_json("details")?,
         }),
         "Hello" => Ok(Body::Hello {
@@ -118,6 +119,20 @@ fn body_from_py(body: &Bound<'_, PyAny>) -> PyResult<Body> {
                 .map_err(|e| PyValueError::new_err(format!("bad CL expressions: {e}")))?;
             Ok(Body::Cl { expressions: exprs })
         }
+        "Subscribe" => Ok(Body::Subscribe {
+            watch: Box::new(match opt_field("watch")? {
+                Some(w) => {
+                    let jv = py_to_json(&w)?;
+                    serde_json::from_value(jv)
+                        .map_err(|e| PyValueError::new_err(format!("bad matcher: {e}")))?
+                }
+                None => return Err(PyValueError::new_err("subscribe requires 'watch'")),
+            }),
+            until_ms: opt_json("until_ms")?.and_then(|x| x.as_i64()),
+        }),
+        "Unsubscribe" => Ok(Body::Unsubscribe {
+            target_msg_id: s("target_msg_id")?,
+        }),
         other => Err(PyValueError::new_err(format!("unknown body kind {other}"))),
     }
 }
@@ -185,11 +200,12 @@ fn body_to_py(py: Python<'_>, b: &Body) -> PyObject {
                 ("recoverable", recoverable.into_pyobject(py).unwrap().to_owned().unbind().into()),
             ],
         ),
-        Body::Error { code, message, details } => (
+        Body::Error { code, message, taxonomy, details } => (
             "Error",
             vec![
                 ("code", (*code).into_pyobject(py).unwrap().unbind().into()),
                 ("message", st(message)),
+                ("taxonomy", taxonomy.map(|x| json_to_py(py, &serde_json::to_value(x).unwrap_or(serde_json::Value::Null))).unwrap_or(py.None())),
                 ("details", details.as_ref().map(|x| json_to_py(py, x)).unwrap_or(py.None())),
             ],
         ),
@@ -213,6 +229,17 @@ fn body_to_py(py: Python<'_>, b: &Body) -> PyObject {
             let val = serde_json::to_value(expressions).unwrap_or(serde_json::Value::Null);
             ("Cl", vec![("expressions", json_to_py(py, &val))])
         }
+        Body::Subscribe { watch, until_ms } => (
+            "Subscribe",
+            vec![
+                ("watch", serde_json::to_value(watch.as_ref()).map(|v| json_to_py(py, &v)).unwrap_or(py.None())),
+                ("until_ms", until_ms.map(|x| x.into_pyobject(py).unwrap().unbind().into()).unwrap_or(py.None())),
+            ],
+        ),
+        Body::Unsubscribe { target_msg_id } => (
+            "Unsubscribe",
+            vec![("target_msg_id", target_msg_id.to_string().into_pyobject(py).unwrap().unbind().into())],
+        ),
     };
     d.set_item("t", t).unwrap();
     let vd = PyDict::new(py);
@@ -239,6 +266,9 @@ fn perf_from_str(name: &str) -> PyResult<Performative> {
         "error" => Performative::Error,
         "hello" => Performative::Hello,
         "bye" => Performative::Bye,
+        "retract" => Performative::Retract,
+        "subscribe" => Performative::Subscribe,
+        "unsubscribe" => Performative::Unsubscribe,
         _ => return Err(PyValueError::new_err(format!("unknown performative {name}"))),
     })
 }
@@ -259,6 +289,9 @@ fn perf_name(p: Performative) -> &'static str {
         Performative::Error => "error",
         Performative::Hello => "hello",
         Performative::Bye => "bye",
+        Performative::Retract => "retract",
+        Performative::Subscribe => "subscribe",
+        Performative::Unsubscribe => "unsubscribe",
     }
 }
 

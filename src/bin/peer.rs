@@ -215,11 +215,11 @@ fn main() {
             (Performative::Query, Body::Cl { expressions }) => {
                 if let Some(v) = validate_cl(expressions) {
                     Some(mk(&my_aid, &env, Performative::Error, Body::Error {
-                        code: 422, message: format!("schema violation: {v}"), details: None,
+ code: 422, message: format!("schema violation: {v}"), taxonomy: None, details: None,
                     }))
                 } else if let Err(e) = well_formed(env.performative, expressions) {
                     Some(mk(&my_aid, &env, Performative::Error, Body::Error {
-                        code: 422, message: format!("ill-formed CL: {e}"), details: None,
+ code: 422, message: format!("ill-formed CL: {e}"), taxonomy: None, details: None,
                     }))
                 } else {
                     let mut facts: Vec<ClExpr> = Vec::new();
@@ -248,7 +248,7 @@ fn main() {
                     }
                     if facts.is_empty() {
                         Some(mk(&my_aid, &env, Performative::Error, Body::Error {
-                            code: 404, message: "no known predicate in query".into(), details: None,
+ code: 404, message: "no known predicate in query".into(), taxonomy: None, details: None,
                         }))
                     } else {
                         Some(mk(&my_aid, &env, Performative::Inform, Body::Cl { expressions: facts }))
@@ -258,11 +258,11 @@ fn main() {
             (Performative::Request, Body::Cl { expressions }) => {
                 if let Some(v) = validate_cl(expressions) {
                     Some(mk(&my_aid, &env, Performative::Error, Body::Error {
-                        code: 422, message: format!("schema violation: {v}"), details: None,
+ code: 422, message: format!("schema violation: {v}"), taxonomy: None, details: None,
                     }))
                 } else if let Err(e) = well_formed(env.performative, expressions) {
                     Some(mk(&my_aid, &env, Performative::Error, Body::Error {
-                        code: 422, message: format!("ill-formed CL: {e}"), details: None,
+ code: 422, message: format!("ill-formed CL: {e}"), taxonomy: None, details: None,
                     }))
                 } else {
                     let mut results: Vec<ClExpr> = Vec::new();
@@ -281,11 +281,11 @@ fn main() {
                     }
                     if let Some(u) = unknown {
                         Some(mk(&my_aid, &env, Performative::Error, Body::Error {
-                            code: 400, message: format!("unknown action '{u}'"), details: None,
+ code: 400, message: format!("unknown action '{u}'"), taxonomy: None, details: None,
                         }))
                     } else if results.is_empty() {
                         Some(mk(&my_aid, &env, Performative::Error, Body::Error {
-                            code: 400, message: "no actions executed".into(), details: None,
+ code: 400, message: "no actions executed".into(), taxonomy: None, details: None,
                         }))
                     } else {
                         Some(mk(&my_aid, &env, Performative::Inform, Body::Cl { expressions: results }))
@@ -301,6 +301,7 @@ fn main() {
                 Body::Error {
                     code: 400,
                     message: format!("unexpected {:?}", env.performative),
+                    taxonomy: None,
                     details: None,
                 },
             )),

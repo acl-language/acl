@@ -46,6 +46,12 @@ pub enum Performative {
     Error = 12,
     Hello = 13,
     Bye = 14,
+    /// §32: retract a prior inform/fact (belief revision)
+    Retract = 15,
+    /// §32: ongoing interest in a predicate (push instead of poll)
+    Subscribe = 16,
+    /// §32: cancel a prior subscription
+    Unsubscribe = 17,
 }
 
 /// Artifact attached to a `Result` body.
@@ -56,6 +62,20 @@ pub struct Artifact {
     /// Raw bytes, encoded as msgpack bin on the wire.
     #[serde(with = "serde_bytes")]
     pub bytes: Vec<u8>,
+}
+
+/// §32: structured error taxonomy — machine-actionable failure kinds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorKind {
+    UnknownPredicate,
+    SchemaViolation,
+    MailboxFull,
+    RateLimited,
+    Unauthorized,
+    UnknownAgent,
+    DecodeFailed,
+    Expired,
 }
 
 /// Body variants (spec §6).
@@ -115,6 +135,9 @@ pub enum Body {
     Error {
         code: u16,
         message: String,
+        /// §32: machine-actionable failure kind (replaces string parsing)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        taxonomy: Option<ErrorKind>,
         #[serde(skip_serializing_if = "Option::is_none")]
         details: Option<serde_json::Value>,
     },
@@ -138,6 +161,25 @@ pub enum Body {
     Cl {
         expressions: Vec<crate::cl::ClExpr>,
     },
+    /// §32: ongoing interest — watch a declarative matcher until `until_ms`.
+    #[serde(rename = "subscribe")]
+    Subscribe { watch: Box<crate::Matcher>, until_ms: Option<i64> },
+    /// §32: cancel a prior subscription.
+    #[serde(rename = "unsubscribe")]
+    Unsubscribe { target_msg_id: String },
+}
+
+/// §32: declarative message matcher — the filter construct that
+/// subscriptions and routers share.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Matcher {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub performative: Option<Performative>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// predicate name the body must reference (fact/query/action/commitment)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predicate: Option<String>,
 }
 
 // ---------------------------------------------------------------- identity
@@ -463,7 +505,8 @@ mod tests {
             (Performative::Progress, Body::Progress { target_msg_id: "abc".into(), percent: Some(50), note: Some("halfway".into()) }),
             (Performative::InputRequired, Body::InputNeeded { target_msg_id: "abc".into(), what: "missing column".into(), schema: None }),
             (Performative::Failure, Body::Failure { target_msg_id: "abc".into(), code: 500, reason: "no data".into(), recoverable: false }),
-            (Performative::Error, Body::Error { code: 400, message: "bad".into(), details: None }),
+            (Performative::Error, Body::Error {
+ code: 400, message: "bad".into(), taxonomy: None, details: None }),
             (Performative::Hello, Body::Hello { agent_card: None, card_hash: None, nonce: vec![7u8; 16] }),
             (Performative::Bye, Body::Ref { target_msg_id: "abc".into() }),
             (Performative::Delegate, Body::Delegate { task: Box::new(Body::Task { description: "sub".into(), input: serde_json::json!(null), deadline_ms: None, priority: None }), chain: vec!["did:example:a".into(), "did:example:b".into()] }),

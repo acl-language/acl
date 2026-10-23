@@ -4,3 +4,5 @@ tests/interop/.venv
 *.so
 *.key
 __pycache__/
+acl-ts/target
+**/target/

@@ -127,9 +127,7 @@ fn main() {
                 }
             }
             _ => Body::Error {
-                code: 400,
-                message: "bridge supports request/Task and query/agent.card".into(),
-                details: None,
+ code: 400, message: "bridge supports request/Task and query/agent.card".into(), taxonomy: None, details: None,
             },
         };
 

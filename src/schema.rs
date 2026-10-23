@@ -147,6 +147,22 @@ impl RuntimeSchema {
             ClExpr::Believes { fact, .. } => self.validate(fact),
             // §29: renew targets a prior message — nothing to validate here
             ClExpr::Renew { .. } => Ok(()),
+            // §32: conditional commitment validates its condition + act
+            ClExpr::ConditionalCommitment { condition, act, .. } => {
+                self.validate(condition)?;
+                self.validate(&ClExpr::Action {
+                    name: act.name.clone(),
+                    params: act.params.clone(),
+                    result_schema: act.result_schema.clone(),
+                })
+            }
+            // §32: preference criteria are policy facts — validated
+            ClExpr::Prefer { criteria } => {
+                for c in criteria {
+                    self.validate(c)?;
+                }
+                Ok(())
+            }
         }
     }
 
@@ -188,16 +204,16 @@ fn collect_dep_warnings(
     namespace: &str,
     out: &mut Vec<String>,
 ) {
-    let mut check_term = |term: &str| {
+    fn check_term(term: &str, deprecated: &BTreeMap<String, String>, out: &mut Vec<String>) {
         if let Some(reason) = deprecated.get(term) {
             out.push(format!("{term} is deprecated: {reason}"));
         }
-    };
+    }
     match e {
-        ClExpr::Fact { predicate, .. } => check_term(predicate),
-        ClExpr::Action { name, .. } => check_term(name),
-        ClExpr::Query { predicate, .. } => check_term(predicate),
-        ClExpr::Commitment { act, .. } => check_term(&act.name),
+        ClExpr::Fact { predicate, .. } => check_term(predicate, deprecated, out),
+        ClExpr::Action { name, .. } => check_term(name, deprecated, out),
+        ClExpr::Query { predicate, .. } => check_term(predicate, deprecated, out),
+        ClExpr::Commitment { act, .. } => check_term(&act.name, deprecated, out),
         ClExpr::And { exprs } | ClExpr::Or { exprs } => {
             for sub in exprs {
                 collect_dep_warnings(sub, deprecated, namespace, out);
@@ -213,6 +229,15 @@ fn collect_dep_warnings(
         }
         ClExpr::Believes { fact, .. } => {
             collect_dep_warnings(fact, deprecated, namespace, out)
+        }
+        ClExpr::ConditionalCommitment { condition, act, .. } => {
+            collect_dep_warnings(condition, deprecated, namespace, out);
+            check_term(&act.name, deprecated, out);
+        }
+        ClExpr::Prefer { criteria } => {
+            for c in criteria {
+                collect_dep_warnings(c, deprecated, namespace, out);
+            }
         }
         ClExpr::Renew { .. } | ClExpr::RefExpr { .. } => {}
     }

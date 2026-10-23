@@ -29,7 +29,7 @@ pub fn fact_to_jsonld(
     assertor: &str,
 ) -> Result<Value, String> {
     let (predicate, args, truth, modality, provenance, confidence, valid_until_ms) = match expr {
-        ClExpr::Fact { predicate, args, truth, derived_from: _, modality, provenance, confidence, valid_until_ms } => {
+        ClExpr::Fact { predicate, args, truth, derived_from: _, supersedes: _, modality, provenance, confidence, valid_until_ms } => {
             (predicate, args, truth, modality, provenance, confidence, valid_until_ms)
         }
         other => return Err(format!("fact_to_jsonld expects a Fact, got {other:?}")),
@@ -120,6 +120,7 @@ mod tests {
             args: BTreeMap::from([("path".into(), ClValue::Str("/tmp/x".into()))]),
             truth: true,
             derived_from: None,
+            supersedes: None,
             modality: None,
             provenance: None,
             confidence: None,

@@ -104,9 +104,7 @@ fn handle(mut stream: TcpStream, key: &SigningKey) {
                     }
                 }
                 _ => Body::Error {
-                    code: 400,
-                    message: "expected request/Task".into(),
-                    details: None,
+ code: 400, message: "expected request/Task".into(), taxonomy: None, details: None,
                 },
             };
             let mut out = Envelope::new(my_aid, env.from.clone(), Performative::Inform, reply_body);

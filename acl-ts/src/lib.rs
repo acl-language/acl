@@ -192,6 +192,9 @@ fn perf_from_str(name: &str) -> Result<Performative> {
         "error" => Performative::Error,
         "hello" => Performative::Hello,
         "bye" => Performative::Bye,
+        "retract" => Performative::Retract,
+        "subscribe" => Performative::Subscribe,
+        "unsubscribe" => Performative::Unsubscribe,
         _ => return Err(Error::new(Status::InvalidArg, format!("unknown performative {name}"))),
     })
 }
@@ -212,6 +215,9 @@ fn perf_name(p: Performative) -> &'static str {
         Performative::Error => "error",
         Performative::Hello => "hello",
         Performative::Bye => "bye",
+        Performative::Retract => "retract",
+        Performative::Subscribe => "subscribe",
+        Performative::Unsubscribe => "unsubscribe",
     }
 }
 
@@ -261,6 +267,7 @@ fn json_to_body(v: &serde_json::Value) -> Option<Body> {
         "Error" => Body::Error {
             code: opt_num("code").map(|x| x as u16).unwrap_or(400),
             message: s("message")?,
+            taxonomy: None,
             details: f.get("details").cloned(),
         },
         "Hello" => Body::Hello {
@@ -306,13 +313,18 @@ fn body_to_json(b: &Body) -> serde_json::Value {
         Body::Progress { target_msg_id, percent, note } => ("Progress", serde_json::json!({ "target_msg_id": target_msg_id, "percent": percent, "note": note })),
         Body::InputNeeded { target_msg_id, what, schema } => ("InputNeeded", serde_json::json!({ "target_msg_id": target_msg_id, "what": what, "schema": schema })),
         Body::Failure { target_msg_id, code, reason, recoverable } => ("Failure", serde_json::json!({ "target_msg_id": target_msg_id, "code": code, "reason": reason, "recoverable": recoverable })),
-        Body::Error { code, message, details } => ("Error", serde_json::json!({ "code": code, "message": message, "details": details })),
+        Body::Error { code, message, taxonomy, details } => ("Error", serde_json::json!({ "code": code, "message": message, "taxonomy": taxonomy, "details": details })),
         Body::Hello { nonce, .. } => ("Hello", serde_json::json!({ "nonce": nonce })),
         Body::Sealed { .. } => ("Sealed", serde_json::json!({})),
         Body::Cl { expressions } => {
             let v = serde_json::to_value(expressions).unwrap_or(serde_json::Value::Null);
             ("Cl", serde_json::json!({ "expressions": v }))
         }
+        Body::Subscribe { watch, until_ms } => {
+            let w = serde_json::to_value(watch.as_ref()).unwrap_or(serde_json::Value::Null);
+            ("Subscribe", serde_json::json!({ "watch": w, "until_ms": until_ms }))
+        }
+        Body::Unsubscribe { target_msg_id } => ("Unsubscribe", serde_json::json!({ "target_msg_id": target_msg_id })),
         Body::Delegate { chain, .. } => ("Delegate", serde_json::json!({ "chain": chain })),
     };
     serde_json::json!({ "t": t, "v": v })

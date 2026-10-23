@@ -118,7 +118,8 @@ fn serve(mut stream: std::net::TcpStream, key: &SigningKey, my_aid: &Aid) -> std
                     artifacts: vec![],
                 }
             }
-            _ => Body::Error { code: 400, message: "expected request/Task".into(), details: None },
+            _ => Body::Error {
+ code: 400, message: "expected request/Task".into(), taxonomy: None, details: None },
         };
         let mut out = Envelope::new(my_aid.clone(), env.from.clone(), Performative::Inform, reply_body);
         out.in_reply_to = Some(env.msg_id.clone());

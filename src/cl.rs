@@ -31,6 +31,9 @@ pub enum ClValue {
     List(Vec<ClValue>),
     Map(BTreeMap<String, ClValue>),
     Bytes(Vec<u8>),
+    /// §32: value with unit of measure — `{"$measured": {"value": v,
+    /// "unit": "ms"}}`. Prevents the classic inter-agent unit confusion.
+    Measured { value: Box<ClValue>, unit: String },
 }
 
 impl ClValue {
@@ -44,6 +47,7 @@ impl ClValue {
             ClValue::List(_) => "list",
             ClValue::Map(_) => "map",
             ClValue::Bytes(_) => "bytes",
+            ClValue::Measured { .. } => "measured",
         }
     }
 
@@ -105,6 +109,15 @@ impl Serialize for ClValue {
                 sm.end()
             }
             ClValue::Bytes(b) => serializer.serialize_bytes(b),
+            ClValue::Measured { value, unit } => {
+                use serde::ser::SerializeMap;
+                let mut m = serializer.serialize_map(Some(1))?;
+                m.serialize_entry(
+                    "$measured",
+                    &serde_json::json!({"value": value, "unit": unit}),
+                )?;
+                m.end()
+            }
         }
     }
 }
@@ -117,6 +130,17 @@ impl<'de> Deserialize<'de> for ClValue {
             if o.len() == 1 {
                 if let Some(name) = o.get("$var").and_then(|x| x.as_str()) {
                     return Ok(ClValue::Var(name.to_string()));
+                }
+                if let Some(m) = o.get("$measured").and_then(|x| x.as_object()) {
+                    let raw_value = m.get("value").cloned().unwrap_or(serde_json::Value::Null);
+                    let value = ClValue::from_json(raw_value)
+                        .map_err(serde::de::Error::custom)?;
+                    let unit = m
+                        .get("unit")
+                        .and_then(|x| x.as_str())
+                        .ok_or_else(|| serde::de::Error::custom("missing unit"))?
+                        .to_string();
+                    return Ok(ClValue::Measured { value: Box::new(value), unit });
                 }
             }
         }
@@ -192,6 +216,10 @@ pub enum ClExpr {
         /// validity is bounded by the source's validity.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         derived_from: Option<String>,
+        /// §32: belief revision — this fact SUPERSEDES the fact asserted
+        /// in the referenced message (retraction with traceability).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        supersedes: Option<String>,
         /// §6.4 epistemic modality (default: Asserted).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         modality: Option<Epistemic>,
@@ -231,6 +259,21 @@ pub enum ClExpr {
     /// §28: metanível — the sender asserts that `agent` holds `fact`.
     #[serde(rename = "believes")]
     Believes { agent: String, fact: Box<ClExpr> },
+    /// §32: conditional commitment — activates only when `condition` holds
+    /// (as observed by the debtor). Condition is a fact composition.
+    #[serde(rename = "conditional_commitment")]
+    ConditionalCommitment {
+        debtor: String,
+        creditor: String,
+        condition: Box<ClExpr>,
+        act: ClAction,
+        deadline_ms: Option<i64>,
+        status: CommitmentStatus,
+    },
+    /// §32: evaluation policy — declares the criteria used to rank bids
+    /// (carried under propose/accept in contract-net, §21).
+    #[serde(rename = "prefer")]
+    Prefer { criteria: Vec<ClExpr> },
     /// §29: extend an active commitment's deadline (carried under request).
     #[serde(rename = "renew")]
     Renew { target_msg_id: String, new_deadline_ms: i64 },
@@ -276,6 +319,7 @@ impl ClExpr {
             args: json_object_to_btree(args),
             truth: true,
             derived_from: None,
+            supersedes: None,
             modality: None,
             provenance: None,
             confidence: None,
@@ -289,6 +333,7 @@ impl ClExpr {
             args: json_object_to_btree(args),
             truth: false,
             derived_from: None,
+            supersedes: None,
             modality: None,
             provenance: None,
             confidence: None,
@@ -358,6 +403,30 @@ impl ClExpr {
             deadline_ms,
             status,
         }
+    }
+
+    /// §32: conditional commitment — activates only when `condition` holds.
+    pub fn conditional_commitment(
+        debtor: &str,
+        creditor: &str,
+        condition: ClExpr,
+        act: ClAction,
+        deadline_ms: Option<i64>,
+        status: CommitmentStatus,
+    ) -> Self {
+        ClExpr::ConditionalCommitment {
+            debtor: debtor.into(),
+            creditor: creditor.into(),
+            condition: Box::new(condition),
+            act,
+            deadline_ms,
+            status,
+        }
+    }
+
+    /// §32: preference policy (CNP evaluation criteria).
+    pub fn prefer(criteria: Vec<ClExpr>) -> Self {
+        ClExpr::Prefer { criteria }
     }
 }
 
@@ -520,6 +589,36 @@ fn check_leaf(
             }
             Ok(())
         }
+        ClExpr::ConditionalCommitment { condition, status, .. } => {
+            // §32: the condition is a fact composition — validated with
+            // inform's grammar (facts only), independent of the carrier
+            check_leaf(Performative::Inform, "fact", condition, bound)?;
+            let ok = match performative {
+                Performative::Propose => *status == CommitmentStatus::Proposed,
+                Performative::Accept => *status == CommitmentStatus::Active,
+                _ => false,
+            };
+            if !ok {
+                return Err(format!(
+                    "performative {performative:?} cannot carry conditional commitment with status {status:?}"
+                ));
+            }
+            Ok(())
+        }
+        ClExpr::Prefer { criteria } => {
+            // §32: evaluation policy — legal under propose (bid policy) and
+            // accept (award policy); criteria are fact compositions
+            if performative != Performative::Propose && performative != Performative::Accept {
+                return Err(format!("prefer is only legal under propose/accept, got {performative:?}"));
+            }
+            if criteria.is_empty() {
+                return Err("prefer with zero criteria".into());
+            }
+            for c in criteria {
+                check_leaf(Performative::Inform, "fact", c, bound)?;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -576,6 +675,7 @@ mod tests {
             ]),
             truth: true,
             derived_from: None,
+            supersedes: None,
             modality: None,
             provenance: None,
             confidence: None,
@@ -589,6 +689,7 @@ mod tests {
             ]),
             truth: true,
             derived_from: None,
+            supersedes: None,
             modality: None,
             provenance: None,
             confidence: None,
@@ -696,6 +797,7 @@ mod tests {
             args: BTreeMap::from([("path".into(), ClValue::Str("/tmp/x".into()))]),
             truth: true,
             derived_from: None,
+            supersedes: None,
             modality: Some(Believed),
             provenance: Some(vec!["did:example:a".into(), "did:example:b".into()]),
             confidence: Some(0.8),
@@ -741,6 +843,7 @@ mod tests {
             ]),
             truth: true,
             derived_from: None,
+            supersedes: None,
             modality: None,
             provenance: None,
             confidence: None,
@@ -831,6 +934,138 @@ mod tests {
             Performative::Inform,
             &[ClExpr::renew("c", 1700000000000)]
         ).is_err());
+    }
+
+    #[test]
+    fn retract_and_supersedes() {
+        use crate::dialogue::dialogue_legal;
+        // retract is a legal reply after inform (belief revision)
+        assert!(dialogue_legal(Performative::Inform, Performative::Retract));
+        assert!(dialogue_legal(Performative::Retract, Performative::Inform));
+        // supersedes roundtrip: the new fact references the old one
+        let revised = ClExpr::Fact {
+            predicate: "task_status".into(),
+            args: BTreeMap::from([("msg_id".into(), ClValue::Str("m1".into()))]),
+            truth: false,
+            derived_from: None,
+            supersedes: Some("original-msg-id".into()),
+            modality: None,
+            provenance: None,
+            confidence: None,
+            valid_until_ms: None,
+        };
+        let env = env(Performative::Inform, cl_body(vec![revised]));
+        match Envelope::decode(&env.encode().unwrap()).unwrap().body {
+            Body::Cl { expressions } => match &expressions[0] {
+                ClExpr::Fact { supersedes, truth, .. } => {
+                    assert_eq!(supersedes.as_deref(), Some("original-msg-id"));
+                    assert!(!truth); // the superseded claim is now false
+                }
+                other => panic!("expected Fact, got {other:?}"),
+            },
+            other => panic!("expected Cl, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn conditional_commitments() {
+        // IF file_exists THEN I commit to file_read
+        let cc = ClExpr::conditional_commitment(
+            "local:1:kenji",
+            "local:2:argus",
+            ClExpr::fact("file_exists", serde_json::json!({"path": "/tmp/in"})),
+            ClAction { name: "acl.std.fs.file_read".into(), params: serde_json::json!({"path": "/tmp/in"}), result_schema: None, partial: None },
+            None,
+            CommitmentStatus::Proposed,
+        );
+        assert!(well_formed(Performative::Propose, &[cc]).is_ok());
+        // condition must be a fact composition — action as condition is illegal
+        assert!(well_formed(
+            Performative::Propose,
+            &[ClExpr::conditional_commitment(
+                "a", "b",
+                ClExpr::action("t", serde_json::json!({})),
+                ClAction { name: "t".into(), params: serde_json::json!({}), result_schema: None, partial: None },
+                None, CommitmentStatus::Proposed,
+            )]
+        ).is_err());
+    }
+
+    #[test]
+    fn prefer_policy() {
+        let policy = ClExpr::prefer(vec![
+            ClExpr::fact("cheap", serde_json::json!({})),
+            ClExpr::fact("within_deadline", serde_json::json!({})),
+        ]);
+        assert!(well_formed(Performative::Propose, &[policy]).is_ok());
+        // not under inform
+        assert!(well_formed(
+            Performative::Inform,
+            &[ClExpr::prefer(vec![ClExpr::fact("f", serde_json::json!({}))])]
+        ).is_err());
+        // empty criteria illegal
+        assert!(well_formed(Performative::Accept, &[ClExpr::prefer(vec![])]).is_err());
+    }
+
+    #[test]
+    fn error_taxonomy_roundtrip() {
+        use crate::ErrorKind;
+        let env = env(
+            Performative::Error,
+            Body::Error {
+                code: 422,
+                message: "schema violation".into(),
+                taxonomy: Some(ErrorKind::SchemaViolation),
+                details: Some(serde_json::json!({"param": "path"})),
+            },
+        );
+        match Envelope::decode(&env.encode().unwrap()).unwrap().body {
+            Body::Error { taxonomy, .. } => {
+                assert_eq!(taxonomy, Some(ErrorKind::SchemaViolation));
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+        // taxonomy serializes as snake_case string on the wire
+        let wire = serde_json::to_value(&env.body).unwrap();
+        assert_eq!(wire["v"]["taxonomy"], "schema_violation");
+    }
+
+    #[test]
+    fn measured_values_roundtrip() {
+        // 5000 ms is unambiguous: {"$measured": {"value": 5000, "unit": "ms"}}
+        let env = env(
+            Performative::Inform,
+            cl_body(vec![ClExpr::Fact {
+                predicate: "elapsed_longer".into(),
+                args: BTreeMap::from([(
+                    "min_ms".into(),
+                    ClValue::Measured { value: Box::new(ClValue::Int(5000)), unit: "ms".into() },
+                )]),
+                truth: true,
+                derived_from: None,
+                supersedes: None,
+                modality: None,
+                provenance: None,
+                confidence: None,
+                valid_until_ms: None,
+            }]),
+        );
+        match Envelope::decode(&env.encode().unwrap()).unwrap().body {
+            Body::Cl { expressions } => match &expressions[0] {
+                ClExpr::Fact { args, .. } => match &args["min_ms"] {
+                    ClValue::Measured { value, unit } => {
+                        assert_eq!(**value, ClValue::Int(5000));
+                        assert_eq!(unit, "ms");
+                    }
+                    other => panic!("expected Measured, got {other:?}"),
+                },
+                other => panic!("expected Fact, got {other:?}"),
+            },
+            other => panic!("expected Cl, got {other:?}"),
+        }
+        // type_name
+        let m = ClValue::Measured { value: Box::new(ClValue::Int(1)), unit: "kg".into() };
+        assert_eq!(m.type_name(), "measured");
     }
 
     #[test]

@@ -18,7 +18,7 @@ pub fn legal_replies(prev: Performative) -> &'static [Performative] {
         Propose => &[Accept, Reject, Error],
         Accept => &[Inform, Failure, Error],
         Cancel => &[Inform, Error],
-        Inform => &[Inform, Error],
+        Inform => &[Inform, Error, Retract],
         Hello => &[Hello, Error],
         InputRequired => &[Inform, Cancel, Error],
         Progress => &[Progress, Inform, Failure, InputRequired, Error],
@@ -26,6 +26,9 @@ pub fn legal_replies(prev: Performative) -> &'static [Performative] {
         Reject => &[Inform, Error],
         Bye => &[],
         Error => &[Inform, Error],
+        Retract => &[Inform, Error],
+        Subscribe => &[Inform, Failure, Error],
+        Unsubscribe => &[Inform, Error],
     }
 }
 
