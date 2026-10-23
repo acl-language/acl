@@ -199,7 +199,7 @@ fn py_expr(e: &Expr) -> String {
 
 fn py_trigger(t: &OnTrigger) -> String {
     match t {
-        OnTrigger::Event { performative, pattern, from } => format!(
+        OnTrigger::Event { performative, pattern, from, .. } => format!(
             "{{\"kind\": \"event\", \"performative\": \"{}\", \"pattern\": {}, \"from\": {}}}",
             py_perf(performative),
             match pattern {

@@ -30,6 +30,13 @@ pub struct RoleEndpoint {
 /// role(s) that are NOT A. With two roles this is exactly one role.
 pub fn handler_executor<'a>(prog: &'a ProtocolProgram, h: &Handler) -> Vec<&'a str> {
     match &h.trigger {
+        // §43: `as <role>` restricts the executor to that ONE role
+        OnTrigger::Event { as_role: Some(r), .. } => prog
+            .roles
+            .iter()
+            .map(|s| s.as_str())
+            .filter(|x| *x == r.as_str())
+            .collect(),
         OnTrigger::Event { from: Some(sender), .. } => prog
             .roles
             .iter()
@@ -87,16 +94,10 @@ pub fn project(prog: &ProtocolProgram, role: &str) -> Result<RoleEndpoint, Vec<I
             message: format!("cannot project: role '{role}' is not declared"),
         }]);
     }
-    if prog.roles.len() != 2 {
-        errors.push(IdlError {
-            line: 0,
-            message: format!(
-                "projection supports exactly 2 roles, protocol declares {}",
-                prog.roles.len()
-            ),
-        });
-    }
-
+    // §43: n-role projection — every handler already carries explicit
+    // attribution (check() requires `from` and `to` for 3+ role
+    // protocols); the projection itself is role-set agnostic
+    let two_role = prog.roles.len() == 2;
     let other = prog
         .roles
         .iter()
@@ -131,7 +132,20 @@ pub fn project(prog: &ProtocolProgram, role: &str) -> Result<RoleEndpoint, Vec<I
                             }
                             Some(r.clone())
                         }
-                        None => Some(other.to_string()),
+                        // §43: the counterpart default only exists in a
+                        // 2-role protocol; check() forces explicit `to`
+                        // otherwise
+                        None if two_role => Some(other.to_string()),
+                        None => {
+                            errors.push(IdlError {
+                                line: 0,
+                                message: format!(
+                                    "send without 'to' in a {}-role protocol (n-role requires explicit targets)",
+                                    prog.roles.len()
+                                ),
+                            });
+                            None
+                        }
                     };
                     if let Some(t) = target {
                         if !t.is_empty() {
@@ -1458,15 +1472,70 @@ end when fulfilled;
     }
 
     #[test]
-    fn projection_rejects_unknown_role_and_n3() {
+    fn projection_rejects_unknown_role() {
         let prog = parse(SUPPLY).unwrap();
         assert!(project(&prog, "intruder").is_err());
-        let three = parse(
-            "protocol t v1;\nroles a, b, c;\non query from a -> send inform to a;\n",
+    }
+
+    // §43: n-role projection — a 3-role relay protocol projects and RUNS
+    #[test]
+    fn three_role_projection_works_end_to_end() {
+        let prog = parse(
+            "protocol relay v1;\nroles buyer, broker, seller;\nstate ok: bool;\nstate done: bool;\non request from buyer as broker { send propose to seller; }\non accept from seller as broker { send inform to buyer; }\non propose from broker as seller -> send accept to buyer;\non accept from broker as buyer { set ok = true; }\non inform from broker as buyer { set done = true; }\n",
         )
         .unwrap();
-        let errs = project(&three, "b").unwrap_err();
-        assert!(errs[0].message.contains("exactly 2 roles"));
+        assert!(crate::protocol::check(&prog).is_ok(), "{:?}", crate::protocol::check(&prog).unwrap_err());
+        // broker's endpoint: the request handler executes there
+        let broker = project(&prog, "broker").unwrap();
+        assert!(broker.handlers.iter().any(|h| matches!(
+            h.trigger,
+            OnTrigger::Event { performative: Performative::Request, .. }
+        )));
+        // and the runtime round-trips: buyer -> broker -> seller -> back
+        let mut b = Runtime::new(&prog, "broker").unwrap();
+        let out = b.deliver(Event::In {
+            from: "buyer".into(),
+            performative: Performative::Request,
+            pattern: None,
+            fields: None,
+        });
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].to.as_deref(), Some("seller"));
+        assert_eq!(out[0].performative, Performative::Propose);
+        let mut se = Runtime::new(&prog, "seller").unwrap();
+        let out2 = se.deliver(Event::In {
+            from: "broker".into(),
+            performative: Performative::Propose,
+            pattern: None,
+            fields: None,
+        });
+        assert_eq!(out2.len(), 1);
+        assert_eq!(out2[0].performative, Performative::Accept);
+        let mut bu = Runtime::new(&prog, "buyer").unwrap();
+        let out3 = bu.deliver(Event::In {
+            from: "broker".into(),
+            performative: Performative::Accept,
+            pattern: None,
+            fields: None,
+        });
+        // the buyer handler only sets state — no sends expected
+        assert!(out3.is_empty());
+        assert_eq!(bu.states_snapshot().get("ok"), Some(&StateValue::Bool(true)));
+    }
+
+    // §43: a 3-role send without explicit `to` is a projection error
+    #[test]
+    fn three_role_unattributed_send_is_projection_error() {
+        let three = parse(
+            "protocol t v1;\nroles a, b, c;\non query from a -> send inform to a;\non inform from b -> send inform to b;\non inform from c -> send inform to c;\n",
+        )
+        .unwrap();
+        let bare = parse(
+            "protocol t v1;\nroles a, b, c;\non query from a -> send inform;\non inform from b -> send bye;\non inform from c -> send bye;\non bye from b -> send inform to b;\non bye from c -> send inform to c;\n",
+        )
+        .unwrap();
+        let errs = project(&bare, "b").unwrap_err();
+        assert!(errs.iter().any(|e| e.message.contains("without 'to'")), "{errs:?}");
     }
 
     #[test]

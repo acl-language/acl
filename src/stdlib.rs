@@ -37,6 +37,7 @@ pub fn double_confirmation() -> Handler {
             performative: Performative::Accept,
             pattern: None,
             from: None,
+            as_role: None,
         },
         guard: Some(Guard::Atom { name: "confirmed".into(), neg: false }),
         actions: vec![ProtocolAction::Begin],

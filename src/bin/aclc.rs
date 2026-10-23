@@ -55,7 +55,7 @@ fn main() {
                                     println!("{f}: endpoint '{}' — {} handlers", ep.role, ep.handlers.len());
                                     for h in &ep.handlers {
                                         let t = match &h.trigger {
-                                            acl_core::protocol::OnTrigger::Event { performative, pattern, from } => {
+                                            acl_core::protocol::OnTrigger::Event { performative, pattern, from, .. } => {
                                                 format!("{:?}{} from {:?}", performative, pattern.clone().unwrap_or_default(), from)
                                             }
                                             acl_core::protocol::OnTrigger::Breach => "Breach".into(),

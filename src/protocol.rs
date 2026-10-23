@@ -33,8 +33,9 @@ impl PartialEq for Handler {
 #[derive(Debug, Clone, PartialEq)]
 pub enum OnTrigger {
     /// `on request("quote") from buyer` — incoming speech act (optionally
-    /// patterned, optionally attributed to a sender role)
-    Event { performative: Performative, pattern: Option<String>, from: Option<String> },
+    /// patterned, attributed to a sender role, and in n-role protocols
+    /// optionally restricted to ONE executor via `as <role>`)
+    Event { performative: Performative, pattern: Option<String>, from: Option<String>, as_role: Option<String> },
     /// `on breach` — a commitment this role owes was broken
     Breach,
     /// `on expired` — the session/commitment deadline passed
@@ -841,7 +842,7 @@ fn merge_programs(mut progs: Vec<ProtocolProgram>) -> Result<ProtocolProgram, Ve
 /// §42: a handler's override signature — trigger word + pattern + from + guard
 pub fn handler_sig(h: &Handler) -> String {
     let trig = match &h.trigger {
-        OnTrigger::Event { performative, pattern, from } => format!(
+        OnTrigger::Event { performative, pattern, from, as_role } => format!(
             "{}|{:?}|{:?}",
             perf_word(performative),
             pattern,
@@ -1283,6 +1284,12 @@ fn parse_single(src: &str) -> Result<ProtocolProgram, Vec<IdlError>> {
                 Some(i) => rest[..i].trim().to_string(),
                 None => head.to_string(),
             };
+            // §43: peel `as <role>` (executor restriction for n-role) —
+            // BEFORE the guard peel, from the END of the head
+            let (head, as_role) = match head.rfind(" as ") {
+                Some(i) => (head[..i].trim().to_string(), Some(head[i + 4..].trim().to_string())),
+                None => (head, None),
+            };
             // §34: peel `when <guard>` (before from-parsing)
             let (head, guard) = match head.rfind(" when ") {
                 Some(i) => (head[..i].trim().to_string(), match parse_guard(head[i + 6..].trim()) {
@@ -1329,7 +1336,7 @@ fn parse_single(src: &str) -> Result<ProtocolProgram, Vec<IdlError>> {
             }
             let mut hs: Vec<Handler> = Vec::new();
             for hhead in &expanded {
-                let trigger = match parse_trigger(hhead) {
+                let trigger = match parse_trigger_as(hhead, as_role.clone()) {
                     Ok(t) => t,
                     Err(e) => {
                         errors.push(IdlError { line: line_no, message: e });
@@ -1510,6 +1517,10 @@ fn parse_single(src: &str) -> Result<ProtocolProgram, Vec<IdlError>> {
 }
 
 fn parse_trigger(head: &str) -> Result<OnTrigger, String> {
+    parse_trigger_as(head, None)
+}
+
+fn parse_trigger_as(head: &str, as_role: Option<String>) -> Result<OnTrigger, String> {
     let (word, pattern, from) = split_trigger(head);
     match word.as_str() {
         "breach" | "expired" if from.is_some() => {
@@ -1518,7 +1529,7 @@ fn parse_trigger(head: &str) -> Result<OnTrigger, String> {
         "breach" => Ok(OnTrigger::Breach),
         "expired" => Ok(OnTrigger::Expired),
         w => match perf_from_word(w) {
-            Some(p) => Ok(OnTrigger::Event { performative: p, pattern, from }),
+            Some(p) => Ok(OnTrigger::Event { performative: p, pattern, from, as_role }),
             None => Err(format!("unknown trigger '{word}'")),
         },
     }
@@ -1945,9 +1956,9 @@ pub fn check(prog: &ProtocolProgram) -> Result<Vec<String>, Vec<IdlError>> {
     let mut sigs: BTreeMap<String, ()> = BTreeMap::new();
     for h in &prog.handlers {
         let sig = match &h.trigger {
-            OnTrigger::Event { performative, pattern, from } => {
+            OnTrigger::Event { performative, pattern, from, as_role } => {
                 format!(
-                    "event:{performative:?}:{pattern:?}:{from:?}:guard={:?}",
+                    "event:{performative:?}:{pattern:?}:{from:?}:{as_role:?}:guard={:?}",
                     h.guard.as_ref().map(|g| guard_word(g))
                 )
             }
@@ -2089,6 +2100,21 @@ pub fn check(prog: &ProtocolProgram) -> Result<Vec<String>, Vec<IdlError>> {
                         message: format!("timer 'as {r}': undeclared role"),
                     });
                 }
+            }
+        }
+        // §43: event-trigger `as <role>` must name a declared role and
+        // differ from the sender (the executor receives, it does not send)
+        if let OnTrigger::Event { from: Some(sender), as_role: Some(r), .. } = &h.trigger {
+            if !prog.roles.iter().any(|x| x == r) {
+                errors.push(IdlError {
+                    line: h.line,
+                    message: format!("trigger 'as {r}': undeclared role"),
+                });
+            } else if r == sender {
+                errors.push(IdlError {
+                    line: h.line,
+                    message: format!("trigger 'as {r}': executor cannot be the sender"),
+                });
             }
         }
         // §41: expression guards are statically validated — undeclared
@@ -2349,7 +2375,7 @@ pub fn pretty(prog: &ProtocolProgram) -> String {
     }
     for h in &prog.handlers {
         let mut trig = match &h.trigger {
-            OnTrigger::Event { performative, pattern, from } => {
+            OnTrigger::Event { performative, pattern, from, as_role } => {
                 let mut t = match pattern {
                     Some(p) => format!("{}{}", perf_word(performative), p),
                     None => perf_word(performative).to_string(),
@@ -2971,7 +2997,7 @@ fn import_module(
 /// captures/patterns round-trip through the same grammar).
 fn handler_to_text(h: &Handler) -> Vec<String> {
     let mut head = match &h.trigger {
-        OnTrigger::Event { performative, pattern, from } => {
+        OnTrigger::Event { performative, pattern, from, as_role } => {
             let mut t = perf_word(performative).to_string();
             if let Some(p) = pattern {
                 t.push(' ');
@@ -2979,6 +3005,9 @@ fn handler_to_text(h: &Handler) -> Vec<String> {
             }
             if let Some(f) = from {
                 t.push_str(&format!(" from {f}"));
+            }
+            if let Some(a) = as_role {
+                t.push_str(&format!(" as {a}"));
             }
             t
         }
