@@ -1,0 +1,1 @@
+&ed25519_dalek::signing::SigningKey: pyo3::impl_::extract_argument::PyFunctionArgument<'_, '_>
