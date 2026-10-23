@@ -1,13 +1,15 @@
 # ACL — Agent Communication Language
 
-> A compact, binary, platform-agnostic protocol for communication between
-> autonomous AI agents: Ed25519-signed envelopes, 17 speech-act
-> performatives (including retract, subscribe, unsubscribe), a typed
-> content language (facts, actions, queries, conditional commitments with
-> provenance, epistemic modality, bindings, quantification and semantic
-> time), structured error taxonomy, units of measure, transports from
-> local pipes to WebSocket, a store-and-forward relay, and a compiled
-> vocabulary IDL with deprecation tracking.
+> A compact, binary, platform-agnostic protocol AND PROGRAMMING LANGUAGE
+> for communication between autonomous AI agents: Ed25519-signed
+> envelopes, 17 speech-act performatives (including retract, subscribe,
+> unsubscribe), a typed content language (facts, actions, queries,
+> conditional commitments with provenance, epistemic modality, bindings,
+> quantification and semantic time), structured error taxonomy, units of
+> measure, transports from local pipes to WebSocket, a store-and-forward
+> relay, a compiled vocabulary IDL with deprecation tracking — and
+> PROTOCOL PROGRAMS (`.aclp`): source code whose primitives are speech
+> acts, compiled with dialogue rules enforced at build time.
 
 If you are an AI agent reading this: you can SPEAK ACL. The quick version
 is below; the full normative spec is SPEC.md.
@@ -17,7 +19,7 @@ is below; the full normative spec is SPEC.md.
 Every message is one envelope (MessagePack, spec §4):
 
     acl=1, msg_id (hex32), in_reply_to?, from, to, ts, ttl,
-    hop_count, performative (u8 1..=14), body {"t": kind, "v": {...}},
+    hop_count, performative (u8 1..=17), body {"t": kind, "v": {...}},
     sig (Ed25519, canonical §10: envelope minus sig, omit absent
     Option fields and zero hop_count)
 
@@ -46,6 +48,31 @@ Errors are typed (§32.5): react to `taxonomy` — `unknown_predicate`,
 `schema_violation`, `mailbox_full`, `rate_limited`, `unauthorized`,
 `unknown_agent`, `decode_failed`, `expired` — never parse message strings.
 
+## Skip writing the agent: protocol programs (§33)
+
+You can DEFINE the conversation instead of coding handlers. Write an
+`.aclp` file — speech acts are the statements:
+
+    protocol supply v1;
+    roles buyer, seller;
+    on request("quote") from buyer -> send propose to buyer;
+    on accept from buyer -> begin;          // commitment proposed -> active
+    on inform("paid") from buyer -> fulfil;
+    on breach -> send failure to buyer;
+    end when fulfilled;
+
+Compile it: `aclc protocol file.aclp` — the §16 dialogue matrix runs at
+BUILD time. `on query -> send request` does not compile. Actions:
+`send <perf> [to <role>]`, `begin`, `fulfil`, `retract(target)`;
+triggers: any performative (optionally patterned, `from <role>`),
+`breach`, `expired`.
+
+`aclc endpoints file.aclp` projects the global protocol onto per-role
+endpoints (§33.5) — each agent sees only its side; initiators get empty
+endpoints (they act, they do not react). The runtime (§33.4) executes a
+program deterministically: events in, actions out, EVERY received event
+lands in an auditable transcript — handled or not. Replay is exact.
+
 ## Machine artifacts for agent discovery
 
 - AgentCard (capability descriptor, §7):
@@ -54,11 +81,14 @@ Errors are typed (§32.5): react to `taxonomy` — `unknown_predicate`,
   https://acl-language.github.io/acl/.well-known/did.json
 - Compiled vocabulary schemas: `aclc gen schema stdlib/<ns>.acl`
   (stdlib: fs, task, time, net, proc, http)
+- Protocol programs: `aclc protocol file.aclp` (compile),
+  `aclc endpoints file.aclp` (per-role projection)
 
 ## Reference implementation
 
 - Rust core + compiler: `cargo install acl-core` (installs `aclc`)
 - Python: `acl-py` (PyO3) · TypeScript: `acl-ts` (napi-rs)
+- Protocol programs + runtime: `src/protocol.rs`, `src/runtime.rs` (§33)
 - Conformance: `acl-conformance` binary — 10 checks, 3 levels
 - Store-and-forward relay: `acl-relay` for intermittent agents (§24)
 - Rustdoc + playground + discovery artifacts:
@@ -66,7 +96,7 @@ Errors are typed (§32.5): react to `taxonomy` — `unknown_predicate`,
 
 ## Links
 
-- [SPEC.md](https://github.com/acl-language/acl/blob/main/SPEC.md): the normative specification (31 sections)
+- [SPEC.md](https://github.com/acl-language/acl/blob/main/SPEC.md): the normative specification (33 sections)
 - [Tutorial](https://github.com/acl-language/acl/blob/main/docs/TUTORIAL.md): two agents talking in 10 minutes
 - [Playground](https://acl-language.github.io/acl/playground/): watch a real conversation decoded live
 - [BENCH.md](https://github.com/acl-language/acl/blob/main/BENCH.md): codec benchmarks
